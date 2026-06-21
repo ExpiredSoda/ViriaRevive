@@ -3,10 +3,15 @@
 For no-console launch, double-click app.pyw instead."""
 
 import sys
+from windows_subprocess import hide_child_console_windows
+
+hide_child_console_windows()
+
 import webview
 from pathlib import Path
 from api_bridge import ApiBridge
 from tray import TrayManager
+from version import APP_NAME
 
 
 def _get_base_dir():
@@ -27,7 +32,7 @@ def main():
     gui_dir = _get_base_dir() / "gui"
 
     window = webview.create_window(
-        title="ViriaRevive",
+        title=APP_NAME,
         url=str(gui_dir / "index.html"),
         js_api=api,
         width=1100,

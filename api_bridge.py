@@ -7,44 +7,91 @@ the UI via  window.evaluate_js()  which calls global JS callback functions.
 """
 
 import functools
+import hashlib
 import http.server
 import json
 import os
+import re
 import shutil
 import socket
+import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+import uuid
+import webbrowser
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import yt_dlp
 
 from config import (
     BASE_DIR,
+    APP_DATA_DIR,
+    BIN_DIR,
     CLIPS_DIR,
     CLIP_DURATION,
+    CLIENT_SECRETS_FILE,
     CROP_VERTICAL,
     DOWNLOADS_DIR,
     FFMPEG_PRESET,
     MIN_GAP,
     MUSIC_DIR,
     NUM_CLIPS,
+    PERSONALIZATION_FILE,
+    PERSONALIZATION_SCHEMA_VERSION,
+    STATE_FILE,
+    STATE_SCHEMA_VERSION,
+    SUBTITLE_PLACEMENT,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
     VIDEO_CRF,
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
-from detector import find_viral_moments
+from detector import find_viral_moments, get_last_scene_detection_diagnostics
 from transcriber import transcribe_clip, find_sentence_boundary
-from subtitler import generate_subtitles, get_available_styles
+from subtitler import (
+    generate_subtitles,
+    get_available_styles,
+    normalize_subtitle_placement,
+    resolve_subtitle_placement,
+    subtitles_are_enabled,
+)
 from clipper import (
     extract_clip, extract_audio_clip, ClipResult,
     add_background_music, apply_video_effect, get_effects_list,
 )
 from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions
+from audio_streams import get_audio_streams, pick_voice_stream_ordinal
+from candidate_ranker import (
+    apply_learned_scoring,
+    build_learning_status,
+    build_shadow_scoring_report,
+    evaluate_candidate,
+    needs_stream_retry,
+    select_best_candidates,
+    write_debug_report,
+)
 from subprocess_utils import CancelledError
-from title_generator import generate_title, generate_titles_batch, list_ollama_models, ensure_model
+from speech_stream_selector import select_speech_stream
+from title_generator import (
+    DEFAULT_VIDEO_CATEGORY_ID,
+    compose_description,
+    generated_description_body,
+    generate_title,
+    generate_tags,
+    generate_titles_batch,
+    list_ollama_models,
+    ensure_model,
+    is_ollama_model_ready,
+    ollama_status,
+    summarize_clip_context,
+    recommended_hashtags,
+    OLLAMA_DOWNLOAD_URL,
+    OLLAMA_WINDOWS_DOCS_URL,
+    OLLAMA_INSTALL_SCRIPT_URL,
+)
 from uploader import (
     upload_to_youtube,
     build_schedule,
@@ -56,8 +103,12 @@ from uploader import (
     add_account,
     list_accounts,
 )
+from version import APP_DESCRIPTION, APP_NAME, APP_VERSION, APP_VERSION_DISPLAY
 
-STATE_FILE = BASE_DIR / "viria_state.json"
+
+YOUTUBE_CREDENTIALS_URL = "https://console.cloud.google.com/apis/credentials"
+FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+SCHEDULER_MISSED_GRACE = timedelta(minutes=10)
 
 
 # ── Log interceptor — captures print() and forwards to the GUI console ───────
@@ -124,13 +175,12 @@ def _install_log_tee():
 # ── Local video server (serves clip files for HTML5 <video> preview) ─────────
 
 class _SilentHandler(http.server.SimpleHTTPRequestHandler):
-    """Serves files from a directory with CORS headers, no logging."""
+    """Serves files from a directory with range support and no logging."""
 
     def log_message(self, fmt, *args):
         pass
 
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
 
@@ -139,6 +189,20 @@ class _SilentHandler(http.server.SimpleHTTPRequestHandler):
             super().handle()
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             pass  # Browser closed connection early — harmless
+
+    def list_directory(self, path):
+        self.send_error(404, "Directory listing disabled")
+        return None
+
+    def send_head(self):
+        try:
+            root = Path(self.directory).resolve()
+            requested = Path(self.translate_path(self.path)).resolve()
+            requested.relative_to(root)
+        except (OSError, ValueError):
+            self.send_error(404, "File not found")
+            return None
+        return super().send_head()
 
 
 class _SilentHTTPServer(http.server.HTTPServer):
@@ -178,6 +242,11 @@ class ApiBridge:
         self._delete_after_upload = False   # auto-delete clips after YouTube upload
         self._user_settings: dict = {}      # user settings persisted to disk
         self._pending_js: list[str] = []    # JS calls queued while window was hidden
+        self._state_lock = threading.RLock()
+        self._upload_lock = threading.Lock()
+        self._ollama_install_token: tuple[str, float] | None = None
+        self._personalization_lock = threading.RLock()
+        self._personalization: dict = self._empty_personalization()
 
         # Install log interceptor so print() output goes to the GUI console
         global _log_bridge
@@ -186,6 +255,7 @@ class ApiBridge:
 
         # Load persisted state from previous session
         self._load_state()
+        self._load_personalization()
 
     # ── Exposed: config / deps ───────────────────────────────────────────
 
@@ -198,27 +268,66 @@ class ApiBridge:
             "whisper_model": WHISPER_MODEL,
             "whisper_language": WHISPER_LANGUAGE or "",
             "subtitle_style": SUBTITLE_STYLE,
+            "subtitle_placement": dict(SUBTITLE_PLACEMENT),
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
             "crop_vertical": CROP_VERTICAL,
+            "description_profile": {
+                "auto_hashtags": True,
+                "custom_text": "",
+            },
         }
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
             defaults.update(self._user_settings)
         return defaults
 
+    def get_app_metadata(self):
+        """Return public app metadata for the UI."""
+        return {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "version_display": APP_VERSION_DISPLAY,
+            "description": APP_DESCRIPTION,
+        }
+
+    def get_app_paths(self):
+        """Return user-facing app paths for setup and privacy screens."""
+        return {
+            "app_data_dir": str(APP_DATA_DIR),
+            "client_secrets_file": str(CLIENT_SECRETS_FILE),
+            "bin_dir": str(BIN_DIR),
+            "clips_dir": str(CLIPS_DIR),
+            "music_dir": str(MUSIC_DIR),
+        }
+
     def save_settings(self, settings):
         """Persist user settings to disk so they survive restarts."""
-        self._user_settings = settings or {}
+        cleaned = dict(settings or {})
+        if "subtitle_placement" in cleaned:
+            cleaned["subtitle_placement"] = normalize_subtitle_placement(
+                cleaned.get("subtitle_placement")
+            )
+        if "description_profile" in cleaned:
+            profile = cleaned.get("description_profile") or {}
+            cleaned["description_profile"] = {
+                "auto_hashtags": bool(profile.get("auto_hashtags", True)),
+                "custom_text": str(profile.get("custom_text", "") or ""),
+            }
+        self._user_settings = cleaned
         self._save_state()
         return {"ok": True}
 
     def check_dependencies(self):
-        return {"ffmpeg": shutil.which("ffmpeg") is not None}
+        return {
+            "ffmpeg": shutil.which("ffmpeg") is not None,
+            "ffprobe": shutil.which("ffprobe") is not None,
+        }
 
     def set_delete_after_upload(self, enabled):
         """Toggle auto-delete clips from disk after successful YouTube upload."""
         self._delete_after_upload = bool(enabled)
+        self._save_state()
         return {"ok": True, "enabled": self._delete_after_upload}
 
     def get_delete_after_upload(self):
@@ -226,13 +335,241 @@ class ApiBridge:
 
     # ── Exposed: AI title generation ──────────────────────────────────────
 
+    def _infer_game_title_from_path(self, path) -> str:
+        generic = {
+            "vertical", "horizontal", "clips", "downloads", "recording video files",
+            "videos", "video files", "captures", "recordings", "obs", "output",
+        }
+        try:
+            p = Path(path)
+        except Exception:
+            return ""
+        for part in [p.parent.name, p.parent.parent.name if p.parent else ""]:
+            cleaned = str(part).strip()
+            if not cleaned or cleaned.lower() in generic:
+                continue
+            if re.match(r"^\d{4}-\d{2}-\d{2}", cleaned):
+                continue
+            return cleaned
+        return ""
+
+    def _game_title_for_clip(self, clip_index: int) -> str:
+        if 0 <= clip_index < len(self._moments):
+            moment = self._moments[clip_index]
+            if moment.get("game_title"):
+                return moment["game_title"]
+            if moment.get("source_path"):
+                title = self._infer_game_title_from_path(moment["source_path"])
+                if title:
+                    moment["game_title"] = title
+                    return title
+            stem = moment.get("source_stem")
+            if stem:
+                for suffix in ("_run_debug.json", "_candidate_debug.json"):
+                    path = SUBTITLES_DIR / f"{stem}{suffix}"
+                    if not path.exists():
+                        continue
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        title = self._infer_game_title_from_path(data.get("video", ""))
+                        if title:
+                            moment["game_title"] = title
+                            moment["source_path"] = data.get("video", "")
+                            return title
+                    except Exception:
+                        pass
+        if 0 <= clip_index < len(self._results):
+            return self._infer_game_title_from_path(self._results[clip_index])
+        return ""
+
+    def _title_context_for_clip(self, clip_index: int) -> dict:
+        if clip_index < 0 or clip_index >= len(self._moments):
+            return {}
+        moment = self._moments[clip_index]
+        if not isinstance(moment, dict):
+            return {}
+        ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+        context = {
+            "schema_version": 1,
+            "clip_id": moment.get("clip_id"),
+            "source_id": moment.get("source_id"),
+            "source_path": moment.get("source_path"),
+            "source_stem": moment.get("source_stem"),
+            "game_title": self._game_title_for_clip(clip_index),
+            "start": moment.get("start"),
+            "end": moment.get("end"),
+            "duration": moment.get("duration"),
+            "peak_time": moment.get("peak_time"),
+            "candidate_rank": moment.get("candidate_rank"),
+            "candidate_kind": moment.get("candidate_kind"),
+            "detector_score": moment.get("score"),
+            "detector_scores": moment.get("detector_scores") if isinstance(moment.get("detector_scores"), dict) else {},
+            "scene_detection_status": moment.get("scene_detection_status"),
+            "scene_score": moment.get("scene_score"),
+            "variance_score": moment.get("variance_score"),
+            "quality_score": moment.get("quality_score"),
+            "selection_quality_score": moment.get("selection_quality_score"),
+            "selection_rank_score": moment.get("selection_rank_score"),
+            "selection_score_source": moment.get("selection_score_source"),
+            "learned_quality_score": moment.get("learned_quality_score"),
+            "learned_adjustment": moment.get("learned_adjustment"),
+            "quality_rank": moment.get("quality_rank"),
+            "word_count": moment.get("word_count"),
+            "speech_stream": moment.get("speech_stream"),
+            "subtitle_generated": moment.get("subtitle_generated"),
+            "subtitles_burned": moment.get("subtitles_burned"),
+            "subtitle_placement": moment.get("subtitle_placement"),
+            "transcript_source": moment.get("transcript_source"),
+            "transcript_backfilled": moment.get("transcript_backfilled"),
+            "transcript": str(moment.get("transcript") or "")[:4000],
+            "ranker": {
+                "hook_points": ranker.get("hook_points"),
+                "weak_points": ranker.get("weak_points"),
+                "aftermath_points": ranker.get("aftermath_points"),
+                "first_word_start": ranker.get("first_word_start"),
+                "last_word_end": ranker.get("last_word_end"),
+                "reject_reason": ranker.get("reject_reason"),
+            },
+        }
+        if 0 <= clip_index < len(self._results):
+            context["clip_filename"] = self._results[clip_index].name
+        return context
+
+    def _tags_for_game(self, game_title: str, transcript: str = "", clip_context: dict | None = None) -> str:
+        return generate_tags(game_title, transcript, clip_context=clip_context)
+
+    def _description_profile(self) -> dict:
+        profile = (self._user_settings or {}).get("description_profile") or {}
+        return {
+            "auto_hashtags": bool(profile.get("auto_hashtags", True)),
+            "custom_text": str(profile.get("custom_text", "") or ""),
+        }
+
+    def _compose_clip_description(
+        self,
+        title: str,
+        game_title: str = "",
+        clip_context: dict | None = None,
+        custom_text: str | None = None,
+        auto_hashtags: bool | None = None,
+        generated_text: str | None = None,
+    ) -> dict:
+        profile = self._description_profile()
+        resolved_custom = profile["custom_text"] if custom_text is None else str(custom_text or "")
+        resolved_auto = profile["auto_hashtags"] if auto_hashtags is None else bool(auto_hashtags)
+        generated = generated_text or generated_description_body(title, game_title, clip_context)
+        final = compose_description(
+            title,
+            game_title=game_title,
+            clip_context=clip_context,
+            custom_text=resolved_custom,
+            auto_hashtags=resolved_auto,
+            generated_text=generated,
+        )
+        return {
+            "generated_description": generated,
+            "description_custom_text": resolved_custom,
+            "description_auto_hashtags": resolved_auto,
+            "description": final,
+            "final_description": final,
+            "recommended_hashtags": recommended_hashtags(game_title) if resolved_auto else [],
+        }
+
+    def _write_metadata_sidecar(
+        self,
+        clip_index: int,
+        title: str,
+        game_title: str = "",
+        description: str | None = None,
+        tags: str | None = None,
+        clip_context: dict | None = None,
+    ) -> str:
+        if clip_index < 0 or clip_index >= len(self._results) or not title:
+            return ""
+        clip_path = Path(self._results[clip_index])
+        description = description or self._compose_clip_description(
+            title,
+            game_title,
+            clip_context=clip_context,
+        )["description"]
+        tags = tags or self._tags_for_game(game_title, clip_context=clip_context)
+        context_summary = summarize_clip_context(
+            (clip_context or {}).get("transcript", ""),
+            game_title,
+            clip_context,
+        )
+        hashtags = recommended_hashtags(game_title)
+        lines = [
+            f"Title: {title}",
+            "",
+            "Description:",
+            description,
+            "",
+            f"Tags: {tags}",
+            f"Hashtags: {' '.join(hashtags)}",
+            f"Game: {game_title or 'Unknown'}",
+            f"Clip: {clip_path}",
+            "",
+            "Analysis Context:",
+            f"Moment Type: {context_summary.get('moment_type', 'general gameplay')}",
+            f"Hook Phrases: {', '.join(context_summary.get('hook_phrases', [])) or 'None'}",
+            f"Quality Score: {context_summary.get('quality_score')}",
+            f"Selection Quality Score: {context_summary.get('selection_quality_score')}",
+        ]
+        sidecar = clip_path.with_suffix(".txt")
+        try:
+            sidecar.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return str(sidecar)
+        except Exception as exc:
+            print(f"[metadata] Failed to write sidecar for {clip_path.name}: {exc}")
+            return ""
+
+    def _store_generated_metadata(
+        self,
+        clip_index: int,
+        title: str,
+        description: str,
+        tags: str,
+        game_title: str,
+        metadata_file: str,
+        clip_context: dict | None = None,
+        generated_description: str | None = None,
+        custom_text: str | None = None,
+        auto_hashtags: bool | None = None,
+    ):
+        if clip_index < 0 or clip_index >= len(self._moments):
+            return
+        moment = self._moments[clip_index]
+        if not isinstance(moment, dict):
+            moment = {}
+            self._moments[clip_index] = moment
+        moment["generated_metadata"] = {
+            "title": title,
+            "description": description,
+            "final_description": description,
+            "generated_description": generated_description or generated_description_body(title, game_title, clip_context),
+            "description_custom_text": custom_text if custom_text is not None else self._description_profile()["custom_text"],
+            "description_auto_hashtags": self._description_profile()["auto_hashtags"] if auto_hashtags is None else bool(auto_hashtags),
+            "recommended_hashtags": recommended_hashtags(game_title)
+            if (self._description_profile()["auto_hashtags"] if auto_hashtags is None else bool(auto_hashtags))
+            else [],
+            "tags": tags,
+            "game_title": game_title,
+            "metadata_file": metadata_file,
+            "title_context": summarize_clip_context(
+                (clip_context or {}).get("transcript", ""),
+                game_title,
+                clip_context,
+            ),
+        }
+
     def generate_titles(self):
         """Generate titles for all clips using LLM (or heuristic fallback).
 
         If transcripts are missing (e.g. clips from a previous session where
         moments were lost), auto-transcribe the clip audio first.
         """
-        from title_generator import ensure_model, DEFAULT_MODEL
+        from title_generator import DEFAULT_MODEL
 
         num_clips = len(self._results)
         # Sync moments to match results count exactly
@@ -250,12 +587,59 @@ class ApiBridge:
             self._save_state()
 
         transcripts = [m.get("transcript", "") for m in self._moments]
+        title_contexts = [self._title_context_for_clip(i) for i in range(num_clips)]
+        game_titles = [context.get("game_title", "") for context in title_contexts]
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
 
-        llm_available = ensure_model(DEFAULT_MODEL)
-        titles = generate_titles_batch(transcripts)
-        return {"titles": titles, "llm": llm_available}
+        llm_available = is_ollama_model_ready(DEFAULT_MODEL)
+        titles = generate_titles_batch(
+            transcripts,
+            game_titles=game_titles,
+            clip_contexts=title_contexts,
+        )
+        metadata = []
+        for i, title in enumerate(titles):
+            if not title:
+                continue
+            game_title = game_titles[i] if i < len(game_titles) else ""
+            clip_context = title_contexts[i] if i < len(title_contexts) else {}
+            desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+            description = desc_parts["description"]
+            tags = self._tags_for_game(
+                game_title,
+                transcripts[i] if i < len(transcripts) else "",
+                clip_context=clip_context,
+            )
+            metadata_file = self._write_metadata_sidecar(i, title, game_title, description, tags, clip_context)
+            self._store_generated_metadata(
+                i,
+                title,
+                description,
+                tags,
+                game_title,
+                metadata_file,
+                clip_context,
+                generated_description=desc_parts["generated_description"],
+                custom_text=desc_parts["description_custom_text"],
+                auto_hashtags=desc_parts["description_auto_hashtags"],
+            )
+            metadata.append({
+                "index": i,
+                "title": title,
+                "game_title": game_title,
+                "description": description,
+                "final_description": description,
+                "generated_description": desc_parts["generated_description"],
+                "description_custom_text": desc_parts["description_custom_text"],
+                "description_auto_hashtags": desc_parts["description_auto_hashtags"],
+                "recommended_hashtags": desc_parts["recommended_hashtags"],
+                "tags": tags,
+                "title_context": summarize_clip_context(transcripts[i], game_title, clip_context),
+                "metadata_file": metadata_file,
+            })
+        self._save_state()
+        return {"titles": titles, "metadata": metadata, "llm": llm_available}
 
     def generate_title_for_clip(self, clip_index):
         """Generate a title for a single clip."""
@@ -275,8 +659,39 @@ class ApiBridge:
 
         if not transcript:
             return {"title": "", "error": "No transcript for this clip"}
-        title = generate_title(transcript)
-        return {"title": title}
+        clip_context = self._title_context_for_clip(clip_index)
+        game_title = clip_context.get("game_title") or self._game_title_for_clip(clip_index)
+        title = generate_title(transcript, game_title=game_title, clip_context=clip_context)
+        desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+        description = desc_parts["description"]
+        tags = self._tags_for_game(game_title, transcript, clip_context=clip_context)
+        metadata_file = self._write_metadata_sidecar(clip_index, title, game_title, description, tags, clip_context)
+        self._store_generated_metadata(
+            clip_index,
+            title,
+            description,
+            tags,
+            game_title,
+            metadata_file,
+            clip_context,
+            generated_description=desc_parts["generated_description"],
+            custom_text=desc_parts["description_custom_text"],
+            auto_hashtags=desc_parts["description_auto_hashtags"],
+        )
+        self._save_state()
+        return {
+            "title": title,
+            "description": description,
+            "final_description": description,
+            "generated_description": desc_parts["generated_description"],
+            "description_custom_text": desc_parts["description_custom_text"],
+            "description_auto_hashtags": desc_parts["description_auto_hashtags"],
+            "tags": tags,
+            "game_title": game_title,
+            "hashtags": desc_parts["recommended_hashtags"],
+            "title_context": summarize_clip_context(transcript, game_title, clip_context),
+            "metadata_file": metadata_file,
+        }
 
     def rename_clip(self, clip_index, new_title):
         """Rename a clip file on disk to match a new title.
@@ -346,7 +761,7 @@ class ApiBridge:
         are transcribed and titled. Otherwise all clips are processed.
         """
         try:
-            from title_generator import ensure_model, DEFAULT_MODEL
+            from title_generator import DEFAULT_MODEL
 
             num_clips = len(self._results)
             print(f"[title-gen] {num_clips} clips, {len(self._moments)} moments in state")
@@ -381,8 +796,12 @@ class ApiBridge:
 
             # Build transcripts list — only for target indices, empty for others
             transcripts = [""] * num_clips
+            game_titles = [""] * num_clips
+            title_contexts = [{} for _ in range(num_clips)]
             for i in target_indices:
                 transcripts[i] = self._moments[i].get("transcript", "")
+                title_contexts[i] = self._title_context_for_clip(i)
+                game_titles[i] = title_contexts[i].get("game_title") or self._game_title_for_clip(i)
             if not any(transcripts[i] for i in target_indices):
                 self._js("window.onTitlesDone && window.onTitlesDone({error: 'No transcripts available'})")
                 return
@@ -395,13 +814,15 @@ class ApiBridge:
                     m = re.match(r'^(.+?)_viral\d+', p.name)
                     self._moments[i]["source_stem"] = m.group(1) if m else p.stem
 
-            llm_available = ensure_model(DEFAULT_MODEL)
+            llm_available = is_ollama_model_ready(DEFAULT_MODEL)
 
             def _on_progress(done, total, title):
                 self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, `{self._esc(title or '')}`)")
 
             titles = generate_titles_batch(
-                transcripts, DEFAULT_MODEL, on_progress=_on_progress
+                transcripts, DEFAULT_MODEL, on_progress=_on_progress,
+                game_titles=game_titles,
+                clip_contexts=title_contexts,
             )
 
             renamed = 0
@@ -415,9 +836,41 @@ class ApiBridge:
                 ok = "filename" in r
                 if ok:
                     renamed += 1
+                game_title = game_titles[i] if i < len(game_titles) else ""
+                clip_context = title_contexts[i] if i < len(title_contexts) else {}
+                desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+                description = desc_parts["description"]
+                tags = self._tags_for_game(
+                    game_title,
+                    transcripts[i] if i < len(transcripts) else "",
+                    clip_context=clip_context,
+                )
+                metadata_file = self._write_metadata_sidecar(i, title, game_title, description, tags, clip_context)
+                self._store_generated_metadata(
+                    i,
+                    title,
+                    description,
+                    tags,
+                    game_title,
+                    metadata_file,
+                    clip_context,
+                    generated_description=desc_parts["generated_description"],
+                    custom_text=desc_parts["description_custom_text"],
+                    auto_hashtags=desc_parts["description_auto_hashtags"],
+                )
                 results.append({
                     "index": i,
                     "title": title,
+                    "game_title": game_title,
+                    "description": description,
+                    "final_description": description,
+                    "generated_description": desc_parts["generated_description"],
+                    "description_custom_text": desc_parts["description_custom_text"],
+                    "description_auto_hashtags": desc_parts["description_auto_hashtags"],
+                    "recommended_hashtags": desc_parts["recommended_hashtags"],
+                    "tags": tags,
+                    "title_context": summarize_clip_context(transcripts[i], game_title, clip_context),
+                    "metadata_file": metadata_file,
                     "renamed": ok,
                     "filename": r.get("filename", self._results[i].name if i < len(self._results) else ""),
                 })
@@ -463,6 +916,10 @@ class ApiBridge:
                 transcript = " ".join(w.get("text", "") for w in words).strip()
                 if transcript:
                     self._moments[clip_index]["transcript"] = transcript
+                    self._moments[clip_index]["transcript_source"] = "backfill"
+                    self._moments[clip_index]["transcript_backfilled"] = True
+                    self._moments[clip_index].setdefault("subtitle_generated", False)
+                    self._moments[clip_index].setdefault("subtitles_burned", False)
                     print(f"  [+] Clip {clip_index + 1}: {len(transcript)} chars transcribed")
             try:
                 wav.unlink(missing_ok=True)
@@ -475,6 +932,90 @@ class ApiBridge:
         """Return available Ollama models for title generation."""
         models = list_ollama_models()
         return {"models": models, "available": len(models) > 0}
+
+    def get_ollama_status(self):
+        """Return whether Ollama is running and ready for title generation."""
+        status = ollama_status()
+        install_path = shutil.which("ollama.exe") or shutil.which("ollama")
+        if install_path:
+            status["install_path"] = str(Path(install_path))
+        status["installed"] = bool(status.get("running") or install_path)
+        return status
+
+    def open_ollama_folder(self):
+        """Open the local Ollama install folder when it can be found."""
+        install_path = shutil.which("ollama.exe") or shutil.which("ollama")
+        if not install_path:
+            return {"error": "Ollama was not found on PATH. Use Install Ollama first."}
+        folder = Path(install_path).resolve().parent
+        try:
+            os.startfile(str(folder))
+        except Exception as e:
+            return {"error": str(e), "path": str(folder)}
+        return {"ok": True, "path": str(folder)}
+
+    def open_ollama_download(self):
+        """Open the official Ollama Windows download page."""
+        try:
+            webbrowser.open(OLLAMA_DOWNLOAD_URL)
+        except Exception as e:
+            return {"error": str(e), "url": OLLAMA_DOWNLOAD_URL}
+        return {
+            "ok": True,
+            "url": OLLAMA_DOWNLOAD_URL,
+            "docs_url": OLLAMA_WINDOWS_DOCS_URL,
+        }
+
+    def prepare_ollama_install(self):
+        """Create a short-lived token after the UI asks for install confirmation."""
+        token = uuid.uuid4().hex
+        self._ollama_install_token = (token, time.time())
+        return {
+            "ok": True,
+            "token": token,
+            "command": "irm https://ollama.com/install.ps1 | iex",
+            "url": OLLAMA_DOWNLOAD_URL,
+        }
+
+    def install_ollama_with_powershell(self, token=None):
+        """Start Ollama's official Windows install script after UI confirmation."""
+        expected, created_at = self._ollama_install_token or ("", 0)
+        self._ollama_install_token = None
+        if not token or token != expected or time.time() - created_at > 120:
+            return {"error": "Ollama install confirmation expired. Try again from the app UI."}
+        command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f"irm {OLLAMA_INSTALL_SCRIPT_URL} | iex",
+        ]
+        try:
+            subprocess.Popen(command, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        except Exception as e:
+            return {"error": str(e), "url": OLLAMA_DOWNLOAD_URL}
+        return {
+            "ok": True,
+            "command": "irm https://ollama.com/install.ps1 | iex",
+            "url": OLLAMA_DOWNLOAD_URL,
+        }
+
+    def open_youtube_oauth_console(self):
+        """Open Google Cloud credentials page for YouTube OAuth setup."""
+        try:
+            webbrowser.open(YOUTUBE_CREDENTIALS_URL)
+        except Exception as e:
+            return {"error": str(e), "url": YOUTUBE_CREDENTIALS_URL}
+        return {"ok": True, "url": YOUTUBE_CREDENTIALS_URL}
+
+    def open_ffmpeg_download(self):
+        """Open the official FFmpeg download page."""
+        try:
+            webbrowser.open(FFMPEG_DOWNLOAD_URL)
+        except Exception as e:
+            return {"error": str(e), "url": FFMPEG_DOWNLOAD_URL}
+        return {"ok": True, "url": FFMPEG_DOWNLOAD_URL}
 
     def ensure_ollama_model(self, model=None):
         """Ensure the title generation model is downloaded. Auto-pulls if needed."""
@@ -518,7 +1059,10 @@ class ApiBridge:
         try:
             return {"categories": list_categories()}
         except Exception as e:
-            return {"error": str(e), "categories": []}
+            return {
+                "error": str(e),
+                "categories": [{"id": DEFAULT_VIDEO_CATEGORY_ID, "title": "Gaming"}],
+            }
 
     def get_subtitle_styles(self):
         """Return available subtitle styles for the UI picker."""
@@ -533,19 +1077,60 @@ class ApiBridge:
         tracks = []
         if MUSIC_DIR.exists():
             for p in sorted(MUSIC_DIR.iterdir()):
-                if p.suffix.lower() in ('.mp3', '.wav', '.aac', '.ogg', '.m4a', '.flac'):
+                safe_path = self._safe_path_under(MUSIC_DIR, p)
+                if not safe_path or not safe_path.is_file():
+                    continue
+                if safe_path.suffix.lower() in ('.mp3', '.wav', '.aac', '.ogg', '.m4a', '.flac'):
                     tracks.append({
-                        "filename": p.name,
-                        "path": str(p),
-                        "size_mb": round(p.stat().st_size / (1024 * 1024), 1),
+                        "filename": safe_path.name,
+                        "path": str(safe_path),
+                        "size_mb": round(safe_path.stat().st_size / (1024 * 1024), 1),
                     })
         return {"tracks": tracks, "music_dir": str(MUSIC_DIR)}
 
+    @staticmethod
+    def _safe_child_path(root: Path, filename) -> Path | None:
+        """Resolve a user-visible filename and keep it under the intended root."""
+        name = str(filename or "").strip()
+        if not name:
+            return None
+        try:
+            root_resolved = root.resolve()
+            path = (root_resolved / name).resolve()
+            path.relative_to(root_resolved)
+            return path
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_path_under(root: Path, path) -> Path | None:
+        """Resolve a persisted path and keep it under the intended root."""
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        try:
+            root_resolved = root.resolve()
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = root_resolved / candidate
+            resolved = candidate.resolve()
+            resolved.relative_to(root_resolved)
+            return resolved
+        except (OSError, ValueError):
+            return None
+
+    def _safe_clip_path(self, path) -> Path | None:
+        """Return an existing clip path only when it is inside CLIPS_DIR."""
+        resolved = self._safe_path_under(CLIPS_DIR, path)
+        if resolved and resolved.exists() and resolved.is_file():
+            return resolved
+        return None
+
     def get_music_url(self, filename):
         """Return a local HTTP URL for a music file so the browser can play it."""
-        music_path = MUSIC_DIR / filename
-        if music_path.exists():
-            return {"url": f"http://127.0.0.1:{self._music_port}/{filename}"}
+        music_path = self._safe_child_path(MUSIC_DIR, filename)
+        if music_path and music_path.exists() and music_path.is_file():
+            return {"url": f"http://127.0.0.1:{self._music_port}/{music_path.name}"}
         return {"url": None}
 
     def open_music_folder(self):
@@ -557,6 +1142,23 @@ class ApiBridge:
             pass
         return {"ok": True}
 
+    def open_data_folder(self):
+        """Open the app data folder in system explorer."""
+        try:
+            os.startfile(str(APP_DATA_DIR))
+        except Exception as e:
+            return {"error": str(e)}
+        return {"ok": True}
+
+    def open_app_bin_folder(self):
+        """Open the app-local bin folder used for ffmpeg/ffprobe drop-ins."""
+        try:
+            BIN_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(BIN_DIR))
+        except Exception as e:
+            return {"error": str(e)}
+        return {"ok": True}
+
     def get_music_waveform(self, filename):
         """Generate waveform data + duration for a music file.
 
@@ -564,8 +1166,8 @@ class ApiBridge:
         amplitude values (0.0-1.0) representing the waveform shape.
         """
         from subprocess_utils import run as _run
-        music_path = MUSIC_DIR / filename
-        if not music_path.exists():
+        music_path = self._safe_child_path(MUSIC_DIR, filename)
+        if not music_path or not music_path.exists() or not music_path.is_file():
             return {"error": "File not found", "peaks": [], "duration": 0}
 
         try:
@@ -639,21 +1241,598 @@ class ApiBridge:
         request_cancel()
         return {"ok": True}
 
+    def cancel_upload(self):
+        """Cancel an active manual upload between YouTube upload chunks."""
+        self._cancel = True
+        return {"ok": True}
+
     # ── Exposed: results ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _hash_id(prefix: str, *parts, length: int = 16) -> str:
+        payload = "\x1f".join(str(p or "") for p in parts)
+        digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()[:length]
+        return f"{prefix}_{digest}"
+
+    def _source_id_for(self, path=None, source_stem: str = "", source_path: str = "") -> str:
+        raw_path = str(source_path or path or "").strip()
+        stem = source_stem or (Path(raw_path).stem if raw_path else "")
+        return self._hash_id("src", raw_path.lower(), stem.lower(), length=14)
+
+    def _clip_id_for(self, moment: dict, path=None) -> str:
+        source_id = moment.get("source_id") or self._source_id_for(path, moment.get("source_stem", ""), moment.get("source_path", ""))
+        start = moment.get("start", "")
+        end = moment.get("end", "")
+        peak = moment.get("peak_time", "")
+        transcript_hash = hashlib.sha1(
+            (moment.get("transcript", "") or "").encode("utf-8", errors="ignore")
+        ).hexdigest()[:10]
+        if start != "" or end != "":
+            return self._hash_id("clip", source_id, start, end, peak, transcript_hash, length=18)
+
+        p = Path(path) if path else None
+        try:
+            stat = p.stat() if p and p.exists() else None
+            return self._hash_id(
+                "clip",
+                source_id,
+                str(p).lower() if p else "",
+                stat.st_size if stat else "",
+                int(stat.st_mtime) if stat else "",
+                length=18,
+            )
+        except Exception:
+            return self._hash_id("clip", source_id, str(path or "").lower(), length=18)
+
+    def _ensure_moment_identity(self, moment, path=None) -> dict:
+        if not isinstance(moment, dict):
+            moment = {}
+        p = Path(path) if path else None
+        if not moment.get("source_path") and p and p.exists():
+            moment["source_path"] = str(p)
+        if not moment.get("source_stem") and p:
+            match = re.match(r'^(.+?)_viral\d+', p.name)
+            moment["source_stem"] = match.group(1) if match else p.stem
+        if not moment.get("source_id"):
+            moment["source_id"] = self._source_id_for(
+                path,
+                moment.get("source_stem", ""),
+                moment.get("source_path", ""),
+            )
+        if not moment.get("clip_id"):
+            moment["clip_id"] = self._clip_id_for(moment, path)
+        return moment
+
+    def _find_clip_index_by_id(self, clip_id: str | None) -> int | None:
+        if not clip_id:
+            return None
+        for i, moment in enumerate(self._moments):
+            if isinstance(moment, dict) and moment.get("clip_id") == clip_id:
+                return i
+        return None
+
+    def _find_clip_index_by_filename(self, filename: str | None) -> int | None:
+        name = str(filename or "").strip()
+        if not name:
+            return None
+        for i, path in enumerate(self._results):
+            if Path(path).name == name:
+                return i
+        return None
+
+    def _resolve_clip_index(self, item) -> int | None:
+        if not isinstance(item, dict):
+            return None
+        idx = self._find_clip_index_by_id(item.get("clip_id"))
+        if idx is not None:
+            return idx
+        idx = self._find_clip_index_by_filename(item.get("clip_filename"))
+        if idx is not None:
+            return idx
+        if item.get("clip_id") or item.get("clip_filename"):
+            return None
+        raw_idx = item.get("index", item.get("clipIdx", None))
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= idx < len(self._results):
+            return idx
+        return None
+
+    def _attach_identity_to_schedule(self, item: dict, idx: int) -> dict:
+        item = dict(item)
+        item["clipIdx"] = idx
+        if idx < len(self._moments):
+            moment = self._ensure_moment_identity(self._moments[idx], self._results[idx])
+            self._moments[idx] = moment
+            item.setdefault("clip_id", moment.get("clip_id"))
+            item.setdefault("source_id", moment.get("source_id"))
+            item.setdefault("source_stem", moment.get("source_stem"))
+        if idx < len(self._results):
+            item.setdefault("clip_filename", self._results[idx].name)
+        return item
+
+    def _schedule_game_title(self, item: dict, idx: int) -> str:
+        if item.get("game_title"):
+            return str(item.get("game_title") or "")
+        if idx < len(self._moments) and isinstance(self._moments[idx], dict):
+            metadata = self._moments[idx].get("generated_metadata") or {}
+            if metadata.get("game_title"):
+                return str(metadata.get("game_title") or "")
+        return self._game_title_for_clip(idx)
+
+    def _ensure_schedule_description(self, item: dict, idx: int) -> dict:
+        item = dict(item)
+        structured = any(
+            key in item
+            for key in (
+                "description_custom_text",
+                "description_auto_hashtags",
+                "description_generated",
+                "generated_description",
+                "final_description",
+            )
+        )
+        if item.get("description") and not structured:
+            return item
+
+        title = str(item.get("title") or f"Clip {idx + 1}")
+        game_title = self._schedule_game_title(item, idx)
+        clip_context = self._title_context_for_clip(idx)
+        generated_text = (
+            item.get("description_generated")
+            or item.get("generated_description")
+            or (self._moments[idx].get("generated_metadata", {}).get("generated_description")
+                if idx < len(self._moments) and isinstance(self._moments[idx], dict)
+                else None)
+        )
+        custom_text = item.get("description_custom_text")
+        if custom_text is None and not structured:
+            custom_text = self._description_profile()["custom_text"]
+        auto_hashtags = item.get("description_auto_hashtags")
+        desc_parts = self._compose_clip_description(
+            title,
+            game_title,
+            clip_context=clip_context,
+            custom_text=custom_text,
+            auto_hashtags=auto_hashtags,
+            generated_text=generated_text,
+        )
+        item["description"] = desc_parts["description"]
+        item["final_description"] = desc_parts["final_description"]
+        item["description_generated"] = desc_parts["generated_description"]
+        item["generated_description"] = desc_parts["generated_description"]
+        item["description_custom_text"] = desc_parts["description_custom_text"]
+        item["description_auto_hashtags"] = desc_parts["description_auto_hashtags"]
+        item["recommended_hashtags"] = desc_parts["recommended_hashtags"]
+        item["game_title"] = game_title
+        return item
+
+    def _normalize_scheduled_items(self, scheduled, legacy_index_map: dict | None = None) -> list[dict]:
+        normalized = []
+        for item in scheduled or []:
+            if not isinstance(item, dict):
+                continue
+            idx = self._find_clip_index_by_id(item.get("clip_id"))
+            if idx is None:
+                idx = self._find_clip_index_by_filename(item.get("clip_filename"))
+            if idx is None and not (item.get("clip_id") or item.get("clip_filename")):
+                try:
+                    old_idx = int(item.get("clipIdx", -1))
+                except (TypeError, ValueError):
+                    old_idx = -1
+                if legacy_index_map is not None:
+                    idx = legacy_index_map.get(old_idx)
+                elif 0 <= old_idx < len(self._results):
+                    idx = old_idx
+            if idx is None or not (0 <= idx < len(self._results)):
+                continue
+            item = self._attach_identity_to_schedule(item, idx)
+            normalized.append(self._ensure_schedule_description(item, idx))
+        return normalized
+
+    def _clip_payload(self, idx: int, path: Path, include_url: bool = True) -> dict:
+        moment = self._ensure_moment_identity(
+            self._moments[idx] if idx < len(self._moments) else {},
+            path,
+        )
+        if idx < len(self._moments):
+            self._moments[idx] = moment
+        clip = {
+            "path": str(path),
+            "filename": path.name,
+            "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
+            "clip_id": moment.get("clip_id"),
+            "source_id": moment.get("source_id"),
+            "source_stem": moment.get("source_stem", ""),
+        }
+        if include_url:
+            clip["url"] = f"http://127.0.0.1:{self._video_port}/{quote(path.name)}"
+        return clip
+
+    @staticmethod
+    def _empty_personalization() -> dict:
+        return {
+            "schema_version": PERSONALIZATION_SCHEMA_VERSION,
+            "events": [],
+            "clips": {},
+        }
+
+    def _feedback_identity_for(self, feedback: dict) -> tuple[int | None, dict]:
+        idx = self._resolve_clip_index(feedback)
+        if idx is not None:
+            path = self._results[idx]
+            moment = self._ensure_moment_identity(
+                self._moments[idx] if idx < len(self._moments) else {},
+                path,
+            )
+            if idx < len(self._moments):
+                self._moments[idx] = moment
+            return idx, {
+                "clip_id": moment.get("clip_id"),
+                "source_id": moment.get("source_id"),
+                "source_stem": moment.get("source_stem", ""),
+                "clip_filename": path.name,
+            }
+
+        clip_id = str(feedback.get("clip_id") or "").strip()
+        if not clip_id:
+            raise ValueError("Feedback needs a clip_id or valid clip index")
+        return None, {
+            "clip_id": clip_id,
+            "source_id": str(feedback.get("source_id") or "").strip(),
+            "source_stem": str(feedback.get("source_stem") or "").strip(),
+            "clip_filename": str(feedback.get("clip_filename") or "").strip(),
+        }
+
+    def _feedback_clip_snapshot(self, clip_idx: int | None) -> dict:
+        if clip_idx is None or clip_idx < 0 or clip_idx >= len(self._moments):
+            return {}
+        moment = self._moments[clip_idx]
+        if not isinstance(moment, dict):
+            return {}
+        ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+        return {
+            "start": moment.get("start"),
+            "end": moment.get("end"),
+            "duration": moment.get("duration"),
+            "peak_time": moment.get("peak_time"),
+            "quality_score": moment.get("quality_score"),
+            "selection_quality_score": moment.get("selection_quality_score"),
+            "quality_rank": moment.get("quality_rank"),
+            "word_count": moment.get("word_count"),
+            "speech_stream": moment.get("speech_stream"),
+            "transcript": str(moment.get("transcript") or "")[:4000],
+            "ranker": {
+                "hook_points": ranker.get("hook_points"),
+                "weak_points": ranker.get("weak_points"),
+                "aftermath_points": ranker.get("aftermath_points"),
+                "first_word_start": ranker.get("first_word_start"),
+                "last_word_end": ranker.get("last_word_end"),
+            },
+        }
+
+    def get_personalization(self):
+        """Return persisted feedback summaries and event log."""
+        with self._personalization_lock:
+            return json.loads(json.dumps(self._personalization))
+
+    @staticmethod
+    def _redact_personalization_export(personalization: dict) -> dict:
+        """Return a shareable feedback export without user text or source IDs."""
+        payload = json.loads(json.dumps(personalization or {}))
+
+        def public_hash(value):
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+        def redact_identity_fields(container):
+            if not isinstance(container, dict):
+                return
+            for key in ("clip_id", "source_id"):
+                value = container.pop(key, "")
+                hashed = public_hash(value)
+                if hashed:
+                    container[f"{key}_hash"] = hashed
+            if container.pop("reason", ""):
+                container["reason_redacted"] = True
+            for key in (
+                "event_id",
+                "clip_filename",
+                "source_stem",
+                "source_path",
+                "timestamp",
+                "updated_at",
+                "created_at",
+                "last_feedback_at",
+                "latest_timestamp",
+            ):
+                container.pop(key, None)
+
+        def redact_snapshot(container):
+            if not isinstance(container, dict):
+                return
+            snapshot = container.get("clip_snapshot")
+            if not isinstance(snapshot, dict):
+                return
+            transcript = str(snapshot.pop("transcript", "") or "")
+            if transcript:
+                snapshot["transcript_redacted"] = True
+                snapshot["transcript_chars"] = len(transcript)
+
+        for event in payload.get("events", []) if isinstance(payload.get("events"), list) else []:
+            redact_identity_fields(event)
+            redact_snapshot(event)
+        clips = payload.get("clips", {})
+        if isinstance(clips, dict):
+            redacted_clips = {}
+            for key, entry in clips.items():
+                if not isinstance(entry, dict):
+                    continue
+                redact_identity_fields(entry)
+                latest = entry.get("latest")
+                if isinstance(latest, dict):
+                    redact_identity_fields(latest)
+                redact_snapshot(entry)
+                redacted_key = public_hash(key) or f"clip_{len(redacted_clips) + 1}"
+                redacted_clips[redacted_key] = entry
+            payload["clips"] = redacted_clips
+
+        payload["export_redacted"] = True
+        payload["export_redactions"] = [
+            "clip_snapshot.transcript",
+            "reason",
+            "clip_filename",
+            "source_stem",
+            "clip_id",
+            "source_id",
+            "timestamps",
+        ]
+        return payload
+
+    def get_data_privacy_summary(self):
+        """Return local data and personalization counts for the settings UI."""
+        with self._personalization_lock:
+            events = self._personalization.get("events", [])
+            clips = self._personalization.get("clips", {})
+            if not isinstance(events, list):
+                events = []
+            if not isinstance(clips, dict):
+                clips = {}
+            latest_values = []
+            for entry in clips.values():
+                if not isinstance(entry, dict):
+                    continue
+                latest = entry.get("latest", {})
+                if isinstance(latest, dict):
+                    latest_values.append(latest)
+            like_count = sum(1 for latest in latest_values if latest.get("like"))
+            dislike_count = sum(1 for latest in latest_values if latest.get("dislike"))
+            favorite_count = sum(1 for latest in latest_values if latest.get("favorite"))
+            feedback_times = [
+                str(event.get("timestamp") or "")
+                for event in events
+                if isinstance(event, dict) and event.get("timestamp")
+            ]
+            for entry in clips.values():
+                if not isinstance(entry, dict):
+                    continue
+                latest = entry.get("latest", {})
+                if isinstance(latest, dict) and latest.get("timestamp"):
+                    feedback_times.append(str(latest.get("timestamp")))
+                if entry.get("updated_at"):
+                    feedback_times.append(str(entry.get("updated_at")))
+            latest_timestamp = max(feedback_times) if feedback_times else ""
+            learning_status = build_learning_status(self._personalization)
+            learning_status["last_feedback_time"] = latest_timestamp
+            learning_status["last_feedback_at"] = latest_timestamp
+            try:
+                personalization_size = PERSONALIZATION_FILE.stat().st_size if PERSONALIZATION_FILE.exists() else 0
+            except Exception:
+                personalization_size = 0
+        try:
+            state_size = STATE_FILE.stat().st_size if STATE_FILE.exists() else 0
+        except Exception:
+            state_size = 0
+        return {
+            "personalization": {
+                "path": str(PERSONALIZATION_FILE),
+                "exists": PERSONALIZATION_FILE.exists(),
+                "size_bytes": personalization_size,
+                "event_count": len(events),
+                "clip_count": len(clips),
+                "like_count": like_count,
+                "dislike_count": dislike_count,
+                "favorite_count": favorite_count,
+                "latest_timestamp": latest_timestamp,
+                "last_feedback_at": latest_timestamp,
+                "learning": learning_status,
+                "schema_version": PERSONALIZATION_SCHEMA_VERSION,
+            },
+            "learning": learning_status,
+            "state": {
+                "path": str(STATE_FILE),
+                "exists": STATE_FILE.exists(),
+                "size_bytes": state_size,
+                "schema_version": STATE_SCHEMA_VERSION,
+            },
+            "local_only": True,
+        }
+
+    def open_personalization_file(self):
+        """Open personalization.json in the system default app."""
+        with self._personalization_lock:
+            if not PERSONALIZATION_FILE.exists():
+                self._save_personalization()
+        try:
+            os.startfile(str(PERSONALIZATION_FILE))
+        except Exception as e:
+            return {"error": str(e)}
+        return {"ok": True}
+
+    def export_personalization(self):
+        """Export a redacted personalization summary to a user-selected JSON file."""
+        import webview
+
+        with self._personalization_lock:
+            snapshot = self._redact_personalization_export(self._personalization)
+        try:
+            result = self._window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename="personalization_export.json",
+                file_types=("JSON files (*.json)", "All files (*.*)"),
+            )
+            if not result:
+                return {"cancelled": True}
+            target = Path(result[0] if isinstance(result, (list, tuple)) else result)
+            if target.suffix.lower() != ".json":
+                target = target.with_suffix(".json")
+            self._write_json_atomic(target, snapshot)
+            return {"ok": True, "path": str(target)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def clear_personalization(self):
+        """Clear all local feedback events and summaries."""
+        with self._personalization_lock:
+            event_count = len(self._personalization.get("events", []))
+            clip_count = len(self._personalization.get("clips", {}))
+            backup = self._backup_json_file(PERSONALIZATION_FILE, "cleared")
+            self._personalization = self._empty_personalization()
+            self._save_personalization()
+        return {
+            "ok": True,
+            "cleared": {"event_count": event_count, "clip_count": clip_count},
+            "backup": str(backup) if backup else "",
+            "personalization": self.get_personalization(),
+        }
+
+    def record_feedback(self, feedback):
+        """Append a like/dislike/favorite feedback event for a clip."""
+        if not isinstance(feedback, dict):
+            return {"error": "Feedback payload must be an object"}
+
+        event_type = str(feedback.get("event_type") or feedback.get("type") or "").strip().lower()
+        if event_type not in {"like", "dislike", "favorite"}:
+            return {"error": "event_type must be like, dislike, or favorite"}
+
+        try:
+            clip_idx, identity = self._feedback_identity_for(feedback)
+        except Exception as e:
+            return {"error": str(e)}
+
+        active = bool(feedback.get("active", True))
+        reason = str(feedback.get("reason") or "").strip()[:1000]
+        timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        clip_snapshot = self._feedback_clip_snapshot(clip_idx)
+
+        with self._personalization_lock:
+            data = self._personalization
+            data.setdefault("schema_version", PERSONALIZATION_SCHEMA_VERSION)
+            events = data.setdefault("events", [])
+            clips = data.setdefault("clips", {})
+
+            clip_id = identity["clip_id"]
+            previous = clips.get(clip_id, {}).get("latest", {})
+            like = bool(previous.get("like", False))
+            dislike = bool(previous.get("dislike", False))
+            favorite = bool(previous.get("favorite", False))
+
+            if event_type == "like":
+                like = active
+                if active:
+                    dislike = False
+            elif event_type == "dislike":
+                dislike = active
+                if active:
+                    like = False
+            elif event_type == "favorite":
+                favorite = active
+
+            event = {
+                "event_id": self._hash_id("fb", timestamp, clip_id, event_type, len(events), reason, length=18),
+                "event_type": event_type,
+                "active": active,
+                "clip_id": clip_id,
+                "source_id": identity.get("source_id", ""),
+                "source_stem": identity.get("source_stem", ""),
+                "clip_filename": identity.get("clip_filename", ""),
+                "like": like,
+                "dislike": dislike,
+                "favorite": favorite,
+                "reason": reason,
+                "timestamp": timestamp,
+            }
+            if clip_snapshot:
+                event["clip_snapshot"] = clip_snapshot
+            events.append(event)
+
+            latest = {
+                "like": like,
+                "dislike": dislike,
+                "favorite": favorite,
+                "reason": reason,
+                "timestamp": timestamp,
+                "event_type": event_type,
+            }
+            entry = {
+                "clip_id": clip_id,
+                "source_id": identity.get("source_id", ""),
+                "source_stem": identity.get("source_stem", ""),
+                "clip_filename": identity.get("clip_filename", ""),
+                "latest": latest,
+                "event_count": int(clips.get(clip_id, {}).get("event_count", 0)) + 1,
+                "updated_at": timestamp,
+            }
+            if clip_snapshot:
+                entry["clip_snapshot"] = clip_snapshot
+            clips[clip_id] = entry
+            self._save_personalization()
+
+        return {"ok": True, "event": event, "clip": entry}
+
+    def _prune_missing_results(self) -> int:
+        """Remove deleted clip paths from state while keeping moments/schedule aligned."""
+        if not self._results:
+            return 0
+
+        old_results = list(self._results)
+        old_moments = list(self._moments)
+        index_map = {}
+        new_results = []
+        new_moments = []
+
+        for old_idx, path in enumerate(old_results):
+            safe_path = self._safe_clip_path(path)
+            if safe_path:
+                index_map[old_idx] = len(new_results)
+                new_results.append(safe_path)
+                new_moments.append(
+                    self._ensure_moment_identity(
+                        old_moments[old_idx] if old_idx < len(old_moments) else {},
+                        safe_path,
+                    )
+                )
+
+        removed = len(old_results) - len(new_results)
+        if not removed:
+            return 0
+
+        self._results = new_results
+        self._moments = new_moments
+        self._scheduled = self._normalize_scheduled_items(self._scheduled, legacy_index_map=index_map)
+        print(f"[refresh] Removed {removed} deleted clip reference(s) from state")
+        self._save_state()
+        return removed
+
     def get_results(self):
+        self._prune_missing_results()
         clips = []
         for i, p in enumerate(self._results):
-            clip = {
-                "path": str(p),
-                "filename": p.name,
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 1) if p.exists() else 0,
-                "url": f"http://127.0.0.1:{self._video_port}/{p.name}" if p.exists() else "",
-            }
-            # Include source_stem for grouping renamed clips
-            if i < len(self._moments) and self._moments[i].get("source_stem"):
-                clip["source_stem"] = self._moments[i]["source_stem"]
-            clips.append(clip)
+            clips.append(self._clip_payload(i, p, include_url=True))
         return {"clips": clips, "moments": self._moments}
 
     def open_output_folder(self):
@@ -692,9 +1871,10 @@ class ApiBridge:
     def get_video_url(self, clip_index):
         """Return a local HTTP URL for the clip so the HTML5 <video> can play it."""
         if 0 <= clip_index < len(self._results):
-            p = self._results[clip_index]
-            if p.exists():
-                return {"url": f"http://127.0.0.1:{self._video_port}/{p.name}"}
+            p = self._safe_clip_path(self._results[clip_index])
+            if p:
+                rel = p.resolve().relative_to(CLIPS_DIR.resolve()).as_posix()
+                return {"url": f"http://127.0.0.1:{self._video_port}/{quote(rel)}"}
         return {"url": None}
 
     # ── Exposed: delete clip ────────────────────────────────────────────
@@ -702,14 +1882,24 @@ class ApiBridge:
     def delete_clip(self, clip_index):
         """Delete a clip by its index in the current results list."""
         if 0 <= clip_index < len(self._results):
-            p = self._results[clip_index]
+            p = self._safe_clip_path(self._results[clip_index])
+            if not p:
+                self._prune_missing_results()
+                return {"error": "Clip path is missing or outside the clips folder"}
+            clip_id = None
+            if clip_index < len(self._moments):
+                clip_id = self._moments[clip_index].get("clip_id")
             try:
-                if p.exists():
-                    p.unlink()
+                p.unlink()
                 self._results.pop(clip_index)
                 # Remove matching moments entry
                 if clip_index < len(self._moments):
                     self._moments.pop(clip_index)
+                self._scheduled = [
+                    s for s in self._scheduled
+                    if s.get("clip_id") != clip_id and s.get("clipIdx") != clip_index
+                ]
+                self._scheduled = self._normalize_scheduled_items(self._scheduled)
                 self._save_state()
                 return {"ok": True}
             except Exception as e:
@@ -718,12 +1908,24 @@ class ApiBridge:
 
     def delete_library_file(self, filename):
         """Delete a video file from the clips folder by filename."""
-        target = CLIPS_DIR / filename
-        if target.exists() and target.parent == CLIPS_DIR:
+        target = self._safe_child_path(CLIPS_DIR, filename)
+        if target and target.exists() and target.is_file():
             try:
+                removed_ids = {
+                    self._moments[i].get("clip_id")
+                    for i, p in enumerate(self._results)
+                    if p.name == target.name and i < len(self._moments)
+                }
                 target.unlink()
                 # Also remove from results if it was there
-                self._results = [p for p in self._results if p.name != filename]
+                keep = [i for i, p in enumerate(self._results) if p.name != target.name]
+                self._results = [self._results[i] for i in keep]
+                self._moments = [self._moments[i] for i in keep if i < len(self._moments)]
+                self._scheduled = [
+                    s for s in self._scheduled
+                    if s.get("clip_id") not in removed_ids and s.get("clip_filename") != target.name
+                ]
+                self._scheduled = self._normalize_scheduled_items(self._scheduled)
                 self._save_state()
                 return {"ok": True}
             except Exception as e:
@@ -734,25 +1936,48 @@ class ApiBridge:
 
     def list_all_clips(self):
         """List all video files in the clips directory."""
+        self._prune_missing_results()
         clips = []
         total_size = 0
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+        known = {
+            p.resolve(): i
+            for i, p in enumerate(self._results)
+            if p.exists()
+        }
         if CLIPS_DIR.exists():
             # Single stat() per file — cache the result
             entries = []
             for p in CLIPS_DIR.iterdir():
-                if p.suffix.lower() in _exts:
-                    st = p.stat()
-                    entries.append((p, st))
+                safe_path = self._safe_path_under(CLIPS_DIR, p)
+                if not safe_path or not safe_path.is_file():
+                    continue
+                if safe_path.suffix.lower() in _exts:
+                    st = safe_path.stat()
+                    entries.append((safe_path, st))
             entries.sort(key=lambda x: x[1].st_mtime, reverse=True)
             for p, st in entries:
                 total_size += st.st_size
-                clips.append({
+                clip = {
                     "filename": p.name,
                     "size_mb": round(st.st_size / (1024 * 1024), 1),
                     "modified": st.st_mtime,
-                    "url": f"http://127.0.0.1:{self._video_port}/{p.name}",
-                })
+                    "url": f"http://127.0.0.1:{self._video_port}/{quote(p.name)}",
+                }
+                known_idx = known.get(p.resolve())
+                if known_idx is not None:
+                    moment = self._ensure_moment_identity(
+                        self._moments[known_idx] if known_idx < len(self._moments) else {},
+                        p,
+                    )
+                    if known_idx < len(self._moments):
+                        self._moments[known_idx] = moment
+                    clip.update({
+                        "clip_id": moment.get("clip_id"),
+                        "source_id": moment.get("source_id"),
+                        "source_stem": moment.get("source_stem", ""),
+                    })
+                clips.append(clip)
         return {
             "clips": clips,
             "total_size_mb": round(total_size / (1024 * 1024), 1),
@@ -766,20 +1991,29 @@ class ApiBridge:
         appear in the upload section alongside pipeline-generated clips.
         Returns the updated results list.
         """
+        removed = self._prune_missing_results()
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
         existing = {p.resolve() for p in self._results if p.exists()}
         added = 0
 
         if CLIPS_DIR.exists():
-            for p in sorted(CLIPS_DIR.iterdir(), key=lambda x: x.stat().st_mtime):
-                if p.suffix.lower() in _exts and p.resolve() not in existing:
+            safe_entries = []
+            for p in CLIPS_DIR.iterdir():
+                safe_path = self._safe_path_under(CLIPS_DIR, p)
+                if safe_path and safe_path.is_file() and safe_path.suffix.lower() in _exts:
+                    safe_entries.append(safe_path)
+            for p in sorted(safe_entries, key=lambda x: x.stat().st_mtime):
+                resolved = p.resolve()
+                if resolved not in existing:
                     self._results.append(p)
-                    existing.add(p.resolve())
+                    self._moments.append(self._ensure_moment_identity({}, p))
+                    existing.add(resolved)
                     added += 1
 
-        if added:
+        if added or removed:
             self._save_state()
-            print(f"[+] Imported {added} clip(s) from clips folder")
+            if added:
+                print(f"[+] Imported {added} clip(s) from clips folder")
 
         return self.get_results()
 
@@ -787,29 +2021,112 @@ class ApiBridge:
 
     def save_scheduled(self, scheduled_list):
         """Replace the full scheduled list (called from JS on every change)."""
-        self._scheduled = scheduled_list or []
-        self._save_state()
+        with self._state_lock:
+            self._scheduled = self._normalize_scheduled_items(scheduled_list or [])
+            self._save_state()
         return {"ok": True}
 
     def get_all_scheduled(self):
         """Return the persisted scheduled list."""
-        return {"scheduled": self._scheduled}
+        with self._state_lock:
+            self._prune_missing_results()
+            self._scheduled = self._normalize_scheduled_items(self._scheduled)
+            return {"scheduled": self._scheduled}
 
     # ── Exposed: upload ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_publish_at(meta: dict) -> datetime | None:
+        """Return a timezone-aware UTC publish datetime from upload metadata."""
+        if not isinstance(meta, dict):
+            return None
+
+        raw = meta.get("publish_at") or meta.get("scheduled_time")
+        if raw:
+            text = str(raw).strip()
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            return dt.astimezone(timezone.utc).replace(microsecond=0)
+
+        local = str(meta.get("scheduled_local") or "").strip()
+        offset = meta.get("timezone_offset_minutes")
+        if local and offset is not None:
+            local_dt = datetime.fromisoformat(local)
+            if local_dt.tzinfo is not None:
+                return local_dt.astimezone(timezone.utc).replace(microsecond=0)
+            return (local_dt + timedelta(minutes=int(offset))).replace(
+                tzinfo=timezone.utc,
+                microsecond=0,
+            )
+
+        if meta.get("date") and meta.get("time"):
+            local_dt = datetime.fromisoformat(f"{meta['date']}T{meta['time']}")
+            return local_dt.astimezone(timezone.utc).replace(microsecond=0)
+        return None
+
+    @classmethod
+    def _ordered_upload_metadata(cls, clips_metadata) -> list[tuple[int, dict, datetime | None]]:
+        if not isinstance(clips_metadata, list):
+            raise ValueError("Upload metadata must be a list")
+        parsed = []
+        for original_index, meta in enumerate(clips_metadata):
+            if not isinstance(meta, dict):
+                raise ValueError("Each upload item must be an object")
+            try:
+                publish_at = cls._parse_publish_at(meta)
+            except Exception as exc:
+                raise ValueError(f"Invalid publish time for clip {original_index + 1}: {exc}") from exc
+            parsed.append((original_index, meta, publish_at))
+        return sorted(
+            parsed,
+            key=lambda item: (item[2] or datetime.max.replace(tzinfo=timezone.utc), item[0]),
+        )
+
+    def _validate_upload_metadata(self, clips_metadata) -> list[tuple[int, dict, datetime | None]]:
+        ordered = self._ordered_upload_metadata(clips_metadata)
+        now_utc = datetime.now(timezone.utc)
+        for original_index, meta, publish_at in ordered:
+            privacy = str(meta.get("privacy", "private") or "private").lower()
+            if privacy == "public" and not publish_at:
+                label = meta.get("title") or meta.get("clip_filename") or f"clip {original_index + 1}"
+                raise ValueError(f"Scheduled publish time is required for public upload: {label}")
+            if publish_at and privacy == "public" and publish_at <= now_utc:
+                label = meta.get("title") or meta.get("clip_filename") or f"clip {original_index + 1}"
+                raise ValueError(f"Scheduled publish time is in the past for {label}")
+        return ordered
+
+    def _get_upload_lock(self):
+        lock = getattr(self, "_upload_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._upload_lock = lock
+        return lock
 
     def start_upload(self, clips_metadata, schedule_start, interval_hours, channel_id=None):
         """Upload clips with per-clip metadata.
 
-        clips_metadata: list of {index, title, description, tags, category_id, privacy}
+        clips_metadata: list of {index, clip_id, source_id, title, description, tags, category_id, privacy, publish_at}
         channel_id: YouTube channel ID to upload to (from get_channels())
         """
         if self._processing:
             return {"error": "Processing in progress"}
+        try:
+            ordered = self._validate_upload_metadata(clips_metadata)
+        except Exception as exc:
+            return {"error": str(exc)}
+        if not ordered:
+            return {"error": "No clips to upload"}
+        upload_lock = self._get_upload_lock()
+        if not upload_lock.acquire(blocking=False):
+            return {"error": "Upload already in progress"}
         self._processing = True
         self._cancel = False
         threading.Thread(
             target=self._run_upload,
-            args=(clips_metadata, schedule_start, interval_hours, channel_id),
+            args=(clips_metadata, schedule_start, interval_hours, channel_id, upload_lock),
             daemon=True,
         ).start()
         return {"ok": True}
@@ -818,18 +2135,21 @@ class ApiBridge:
         """Upload a single clip immediately (used by background scheduler)."""
         if clip_index >= len(self._results):
             return {"error": "Invalid clip index"}
-        video_path = self._results[clip_index]
-        if not video_path.exists():
+        video_path = self._safe_clip_path(self._results[clip_index])
+        if not video_path:
             return {"error": "Clip file not found"}
         try:
+            normalized_meta = self._ensure_schedule_description(dict(meta or {}), clip_index)
             upload_to_youtube(
                 video_path,
-                title=meta.get("title", f"Viral Clip #{clip_index + 1}"),
-                description=meta.get("description", ""),
-                tags=meta.get("tags", ["shorts", "viral", "clips"]),
-                category_id=str(meta.get("category_id", "22")),
-                privacy=meta.get("privacy", "private"),
-                channel_id=channel_id,
+                title=normalized_meta.get("title", f"Viral Clip #{clip_index + 1}"),
+                description=normalized_meta.get("final_description") or normalized_meta.get("description", ""),
+                tags=normalized_meta.get("tags", generate_tags()),
+                category_id=DEFAULT_VIDEO_CATEGORY_ID,
+                privacy=normalized_meta.get("privacy", "private"),
+                channel_id=normalized_meta.get("channel_id") or channel_id,
+                account_id=normalized_meta.get("account_id"),
+                cancel_check=lambda: self._cancel,
             )
             return {"ok": True}
         except Exception as e:
@@ -850,20 +2170,12 @@ class ApiBridge:
 
     def load_persisted_state(self):
         """Return persisted results/moments/scheduled for frontend init."""
+        self._prune_missing_results()
         clips = []
         for i, p in enumerate(self._results):
-            if not p.exists():
-                continue
-            clip = {
-                "path": str(p),
-                "filename": p.name,
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 1),
-            }
-            # Include source_stem so frontend can group renamed clips by source video
-            if i < len(self._moments) and self._moments[i].get("source_stem"):
-                clip["source_stem"] = self._moments[i]["source_stem"]
-            clips.append(clip)
+            clips.append(self._clip_payload(i, p, include_url=False))
         return {
+            "schema_version": STATE_SCHEMA_VERSION,
             "clips": clips,
             "moments": self._moments[:len(self._results)],
             "scheduled": self._scheduled,
@@ -880,6 +2192,10 @@ class ApiBridge:
             clip_duration = int(settings.get("clip_duration", CLIP_DURATION))
             min_gap = int(settings.get("min_gap", MIN_GAP))
             style = settings.get("subtitle_style", SUBTITLE_STYLE)
+            subtitle_enabled = subtitles_are_enabled(style)
+            subtitle_placement = normalize_subtitle_placement(
+                settings.get("subtitle_placement", SUBTITLE_PLACEMENT)
+            )
             model = settings.get("whisper_model", WHISPER_MODEL)
             language = settings.get("whisper_language") or None
             preset = settings.get("ffmpeg_preset", FFMPEG_PRESET)
@@ -890,6 +2206,8 @@ class ApiBridge:
             music_volume = float(settings.get("music_volume", 0.12))
             music_start = float(settings.get("music_start", 0))
             music_end = float(settings.get("music_end", 0))
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_warnings: list[str] = []
 
             # ── 1. Download ──────────────────────────────────────────
             if self._cancel:
@@ -897,6 +2215,8 @@ class ApiBridge:
             self._push("download", 0, "Downloading video...")
 
             video_path = self._download_with_progress(url)
+            source_id = self._source_id_for(video_path)
+            source_stem = video_path.stem[:50]
 
             self._push("download", 100, f"Downloaded: {video_path.name}")
 
@@ -950,84 +2270,225 @@ class ApiBridge:
                 return self._cancelled()
             self._push("detect", 0, "Analyzing video for viral moments...")
 
-            moments = find_viral_moments(
-                video_path, num_clips=num_clips, clip_duration=clip_duration, min_gap=min_gap
+            candidates = find_viral_moments(
+                video_path,
+                num_clips=num_clips,
+                clip_duration=clip_duration,
+                min_gap=min_gap,
+                candidate_multiplier=5,
             )
-            # Append moments (batch mode: preserve previous video's moments)
-            self._moments.extend(moments)
+            scene_detection = get_last_scene_detection_diagnostics()
+            scene_status = scene_detection.get("status", "unknown")
+            if scene_status not in {"ok", "zero_changes"}:
+                run_warnings.append(f"scene_detection_{scene_status}")
 
-            if not moments:
+            if not candidates:
                 self._push("detect", 100, "No moments found")
                 return self._error("No viral moments found. Try a longer video or fewer clips.")
 
-            self._push("detect", 100, f"Found {len(moments)} moments")
+            self._push("detect", 55, f"Found {len(candidates)} candidate moments")
+
+            # Pick the real commentary/speech track by sampling the selected
+            # moments. OBS track labels are often misleading.
+            self._push("detect", 60, "Inspecting audio tracks...")
+            speech_stream = None
+            try:
+                speech_stream = select_speech_stream(
+                    video_path, candidates, model, language, SUBTITLES_DIR
+                )
+            except Exception as e:
+                print(f"[audio] Speech stream scan failed: {e}")
+                speech_stream = pick_voice_stream_ordinal(video_path)
+
+            # ── 3. Transcript-rank candidates before rendering ────────
+            stem = source_stem
+            evaluations: list[dict] = []
+            probe_buffer = 14
+            candidate_total = len(candidates)
+
+            for idx, candidate in enumerate(candidates, 1):
+                if self._cancel:
+                    return self._cancelled()
+                start = int(candidate["start"])
+                extended_end = min(int(candidate["end"]) + probe_buffer, int(vid_duration))
+                wav = SUBTITLES_DIR / f"{stem}_probe_{idx}.wav"
+                wav.unlink(missing_ok=True)
+
+                pct = 60 + int((idx - 1) / max(candidate_total, 1) * 25)
+                self._push("detect", pct, f"Scoring candidate {idx}/{candidate_total}...")
+
+                words = []
+                used_stream = speech_stream
+                if extract_audio_clip(video_path, start, extended_end, wav, audio_stream=speech_stream):
+                    words = transcribe_clip(wav, model_size=model, language=language)
+
+                if needs_stream_retry(words, extended_end - start):
+                    words, alt_stream = self._try_alternate_audio_streams(
+                        video_path, start, extended_end, wav, model, language,
+                        idx, candidate_total, speech_stream, return_stream=True,
+                    )
+                    if alt_stream is not None:
+                        used_stream = alt_stream
+
+                evaluation = evaluate_candidate(
+                    candidate,
+                    words,
+                    extraction_start=float(start),
+                    extraction_end=float(extended_end),
+                    video_duration=float(vid_duration),
+                    target_duration=clip_duration,
+                    selected_stream=used_stream,
+                )
+                evaluations.append(evaluation)
+                try:
+                    wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            with self._personalization_lock:
+                personalization_snapshot = json.loads(json.dumps(self._personalization))
+            apply_learned_scoring(
+                evaluations,
+                personalization_snapshot,
+                source_id=source_id,
+                source_stem=source_stem,
+            )
+            selected = select_best_candidates(
+                evaluations,
+                num_clips,
+                min_gap=max(8, min_gap),
+                score_key="learned_quality_score",
+            )
+            shadow_scoring = build_shadow_scoring_report(
+                evaluations,
+                selected,
+                personalization_snapshot,
+                source_id=source_id,
+                source_stem=source_stem,
+                max_count=num_clips,
+                min_gap=max(8, min_gap),
+            )
+            debug_path = SUBTITLES_DIR / f"{stem}_candidate_debug.json"
+            run_debug_path = SUBTITLES_DIR / f"{stem}_run_debug.json"
+            debug_settings = {
+                "num_clips": num_clips,
+                "clip_duration": clip_duration,
+                "min_gap": min_gap,
+                "whisper_model": model,
+                "whisper_language": language,
+                "subtitle_style": style,
+                "subtitle_placement": subtitle_placement,
+                "ffmpeg_preset": preset,
+                "video_crf": crf,
+                "crop_vertical": crop_vertical,
+                "candidate_multiplier": 5,
+            }
+            try:
+                write_debug_report(
+                    debug_path,
+                    video_path,
+                    candidates,
+                    evaluations,
+                    selected,
+                    scene_detection=scene_detection,
+                    settings=debug_settings,
+                    video_duration=vid_duration,
+                    warnings=run_warnings,
+                    shadow_scoring=shadow_scoring,
+                    run_id=run_id,
+                )
+                print(f"[rank] Candidate debug saved: {debug_path}")
+                self._log_shadow_scoring(shadow_scoring)
+            except Exception as e:
+                print(f"[rank] Failed to save candidate debug: {e}")
+
+            if not selected:
+                self._push("detect", 100, "No high-quality clips found")
+                return self._error("No high-quality clips found. Try a longer video or lower the clip quality bar.")
+
+            moments = [item["moment"] for item in selected]
+            for m in moments:
+                m["source_id"] = source_id
+                m["source_path"] = str(video_path)
+                m["source_stem"] = source_stem
+                m["game_title"] = self._infer_game_title_from_path(video_path)
+                m["clip_id"] = self._clip_id_for(m)
+            self._push("detect", 100, f"Selected {len(moments)} good clips from {len(candidates)} candidates")
             self._js(f"window.onMomentsDetected({json.dumps(moments)})")
 
-            # ── 3. Process each clip ─────────────────────────────────
-            stem = video_path.stem[:50]
+            # ── 4. Render accepted clips ──────────────────────────────
             done: list[Path] = []
-            total = len(moments)
+            done_moments: list[dict] = []
+            final_clip_debug: list[dict] = []
+            total = len(selected)
 
-            # Buffer to extend audio extraction for sentence boundary search
-            SENTENCE_BUFFER = 5  # seconds beyond original end
-
-            for idx, m in enumerate(moments):
+            for idx, item in enumerate(selected, 1):
                 if self._cancel:
                     return self._cancelled()
-                clip_num = idx + 1
-                start, end = m["start"], m["end"]
-                original_duration = end - start
-
-                # ── 3b: extract audio WITH extended buffer ──
-                # Extract a few extra seconds beyond the clip end so we can
-                # find a natural sentence ending even if it falls just outside.
-                self._clip_push(clip_num, total, "audio", 50, f"Clip {clip_num}/{total}: Extracting audio...")
+                m = item["moment"]
+                words = item["words"]
+                start, end = int(m["start"]), int(m["end"])
+                clip_num = idx
+                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
                 wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
-                extended_end = min(end + SENTENCE_BUFFER, int(vid_duration))
-                r = extract_audio_clip(video_path, start, extended_end, wav)
-                if not r:
-                    self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num}: failed, skipping")
-                    continue
-                self._clip_push(clip_num, total, "audio", 100, "Audio extracted")
+                ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
+                for stale in (wav, ass, out):
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
-                # ── 3c: transcribe the extended audio ──
-                if self._cancel:
-                    return self._cancelled()
-                self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
-                words = transcribe_clip(wav, model_size=model, language=language)
-                self._clip_push(clip_num, total, "transcribe", 100, f"{len(words)} words transcribed")
+                self._clip_push(clip_num, total, "audio", 40, f"Clip {clip_num}/{total}: Final transcription...")
+                final_probe_end = min(end + 8, int(vid_duration))
+                final_words = []
+                final_stream = m.get("speech_stream", speech_stream)
+                if extract_audio_clip(video_path, start, final_probe_end, wav, audio_stream=final_stream):
+                    final_words = transcribe_clip(wav, model_size=model, language=language)
+                if needs_stream_retry(final_words, final_probe_end - start):
+                    retry_words, retry_stream = self._try_alternate_audio_streams(
+                        video_path, start, final_probe_end, wav, model, language,
+                        clip_num, total, final_stream, return_stream=True,
+                    )
+                    if retry_words:
+                        final_words = retry_words
+                        final_stream = retry_stream
 
-                # ── 3c.1: find natural sentence boundary ──
-                # Adjust clip end so the speaker finishes their sentence
-                new_duration = find_sentence_boundary(
-                    words,
-                    clip_duration=float(original_duration),
-                    min_keep=0.60,
-                    max_extend=float(SENTENCE_BUFFER),
-                )
-                if new_duration is not None:
-                    end = start + int(new_duration + 0.5)  # round to nearest second
-                    # Trim words to the adjusted duration
-                    words = [w for w in words if w["end"] <= new_duration + 0.1]
-                    self._clip_push(clip_num, total, "transcribe", 100,
-                                    f"Adjusted to {end - start}s (sentence end)")
-                else:
-                    # No boundary found — trim words to original duration
-                    words = [w for w in words if w["end"] <= original_duration + 0.1]
+                if final_words:
+                    final_candidate = {
+                        **item["candidate"],
+                        "start": start,
+                        "end": end,
+                        "duration": end - start,
+                    }
+                    final_eval = evaluate_candidate(
+                        final_candidate,
+                        final_words,
+                        extraction_start=float(start),
+                        extraction_end=float(final_probe_end),
+                        video_duration=float(vid_duration),
+                        target_duration=clip_duration,
+                        selected_stream=final_stream,
+                    )
+                    if final_eval["words"]:
+                        keep_rank = m.get("quality_rank")
+                        keep_selection_quality = m.get("selection_quality_score")
+                        m.update(final_eval["moment"])
+                        if keep_rank is not None:
+                            m["quality_rank"] = keep_rank
+                        if keep_selection_quality is not None:
+                            m["selection_quality_score"] = keep_selection_quality
+                        words = final_eval["words"]
+                        start, end = int(m["start"]), int(m["end"])
 
-                # Update moment info for UI
-                m["end"] = end
-                m["duration"] = end - start
-                # Store transcript text for LLM title generation
-                m["transcript"] = " ".join(w.get("word", w.get("text", "")) for w in words).strip()
+                self._clip_push(clip_num, total, "audio", 100, f"Clip {clip_num}/{total}: Preparing...")
 
-                # ── 3a: compute crop params (uses adjusted start/end) ──
+                # ── 4a: compute crop params (uses adjusted start/end) ──
                 crop_params = None
                 crop_w, crop_h = get_dimensions(video_path)
                 if crop_vertical:
                     if self._cancel:
                         return self._cancelled()
-                    self._clip_push(clip_num, total, "audio", 0, f"Clip {clip_num}/{total}: Tracking speakers...")
+                    self._clip_push(clip_num, total, "audio", 100, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
                         crop_params = get_crop_params_dynamic(video_path, start, end)
                     except Exception as e:
@@ -1036,31 +2497,52 @@ class ApiBridge:
                     if crop_params:
                         crop_w, crop_h = crop_params[0], crop_params[1]
 
-                # ── 3d: subtitles (pass cropped dimensions) ──
+                # ── 4b: subtitles (pass cropped dimensions) ──
                 if self._cancel:
                     return self._cancelled()
-                self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
-                ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
-                generate_subtitles(
-                    words, ass,
-                    video_width=crop_w,
-                    video_height=crop_h,
-                    style=style,
+                resolved_subtitle_placement = resolve_subtitle_placement(
+                    crop_w, crop_h, subtitle_placement
                 )
-                self._clip_push(clip_num, total, "subtitle", 100, "Subtitles generated")
+                if subtitle_enabled:
+                    self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
+                    ass_path = generate_subtitles(
+                        words, ass,
+                        video_width=crop_w,
+                        video_height=crop_h,
+                        style=style,
+                        subtitle_placement=subtitle_placement,
+                    )
+                else:
+                    ass.unlink(missing_ok=True)
+                    ass_path = None
+                m["subtitle_generated"] = bool(ass_path)
+                m["subtitle_placement"] = resolved_subtitle_placement
+                self._clip_push(
+                    clip_num, total, "subtitle", 100,
+                    "Subtitles generated" if ass_path else ("Captions disabled" if not subtitle_enabled else "No subtitles generated"),
+                )
 
-                # ── 3e: render clip with crop + burned subs ──
+                # ── 4c: render clip with crop + burned subs ──
                 if self._cancel:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "render", 0, f"Clip {clip_num}/{total}: Rendering...")
-                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
                 clip_result = extract_clip(
                     video_path, start, end, out,
-                    subtitle_path=ass if words else None,
+                    subtitle_path=ass_path if ass_path else None,
                     crop_params=crop_params,
                     preset=preset, crf=crf,
                 )
                 if clip_result and clip_result.path:
+                    m["subtitles_burned"] = bool(clip_result.subtitles_burned and ass_path)
+                    m["source_id"] = source_id
+                    m["source_path"] = str(video_path)
+                    m["source_stem"] = source_stem
+                    m["game_title"] = self._infer_game_title_from_path(video_path)
+                    m["clip_id"] = self._clip_id_for(m, clip_result.path)
+                    if clip_result.warning:
+                        m["render_warning"] = clip_result.warning
+                        run_warnings.append(f"clip_{clip_num}_{clip_result.warning}")
+
                     # Post-processing: apply video effect
                     if effect and effect != "none":
                         self._clip_push(clip_num, total, "render", 80,
@@ -1069,18 +2551,49 @@ class ApiBridge:
 
                     # Post-processing: mix background music
                     if music_file:
-                        music_path = Path(music_file)
-                        if not music_path.is_absolute():
-                            music_path = MUSIC_DIR / music_file
-                        if music_path.exists():
+                        music_path = self._safe_child_path(MUSIC_DIR, music_file)
+                        if music_path and music_path.exists() and music_path.is_file():
                             self._clip_push(clip_num, total, "render", 90,
                                             f"Clip {clip_num}/{total}: Adding music...")
                             add_background_music(
                                 clip_result.path, music_path, music_volume,
                                 trim_start=music_start, trim_end=music_end,
                             )
+                        else:
+                            run_warnings.append(f"clip_{clip_num}_music_file_missing")
 
                     done.append(clip_result.path)
+                    done_moments.append(m)
+                    final_clip_debug.append(
+                        {
+                            "index": clip_num,
+                            "path": str(clip_result.path),
+                            "clip_id": m.get("clip_id"),
+                            "source_id": m.get("source_id"),
+                            "subtitle_path": str(ass_path) if ass_path else None,
+                            "start": start,
+                            "end": end,
+                            "duration": end - start,
+                            "base_quality_score": item.get("quality_score"),
+                            "quality_score": m.get("quality_score"),
+                            "selection_quality_score": m.get("selection_quality_score"),
+                            "selection_rank_score": item.get("selection_rank_score"),
+                            "selection_score_source": item.get("selection_score_source", "quality_score"),
+                            "learned_score": item.get("shadow_scoring", {}).get("learned_quality_score"),
+                            "learned_quality_score": item.get("shadow_scoring", {}).get("learned_quality_score"),
+                            "learned_adjustment": item.get("shadow_scoring", {}).get("learned_adjustment"),
+                            "rank_delta": item.get("shadow_scoring", {}).get("rank_delta"),
+                            "selection_delta": item.get("shadow_scoring", {}).get("selection_delta", ""),
+                            "quality_rank": m.get("quality_rank"),
+                            "word_count": m.get("word_count"),
+                            "speech_stream": m.get("speech_stream"),
+                            "subtitle_generated": m.get("subtitle_generated"),
+                            "subtitles_burned": m.get("subtitles_burned"),
+                            "subtitle_placement": m.get("subtitle_placement"),
+                            "render_warning": m.get("render_warning", ""),
+                            "transcript": m.get("transcript", ""),
+                        }
+                    )
                     if not clip_result.subtitles_burned and clip_result.warning:
                         self._clip_push(clip_num, total, "render", 100,
                                         f"Clip {clip_num} done (WARNING: {clip_result.warning})")
@@ -1091,7 +2604,6 @@ class ApiBridge:
                 else:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} failed")
 
-                # cleanup temp wav
                 try:
                     wav.unlink(missing_ok=True)
                 except Exception:
@@ -1099,6 +2611,25 @@ class ApiBridge:
 
             # Append results (batch mode: preserve previous video's clips)
             self._results.extend(done)
+            self._moments.extend(done_moments)
+            try:
+                write_debug_report(
+                    run_debug_path,
+                    video_path,
+                    candidates,
+                    evaluations,
+                    selected,
+                    scene_detection=scene_detection,
+                    settings=debug_settings,
+                    video_duration=vid_duration,
+                    final_clips=final_clip_debug,
+                    warnings=run_warnings,
+                    shadow_scoring=shadow_scoring,
+                    run_id=run_id,
+                )
+                print(f"[rank] Run debug saved: {run_debug_path}")
+            except Exception as e:
+                print(f"[rank] Failed to save final run debug: {e}")
             self._save_state()
             self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null)")
 
@@ -1154,50 +2685,190 @@ class ApiBridge:
             info = ydl.extract_info(url, download=True)
             return Path(ydl.prepare_filename(info))
 
+    def _try_alternate_audio_streams(self, video_path, start, end, wav, model, language,
+                                     clip_num, total, preferred_stream=None,
+                                     return_stream=False):
+        """If the preferred mic stream is silent, try other audio tracks for speech."""
+        streams = get_audio_streams(video_path)
+        if len(streams) < 2:
+            return ([], None) if return_stream else []
+
+        preferred = preferred_stream
+        if preferred is None:
+            preferred = pick_voice_stream_ordinal(video_path)
+        for stream in streams:
+            ordinal = int(stream["ordinal"])
+            if preferred is not None and ordinal == preferred:
+                continue
+            title = stream.get("title") or f"0:a:{ordinal}"
+            print(f"[audio] No words on preferred stream; trying 0:a:{ordinal} ({title})")
+            self._clip_push(
+                clip_num, total, "transcribe", 40,
+                f"Clip {clip_num}/{total}: Trying audio track {ordinal + 1}..."
+            )
+            r = extract_audio_clip(video_path, start, end, wav, audio_stream=ordinal)
+            if not r:
+                continue
+            words = transcribe_clip(wav, model_size=model, language=language)
+            if words:
+                print(f"[audio] Using 0:a:{ordinal} ({title}) for subtitles")
+                return (words, ordinal) if return_stream else words
+
+        return ([], None) if return_stream else []
+
     # ── Upload orchestrator (background thread) ──────────────────────────
 
-    def _run_upload(self, clips_metadata, schedule_start_iso, interval_hours, channel_id=None):
-        try:
-            start_time = datetime.fromisoformat(schedule_start_iso) if schedule_start_iso else None
-            total = len(clips_metadata)
+    def _scheduled_upload_active(self, clip_idx, meta=None, channel_id=None) -> bool:
+        for item in self._scheduled:
+            if item.get("uploaded"):
+                continue
+            if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                continue
+            if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
+                continue
+            if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                continue
+            if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                continue
+            if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                continue
+            return True
+        return False
 
-            for i, meta in enumerate(clips_metadata):
+    def _scheduled_item_matches_clip(self, item, clip_idx, meta=None) -> bool:
+        """Match schedule entries by stable identity before falling back to legacy indexes."""
+        if not isinstance(item, dict):
+            return False
+        meta = meta or {}
+        try:
+            resolved_idx = int(clip_idx)
+        except (TypeError, ValueError):
+            resolved_idx = -1
+
+        target_clip_id = str(meta.get("clip_id") or "").strip()
+        target_filename = str(meta.get("clip_filename") or "").strip()
+        moments = getattr(self, "_moments", [])
+        results = getattr(self, "_results", [])
+        if 0 <= resolved_idx < len(moments):
+            moment = moments[resolved_idx]
+            if isinstance(moment, dict) and not target_clip_id:
+                target_clip_id = str(moment.get("clip_id") or "").strip()
+        if 0 <= resolved_idx < len(results) and not target_filename:
+            target_filename = Path(results[resolved_idx]).name
+
+        item_clip_id = str(item.get("clip_id") or "").strip()
+        item_filename = str(item.get("clip_filename") or "").strip()
+
+        if target_clip_id or item_clip_id:
+            return bool(target_clip_id and item_clip_id and target_clip_id == item_clip_id)
+        if target_filename or item_filename:
+            return bool(target_filename and item_filename and target_filename == item_filename)
+
+        try:
+            return int(item.get("clipIdx", -1)) == resolved_idx
+        except (TypeError, ValueError):
+            return False
+
+    def _mark_scheduled_uploaded(self, clip_idx, meta, upload_result=None):
+        """Mark the matching scheduled item as uploaded after YouTube accepts it."""
+        timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        changed = False
+        for item in self._scheduled:
+            if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                continue
+            if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                continue
+            if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                continue
+            if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                continue
+            item["uploaded"] = True
+            item["uploaded_at"] = timestamp
+            if isinstance(upload_result, dict):
+                if upload_result.get("id"):
+                    item["youtube_id"] = upload_result["id"]
+                if upload_result.get("url"):
+                    item["youtube_url"] = upload_result["url"]
+            changed = True
+        if changed:
+            self._save_state()
+        return changed
+
+    def _run_upload(self, clips_metadata, schedule_start_iso, interval_hours, channel_id=None, upload_lock=None):
+        try:
+            ordered_metadata = self._validate_upload_metadata(clips_metadata)
+            total = len(ordered_metadata)
+            uploaded = 0
+            skipped = 0
+
+            for i, (_original_index, meta, scheduled) in enumerate(ordered_metadata):
                 if self._cancel:
                     return self._cancelled()
                 pct = int((i / total) * 100)
+
+                idx = self._resolve_clip_index(meta)
+                if idx is None:
+                    skipped += 1
+                    continue
+                video_path = self._safe_clip_path(self._results[idx])
+                if not video_path:
+                    skipped += 1
+                    continue
+                meta = self._ensure_schedule_description(dict(meta), idx)
+                if not self._scheduled_upload_active(idx, meta, channel_id):
+                    skipped += 1
+                    print(f"[upload] Skipping Clip {idx + 1}; it is no longer scheduled")
+                    continue
+
                 self._push("upload", pct, f"Uploading clip {i + 1}/{total}...")
 
-                idx = meta.get("index", i)
-                if idx >= len(self._results):
-                    continue
-                video_path = self._results[idx]
+                clip_base_pct = int((i / total) * 100)
+                clip_span_pct = 100 / total
 
-                scheduled = None
-                if start_time:
-                    scheduled = start_time + timedelta(hours=int(interval_hours) * i)
+                def _upload_progress(chunk_percent, clip_number=i + 1):
+                    overall = min(99, int(clip_base_pct + (float(chunk_percent) / 100.0) * clip_span_pct))
+                    self._push("upload", overall, f"Uploading clip {clip_number}/{total}... {int(chunk_percent)}%")
 
-                upload_to_youtube(
+                result = upload_to_youtube(
                     video_path,
                     title=meta.get("title", f"Viral Clip #{i + 1}"),
-                    description=meta.get("description", ""),
-                    tags=meta.get("tags", ["shorts", "viral", "clips"]),
-                    category_id=str(meta.get("category_id", "22")),
+                    description=meta.get("final_description") or meta.get("description", ""),
+                    tags=meta.get("tags", generate_tags()),
+                    category_id=DEFAULT_VIDEO_CATEGORY_ID,
                     privacy=meta.get("privacy", "private"),
                     scheduled_time=scheduled,
-                    channel_id=channel_id,
+                    channel_id=meta.get("channel_id") or channel_id,
+                    account_id=meta.get("account_id"),
+                    cancel_check=lambda: self._cancel or not self._scheduled_upload_active(idx, meta, channel_id),
+                    on_progress=_upload_progress,
                 )
+                uploaded += 1
+                if self._mark_scheduled_uploaded(idx, meta, result):
+                    self._js("window.onScheduleUpdated()")
 
                 # Auto-delete from disk after successful upload
                 if self._delete_after_upload:
                     self._delete_uploaded_clip(idx, video_path)
 
-            self._push("upload", 100, f"All {total} clips uploaded!")
-            self._js(f"window.onPipelineComplete(true, {total}, {total}, null)")
+            msg = f"Uploaded {uploaded} clip(s)"
+            if skipped:
+                msg += f"; skipped {skipped} removed/missing clip(s)"
+            self._push("upload", 100, msg)
+            success = skipped == 0 and uploaded == total
+            error_msg = "null" if success else json.dumps(msg)
+            self._js(f"window.onPipelineComplete({str(success).lower()}, {uploaded}, {total}, {error_msg})")
 
         except Exception as e:
+            if self._cancel:
+                return self._cancelled()
             self._error(f"Upload failed: {e}")
         finally:
             self._processing = False
+            if upload_lock:
+                try:
+                    upload_lock.release()
+                except RuntimeError:
+                    pass
 
     # ── Background upload scheduler ──────────────────────────────────────
 
@@ -1207,7 +2878,7 @@ class ApiBridge:
             now = datetime.now()
             changed = False
 
-            for item in self._scheduled:
+            for item in list(self._scheduled):
                 if item.get("uploaded"):
                     continue
                 try:
@@ -1216,38 +2887,64 @@ class ApiBridge:
                     continue
 
                 if now >= sched_dt:
-                    clip_idx = item.get("clipIdx", -1)
-                    if 0 <= clip_idx < len(self._results):
-                        video_path = self._results[clip_idx]
-                        if video_path.exists():
-                            title = item.get("title", f"Viral Clip #{clip_idx + 1}")
-                            print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
-                            self._js(f"window.onSchedulerStatus('Uploading: {self._esc(title)}')")
-                            try:
-                                tags = item.get("tags", "shorts, viral, clips")
-                                if isinstance(tags, str):
-                                    tags = [t.strip() for t in tags.split(",") if t.strip()]
-                                upload_to_youtube(
-                                    video_path,
-                                    title=title,
-                                    description=item.get("description", ""),
-                                    tags=tags,
-                                    category_id=str(item.get("category_id", "22")),
-                                    privacy=item.get("privacy", "private"),
-                                    channel_id=item.get("channel_id"),
-                                )
-                                item["uploaded"] = True
-                                changed = True
-                                print(f"[scheduler] Uploaded: {title}")
-                                self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
+                    if self._scheduled_item_missed_upload_window(item, sched_dt, now):
+                        if item.get("scheduler_status") != "missed":
+                            item["scheduler_status"] = "missed"
+                            item["missed_at"] = now.replace(microsecond=0).isoformat()
+                            changed = True
+                            print("[scheduler] Public scheduled upload missed; waiting for manual reschedule/upload")
+                        continue
+                    clip_idx = self._resolve_clip_index(item)
+                    video_path = self._safe_clip_path(self._results[clip_idx]) if clip_idx is not None and 0 <= clip_idx < len(self._results) else None
+                    if not video_path:
+                        self._scheduled.remove(item)
+                        changed = True
+                        print("[scheduler] Removed scheduled item for a missing clip")
+                        continue
+                    item["clipIdx"] = clip_idx
+                    upload_lock = self._get_upload_lock()
+                    if self._processing or not upload_lock.acquire(blocking=False):
+                        print("[scheduler] Upload already in progress; will retry scheduled item")
+                        continue
+                    self._processing = True
+                    self._cancel = False
+                    title = item.get("title", f"Viral Clip #{clip_idx + 1}")
+                    print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
+                    status_message = json.dumps(f"Uploading: {title}")
+                    self._js(f"window.onSchedulerStatus({status_message})")
+                    try:
+                        tags = item.get("tags", generate_tags())
+                        if isinstance(tags, str):
+                            tags = [t.strip() for t in tags.split(",") if t.strip()]
+                        upload_to_youtube(
+                            video_path,
+                            title=title,
+                            description=item.get("final_description") or item.get("description", ""),
+                            tags=tags,
+                            category_id=DEFAULT_VIDEO_CATEGORY_ID,
+                            privacy=item.get("privacy", "private"),
+                            channel_id=item.get("channel_id"),
+                            account_id=item.get("account_id"),
+                            cancel_check=lambda item=item: self._cancel or item not in self._scheduled,
+                        )
+                        item["uploaded"] = True
+                        changed = True
+                        print(f"[scheduler] Uploaded: {title}")
+                        self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
 
-                                # Auto-delete from disk after successful upload
-                                if self._delete_after_upload:
-                                    self._delete_uploaded_clip(clip_idx, video_path)
+                        # Auto-delete from disk after successful upload
+                        if self._delete_after_upload:
+                            self._delete_uploaded_clip(clip_idx, video_path)
 
-                            except Exception as e:
-                                print(f"[scheduler] Upload failed: {e}")
-                                self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
+                    except Exception as e:
+                        print(f"[scheduler] Upload failed: {e}")
+                        self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
+                    finally:
+                        self._processing = False
+                        try:
+                            upload_lock.release()
+                        except RuntimeError:
+                            pass
 
             if changed:
                 self._save_state()
@@ -1255,56 +2952,235 @@ class ApiBridge:
 
             time.sleep(30)
 
+    def _scheduled_item_missed_upload_window(self, item, sched_dt, now=None) -> bool:
+        """Return True when an overdue public item should wait for user action."""
+        if not isinstance(item, dict):
+            return False
+        privacy = str(item.get("privacy", "private") or "private").lower()
+        if privacy != "public":
+            return False
+        now = now or datetime.now()
+        return now > sched_dt + SCHEDULER_MISSED_GRACE
+
     def _delete_uploaded_clip(self, clip_idx, video_path):
         """Delete a clip file from disk after successful upload."""
         try:
-            if video_path.exists():
-                video_path.unlink()
-                print(f"[cleanup] Deleted uploaded clip: {video_path.name}")
-                self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(video_path.name)}`)")
+            safe_path = self._safe_clip_path(video_path)
+            if safe_path:
+                deleted_name = safe_path.name
+                safe_path.unlink()
+                self._prune_missing_results()
+                print(f"[cleanup] Deleted uploaded clip: {deleted_name}")
+                self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(deleted_name)}`)")
         except Exception as e:
             print(f"[cleanup] Failed to delete {video_path.name}: {e}")
 
     # ── State persistence ────────────────────────────────────────────────
 
+    def _backup_json_file(self, path: Path, label: str) -> Path | None:
+        if not path.exists():
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"{path.stem}.{label}.{timestamp}{path.suffix}.bak")
+        try:
+            shutil.copy2(path, backup)
+            return backup
+        except Exception as e:
+            print(f"[state] Failed to back up {path.name}: {e}")
+            return None
+
+    def _backup_state_file(self, label: str) -> Path | None:
+        backup = self._backup_json_file(STATE_FILE, label)
+        if backup:
+            print(f"[state] Backed up state before migration: {backup}")
+        return backup
+
+    def _write_json_atomic(self, path: Path, data: dict):
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _write_state_atomic(self, data: dict):
+        self._write_json_atomic(STATE_FILE, data)
+
+    def _save_personalization(self):
+        """Persist feedback history to personalization.json."""
+        with self._personalization_lock:
+            data = {
+                "schema_version": PERSONALIZATION_SCHEMA_VERSION,
+                "events": self._personalization.get("events", []),
+                "clips": self._personalization.get("clips", {}),
+            }
+            self._personalization = data
+            try:
+                self._write_json_atomic(PERSONALIZATION_FILE, data)
+            except Exception as e:
+                print(f"[!] Failed to save personalization: {e}")
+
+    def _load_personalization(self):
+        """Load feedback history from personalization.json."""
+        if not PERSONALIZATION_FILE.exists():
+            self._personalization = self._empty_personalization()
+            self._save_personalization()
+            return
+        with self._personalization_lock:
+            try:
+                data = json.loads(PERSONALIZATION_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("root JSON value is not an object")
+                events = data.get("events", [])
+                clips = data.get("clips", {})
+                if not isinstance(events, list):
+                    events = []
+                if not isinstance(clips, dict):
+                    clips = {}
+                self._personalization = {
+                    "schema_version": PERSONALIZATION_SCHEMA_VERSION,
+                    "events": events,
+                    "clips": clips,
+                }
+                if data.get("schema_version") != PERSONALIZATION_SCHEMA_VERSION:
+                    self._save_personalization()
+                print(f"[+] Restored personalization: {len(events)} feedback event(s)")
+            except Exception as e:
+                backup = self._backup_json_file(PERSONALIZATION_FILE, "corrupt")
+                if backup:
+                    print(f"[personalization] Backed up corrupt feedback file: {backup}")
+                print(f"[!] Failed to load personalization: {e}")
+                self._personalization = self._empty_personalization()
+
     def _save_state(self):
         """Persist results, moments, schedule, and settings to JSON."""
-        data = {
-            "results": [str(p) for p in self._results],
-            "moments": self._moments,
-            "scheduled": self._scheduled,
-            "delete_after_upload": self._delete_after_upload,
-            "user_settings": self._user_settings,
-        }
-        try:
-            STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception as e:
-            print(f"[!] Failed to save state: {e}")
+        with self._state_lock:
+            aligned_moments = []
+            for i, path in enumerate(self._results):
+                moment = self._moments[i] if i < len(self._moments) else {}
+                aligned_moments.append(self._ensure_moment_identity(moment, path))
+            self._moments = aligned_moments
+            self._scheduled = self._normalize_scheduled_items(self._scheduled)
+
+            data = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "results": [str(p) for p in self._results],
+                "moments": self._moments,
+                "scheduled": self._scheduled,
+                "delete_after_upload": self._delete_after_upload,
+                "user_settings": self._user_settings,
+            }
+            try:
+                self._write_state_atomic(data)
+            except Exception as e:
+                print(f"[!] Failed to save state: {e}")
 
     def _load_state(self):
         """Load persisted state from previous session."""
         if not STATE_FILE.exists():
             return
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Restore results as Path objects, keeping moments aligned
-            paths = [Path(p) for p in data.get("results", [])]
-            all_moments = data.get("moments", [])
-            # Filter out missing files AND their corresponding moments
-            self._results = []
-            self._moments = []
-            for i, p in enumerate(paths):
-                if p.exists():
-                    self._results.append(p)
-                    self._moments.append(all_moments[i] if i < len(all_moments) else {})
-            self._scheduled = data.get("scheduled", [])
-            self._delete_after_upload = data.get("delete_after_upload", False)
-            self._user_settings = data.get("user_settings", {})
-            print(f"[+] Restored state: {len(self._results)} clips, {len(self._scheduled)} scheduled")
-            if self._user_settings:
-                print(f"[+] Restored user settings: {list(self._user_settings.keys())}")
-        except Exception as e:
-            print(f"[!] Failed to load state: {e}")
+        with self._state_lock:
+            try:
+                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    print("[!] Failed to load state: root JSON value is not an object")
+                    return
+
+                try:
+                    schema_version = int(data.get("schema_version") or 1)
+                except (TypeError, ValueError):
+                    schema_version = 1
+
+                paths = list(data.get("results", []))
+                all_moments = data.get("moments", [])
+                if not isinstance(all_moments, list):
+                    all_moments = []
+                old_scheduled = data.get("scheduled", [])
+                if not isinstance(old_scheduled, list):
+                    old_scheduled = []
+
+                self._results = []
+                self._moments = []
+                index_map: dict[int, int] = {}
+                identity_missing = schema_version < STATE_SCHEMA_VERSION
+                for i, path in enumerate(paths):
+                    safe_path = self._safe_clip_path(path)
+                    if not safe_path:
+                        continue
+                    index_map[i] = len(self._results)
+                    moment = all_moments[i] if i < len(all_moments) else {}
+                    if not isinstance(moment, dict) or not moment.get("clip_id") or not moment.get("source_id"):
+                        identity_missing = True
+                    self._results.append(safe_path)
+                    self._moments.append(self._ensure_moment_identity(moment, safe_path))
+
+                schedule_missing_identity = any(
+                    isinstance(item, dict) and not item.get("clip_id")
+                    for item in old_scheduled
+                )
+                self._scheduled = self._normalize_scheduled_items(old_scheduled, legacy_index_map=index_map)
+                self._delete_after_upload = bool(data.get("delete_after_upload", False))
+                self._user_settings = data.get("user_settings", {}) if isinstance(data.get("user_settings", {}), dict) else {}
+
+                removed_missing_files = len(self._results) != len(paths)
+                removed_scheduled_items = len(self._scheduled) != len(old_scheduled)
+                needs_rewrite = (
+                    schema_version != STATE_SCHEMA_VERSION
+                    or identity_missing
+                    or schedule_missing_identity
+                    or removed_missing_files
+                    or removed_scheduled_items
+                )
+                if schema_version < STATE_SCHEMA_VERSION:
+                    self._backup_state_file(f"pre_v{STATE_SCHEMA_VERSION}")
+                if needs_rewrite:
+                    self._save_state()
+
+                print(f"[+] Restored state: {len(self._results)} clips, {len(self._scheduled)} scheduled")
+                if self._user_settings:
+                    print(f"[+] Restored user settings: {list(self._user_settings.keys())}")
+            except Exception as e:
+                print(f"[!] Failed to load state: {e}")
+
+    def _log_shadow_scoring(self, shadow_scoring: dict):
+        if not shadow_scoring:
+            return
+        if not shadow_scoring.get("has_learning_signals"):
+            print(
+                f"[rank] Learned scoring checked {shadow_scoring.get('candidate_count', 0)} "
+                "candidate(s); no feedback signals yet, base ranking used"
+            )
+            return
+
+        changes = shadow_scoring.get("top_changes", [])
+        changed_count = len(changes)
+        learned_add = sum(1 for row in changes if row.get("selection_delta") == "added_by_learning")
+        learned_drop = sum(1 for row in changes if row.get("selection_delta") == "dropped_by_learning")
+        cap = shadow_scoring.get("learned_selection_max_adjustment", 0)
+        changed = "changed selection" if shadow_scoring.get("output_changed") else "kept the same selection"
+        print(
+            f"[rank] Learned scoring blend: cap ±{cap}, {changed_count} reorder signal(s), "
+            f"{learned_add} added, {learned_drop} dropped; {changed}"
+        )
+        for row in changes[:3]:
+            start = row.get("start")
+            end = row.get("end")
+            delta = row.get("rank_delta")
+            current = row.get("baseline_rank")
+            shadow = row.get("shadow_rank")
+            score = row.get("learned_quality_score", row.get("shadow_score"))
+            print(
+                f"[rank]   candidate {row.get('candidate_rank')} {start}-{end}s: "
+                f"rank {current}->{shadow} (delta {delta}), learned_score={score}"
+            )
 
     # ── Progress push helpers ────────────────────────────────────────────
 
@@ -1362,4 +3238,12 @@ class ApiBridge:
 
     @staticmethod
     def _esc(s):
-        return str(s).replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+        return (
+            str(s)
+            .replace("\\", "\\\\")
+            .replace("`", "\\`")
+            .replace("$", "\\$")
+            .replace("'", "\\'")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+        )

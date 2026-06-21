@@ -97,6 +97,44 @@ STYLES = {
     },
 }
 
+NO_SUBTITLE_STYLE = "none"
+
+DEFAULT_SUBTITLE_PLACEMENT = {
+    "x_pct": 50,
+    "y_pct": 82,
+    "width_pct": 86,
+}
+
+
+def normalize_subtitle_placement(placement: dict | None = None) -> dict:
+    """Clamp caption-box placement percentages into a usable video safe area."""
+    data = placement if isinstance(placement, dict) else {}
+    return {
+        "x_pct": _clamp_pct(data.get("x_pct"), DEFAULT_SUBTITLE_PLACEMENT["x_pct"], 10, 90),
+        "y_pct": _clamp_pct(data.get("y_pct"), DEFAULT_SUBTITLE_PLACEMENT["y_pct"], 12, 92),
+        "width_pct": _clamp_pct(data.get("width_pct"), DEFAULT_SUBTITLE_PLACEMENT["width_pct"], 45, 96),
+    }
+
+
+def resolve_subtitle_placement(
+    video_width: int,
+    video_height: int,
+    placement: dict | None = None,
+) -> dict:
+    """Return requested percentages plus resolved ASS pixel coordinates/margins."""
+    normalized = normalize_subtitle_placement(placement)
+    layout = _subtitle_layout(video_width, video_height, normalized)
+    return {
+        **normalized,
+        "x_px": layout["x"],
+        "y_px": layout["y"],
+        "box_width_px": layout["box_width"],
+        "margin_l": layout["margin_l"],
+        "margin_r": layout["margin_r"],
+        "margin_v": layout["margin_v"],
+        "alignment": 5,
+    }
+
 
 def generate_subtitles(
     words: list,
@@ -104,40 +142,55 @@ def generate_subtitles(
     video_width: int = 1920,
     video_height: int = 1080,
     style: str = "tiktok",
+    subtitle_placement: dict | None = None,
 ) -> Path | None:
     """Generate ASS subtitles with word-by-word highlighting.
 
     Flicker-free: uses a base phrase layer + gapless highlight overlay.
     Automatically adjusts font size and phrase length for vertical video.
     """
+    if not subtitles_are_enabled(style):
+        output_path.unlink(missing_ok=True)
+        print("[*] Subtitles disabled by style")
+        return None
+
     if not words:
+        output_path.unlink(missing_ok=True)
         print("[!] No words for subtitles")
         return None
 
     s = dict(STYLES.get(style, STYLES["tiktok"]))  # copy
+    placement = resolve_subtitle_placement(video_width, video_height, subtitle_placement)
 
     # ── adapt for vertical video ─────────────────────────────────────────
     is_vertical = video_width < 900
     if is_vertical:
         s["size"] = round(s["size"] * 0.75)          # 68→51, 60→45, 78→59
         s["border"] = max(2, s["border"] - 1)
-    max_words = 3 if is_vertical else 4
-
-    # MarginV: distance from bottom edge (alignment 2 = bottom-center)
-    margin_v = round(video_height * 0.18) if is_vertical else round(video_height * 0.06)
+    max_words = _max_words_for_layout(is_vertical, placement["width_pct"])
 
     # Sanitize word timestamps — fix overlaps from Whisper
     words = _sanitize_word_times(words)
+    if not words:
+        output_path.unlink(missing_ok=True)
+        print("[!] No usable words for subtitles")
+        return None
 
     phrases = _group_phrases(words, max_words=max_words)
+    if not phrases:
+        output_path.unlink(missing_ok=True)
+        print("[!] No subtitle phrases generated")
+        return None
 
     use_karaoke = s.get("mode") == "karaoke"
 
     lines = [
-        _ass_header(video_width, video_height, s, margin_v),
+        _ass_header(video_width, video_height, s, placement),
         "\n[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    position = _ass_position_override(placement)
+    base_bold = 1 if s.get("bold", 0) != 0 else 0
 
     for phrase in phrases:
         pw = phrase["words"]
@@ -156,7 +209,7 @@ def generate_subtitles(
             start = _ass_time(phrase_start)
             end = _ass_time(phrase_end)
             lines.append(
-                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an2}}{text}"
+                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{position}{text}"
             )
         else:
             # ── Standard mode: gapless highlight lines (no base layer) ─
@@ -171,7 +224,7 @@ def generate_subtitles(
                         parts.append(
                             f"{{\\c{s['highlight']}\\b1}}"
                             f"{w['text'].upper()}"
-                            f"{{\\r}}"
+                            f"{{\\c{s['primary']}\\b{base_bold}}}"
                         )
                     else:
                         parts.append(w["text"].upper())
@@ -191,18 +244,30 @@ def generate_subtitles(
 
                 lines.append(
                     f"Dialogue: 0,{_ass_time(w_start)},{_ass_time(w_end)},"
-                    f"Default,,0,0,0,,{{\\an2}}{text}"
+                    f"Default,,0,0,0,,{position}{text}"
                 )
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
     mode_label = "karaoke" if use_karaoke else "highlight"
-    print(f"[+] Subtitles saved: {output_path.name}  ({len(phrases)} phrases, {len(words)} words, {mode_label})")
+    print(
+        f"[+] Subtitles saved: {output_path.name}  "
+        f"({len(phrases)} phrases, {len(words)} words, {mode_label}, "
+        f"x={placement['x_pct']}%, y={placement['y_pct']}%, width={placement['width_pct']}%)"
+    )
     return output_path
+
+
+def subtitles_are_enabled(style: str | None) -> bool:
+    return str(style or "").strip().lower() != NO_SUBTITLE_STYLE
 
 
 def get_available_styles() -> list[dict]:
     """Return style metadata for the UI style picker."""
-    result = []
+    result = [{
+        "id": NO_SUBTITLE_STYLE,
+        "label": "None",
+        "desc": "No words burned into the clip",
+    }]
     for key, s in STYLES.items():
         result.append({
             "id": key,
@@ -217,6 +282,7 @@ def generate_drawtext_vf(
     video_width: int = 540,
     video_height: int = 960,
     style: str = "tiktok",
+    subtitle_placement: dict | None = None,
 ) -> str:
     """Generate a drawtext filter chain for subtitles (ffmpeg drawtext fallback).
 
@@ -226,15 +292,18 @@ def generate_drawtext_vf(
     Each phrase is shown/hidden using: y=if(between(t,start,end), visible_y, -100)
     This works even on old ffmpeg that doesn't support timeline/enable.
     """
+    if not subtitles_are_enabled(style):
+        return ""
+
     if not words:
         return ""
 
     s = STYLES.get(style, STYLES["tiktok"])
+    placement = resolve_subtitle_placement(video_width, video_height, subtitle_placement)
 
     is_vertical = video_width < 900
     font_size = round(s["size"] * 0.75) if is_vertical else s["size"]
-    margin_v = round(video_height * 0.18) if is_vertical else round(video_height * 0.06)
-    max_words = 3 if is_vertical else 4
+    max_words = _max_words_for_layout(is_vertical, placement["width_pct"])
 
     # Resolve font file path
     font_name = s.get("font", "Arial")
@@ -244,7 +313,8 @@ def generate_drawtext_vf(
     else:
         fontfile_escaped = f"/usr/share/fonts/truetype/{font_file}"
 
-    visible_y = video_height - margin_v
+    visible_x = f"min(max(10\\,{placement['x_px']}-tw/2)\\,w-tw-10)"
+    visible_y = f"min(max(10\\,{placement['y_px']}-th/2)\\,h-th-10)"
     phrases = _group_phrases(words, max_words=max_words)
 
     filters = []
@@ -266,7 +336,7 @@ def generate_drawtext_vf(
             f":fontfile='{fontfile_escaped}'"
             f":fontsize={font_size}"
             f":fontcolor=white"
-            f":x=(w-tw)/2"
+            f":x={visible_x}"
             f":y={y_expr}"
             f":shadowcolor=black:shadowx=3:shadowy=3"
         )
@@ -350,7 +420,48 @@ def _group_phrases(
     return phrases
 
 
-def _ass_header(w: int, h: int, s: dict, margin_v: int = 60) -> str:
+def _clamp_pct(value, default: int, low: int, high: int) -> int:
+    try:
+        pct = int(round(float(value)))
+    except (TypeError, ValueError):
+        pct = default
+    return max(low, min(high, pct))
+
+
+def _max_words_for_layout(is_vertical: bool, width_pct: int) -> int:
+    if is_vertical:
+        return 2 if width_pct < 58 else 3
+    return 3 if width_pct < 58 else 4
+
+
+def _subtitle_layout(w: int, h: int, placement: dict) -> dict:
+    safe_pad = max(8, round(min(w, h) * 0.02))
+    desired_x = round(w * placement["x_pct"] / 100)
+    y = round(h * placement["y_pct"] / 100)
+    box_w = round(w * placement["width_pct"] / 100)
+    box_w = max(1, min(box_w, max(1, w - (safe_pad * 2))))
+
+    left = round(desired_x - (box_w / 2))
+    left = max(safe_pad, min(max(safe_pad, w - safe_pad - box_w), left))
+    right = max(safe_pad, w - left - box_w)
+    x = round(left + (box_w / 2))
+    y = max(safe_pad, min(max(safe_pad, h - safe_pad), y))
+
+    return {
+        "x": x,
+        "y": y,
+        "box_width": box_w,
+        "margin_l": left,
+        "margin_r": right,
+        "margin_v": 0,
+    }
+
+
+def _ass_position_override(layout: dict) -> str:
+    return f"{{\\an5\\pos({layout['x_px']},{layout['y_px']})}}"
+
+
+def _ass_header(w: int, h: int, s: dict, layout: dict) -> str:
     secondary = s.get("secondary", s["highlight"])
     return (
         f"[Script Info]\n"
@@ -370,7 +481,8 @@ def _ass_header(w: int, h: int, s: dict, margin_v: int = 60) -> str:
         f"Style: Default,{s['font']},{s['size']},{s['primary']},{secondary},"
         f"{s['outline']},{s['back']},{s['bold']},0,0,0,100,100,0,0,"
         f"{s.get('border_style', 1)},"
-        f"{s['border']},{s['shadow']},2,10,10,{margin_v},1"
+        f"{s['border']},{s['shadow']},5,"
+        f"{layout['margin_l']},{layout['margin_r']},{layout['margin_v']},1"
     )
 
 

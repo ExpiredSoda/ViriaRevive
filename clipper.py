@@ -5,6 +5,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from audio_streams import audio_output_args, get_audio_streams, pick_voice_stream_ordinal
 from subprocess_utils import run as _run
 
 
@@ -114,7 +115,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     if not filt:
         return False
 
-    audio_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-strict", "-2", "-b:a", "128k"]
+    audio_args = audio_output_args(input_path, bitrate="128k", copy_single=copy_audio)
 
     # Attempt 1: filename-only with CWD set to subtitle directory + local fontsdir
     fontsdir_cwd = _fonts_dir_option(sub_dir, use_cwd=True)
@@ -329,7 +330,7 @@ def extract_clip(
             "-vf", crop_vf,
             "-c:v", "libx264", "-preset", preset, "-crf", "18",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
+            *audio_output_args(video_path, bitrate="192k"),
             str(temp_cropped),
         ]
         print(f"    Pass 1 (crop): {' '.join(cmd1)}")
@@ -367,7 +368,7 @@ def extract_clip(
             "-vf", crop_vf,
             "-c:v", "libx264", "-preset", preset, "-crf", crf,
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-strict", "-2", "-b:a", "128k",
+            *audio_output_args(video_path, bitrate="128k"),
             str(output_path),
         ]
         print(f"    cmd (crop): {' '.join(cmd)}")
@@ -386,7 +387,7 @@ def extract_clip(
             "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path), "-t", str(duration),
             "-c:v", "libx264", "-preset", preset, "-crf", "18",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-strict", "-2", "-b:a", "128k",
+            *audio_output_args(video_path, bitrate="128k"),
             str(temp_input),
         ]
         r_ext = _run(cmd_extract, capture_output=True, text=True, errors="replace")
@@ -410,10 +411,18 @@ def extract_clip(
                               warning="Subtitle filter failed — check ffmpeg libass support")
 
     # ── CASE D: no filters → stream copy ─────────────────────────────────
-    cmd = [
-        "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
-        "-t", str(duration), "-c", "copy", str(output_path),
-    ]
+    if len(get_audio_streams(video_path)) > 1:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
+            "-t", str(duration), "-c:v", "copy",
+            *audio_output_args(video_path, bitrate="192k"),
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
+            "-t", str(duration), "-c", "copy", str(output_path),
+        ]
     r = _run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         print(f"[!] Stream copy failed:\n{r.stderr[-400:]}")
@@ -422,11 +431,16 @@ def extract_clip(
     return ClipResult(path=output_path)
 
 
-def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path) -> Path | None:
+def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path,
+                       audio_stream: int | None = None) -> Path | None:
     """Extract mono 16 kHz WAV audio for whisper transcription."""
+    if audio_stream is None:
+        audio_stream = pick_voice_stream_ordinal(video_path)
+    map_args = ["-map", f"0:a:{audio_stream}"] if audio_stream is not None else []
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start), "-i", str(video_path), "-t", str(end - start),
+        *map_args,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         str(output_path),
     ]
@@ -452,10 +466,18 @@ def _rename_safe(src: Path, dst: Path):
 
 def _fallback_stream_copy(video_path, start, duration, output_path):
     print("[!] Falling back to stream copy...")
-    cmd = [
-        "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
-        "-t", str(duration), "-c", "copy", str(output_path),
-    ]
+    if len(get_audio_streams(video_path)) > 1:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
+            "-t", str(duration), "-c:v", "copy",
+            *audio_output_args(video_path, bitrate="192k"),
+            str(output_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
+            "-t", str(duration), "-c", "copy", str(output_path),
+        ]
     r = _run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         print(f"[!] Stream copy also failed:\n{r.stderr[-400:]}")

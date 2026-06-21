@@ -6,6 +6,8 @@ const state = {
     settings: {},
     results: [],
     moments: [],
+    feedbackByClipId: {},
+    personalization: { schema_version: 1, events: [], clips: {} },
     overallPercent: 0,
     ytConnected: false,
     channels: [],
@@ -14,7 +16,7 @@ const state = {
     // Calendar
     calYear: new Date().getFullYear(),
     calMonth: new Date().getMonth(),
-    scheduled: [],          // [{clipIdx, date, time, title, description, tags, category_id, privacy, uploaded}]
+    scheduled: [],          // [{clipIdx, clip_id, source_id, date, time, title, description, tags, category_id, privacy, uploaded}]
     editingScheduleIdx: -1,
     pickerDate: null,
     _schedPreset: 'allpeaks',
@@ -33,6 +35,713 @@ const state = {
     batchIndex: -1,       // current index being processed (-1 = not running)
     batchSettings: null,  // settings snapshot for the batch run
 };
+
+const DEFAULT_CATEGORY_ID = '20'; // Gaming
+const DEFAULT_UPLOAD_TAGS = 'shorts, gaming, gameplay, gaming shorts, youtube shorts, viral shorts, stream highlights, streamer moments, live stream clips, funny gaming moments, scary gaming moments, horror gaming, scary game, creepy game, survival horror, horror shorts, jump scare, chase scene, panic moment, gaming reaction, lets play, playthrough, vertical gaming, game clips';
+const SCHEDULE_BUFFER_MINUTES = 10;
+let _lastOllamaStatus = null;
+
+function scheduledLocalDate(item) {
+    const date = String(item?.date || '').trim();
+    const time = String(item?.time || '').trim() || '12:00';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) return null;
+    const d = new Date(`${date}T${time}:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function scheduledPublishFields(item) {
+    const d = scheduledLocalDate(item);
+    if (!d) {
+        return { scheduled_local: '', publish_at: '', timezone_offset_minutes: null };
+    }
+    return {
+        scheduled_local: `${item.date}T${item.time}:00`,
+        publish_at: d.toISOString(),
+        timezone_offset_minutes: d.getTimezoneOffset(),
+    };
+}
+
+function isScheduleMissed(item, now = new Date()) {
+    if (!item || item.uploaded) return false;
+    const d = scheduledLocalDate(item);
+    return !!d && d.getTime() < now.getTime();
+}
+
+function _isTodayDateStr(dateStr, now = new Date()) {
+    return dateStr === _toDateStr(now);
+}
+
+function _isFutureScheduleSlot(dateStr, time, now = new Date()) {
+    if (!_isTodayDateStr(dateStr, now)) return true;
+    const slot = scheduledLocalDate({ date: dateStr, time });
+    if (!slot) return false;
+    return slot.getTime() > now.getTime() + SCHEDULE_BUFFER_MINUTES * 60 * 1000;
+}
+
+function hasPendingSchedule() {
+    return state.scheduled.some(s => !s.uploaded);
+}
+
+function ensureSchedulerForPending() {
+    if (!state.ytConnected || !hasPendingSchedule()) return;
+    try { pywebview.api.start_scheduler(); } catch (_) {}
+}
+
+function descriptionProfile() {
+    const profile = state.settings.description_profile || {};
+    return {
+        auto_hashtags: profile.auto_hashtags !== false,
+        custom_text: String(profile.custom_text || ''),
+    };
+}
+
+function setDescriptionProfile(profile) {
+    state.settings.description_profile = {
+        auto_hashtags: profile.auto_hashtags !== false,
+        custom_text: String(profile.custom_text || ''),
+    };
+    refreshDescriptionOptionsStatus();
+}
+
+function descriptionGameHashtag(gameTitle = '') {
+    const cleaned = String(gameTitle || '').replace(/[^A-Za-z0-9]+/g, ' ').trim();
+    if (!cleaned) return '#Gaming';
+    return '#' + cleaned.split(/\s+/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('').slice(0, 48);
+}
+
+function recommendedDescriptionHashtags(gameTitle = '') {
+    const tags = ['#shorts', descriptionGameHashtag(gameTitle), '#gaming'];
+    const unique = [];
+    const seen = new Set();
+    tags.forEach(tag => {
+        const key = tag.toLowerCase();
+        if (seen.has(key)) return;
+        unique.push(tag);
+        seen.add(key);
+    });
+    return unique;
+}
+
+function generatedDescriptionForClip(clip, idx, title = '') {
+    const moment = state.moments[idx] || {};
+    const meta = moment.generated_metadata || {};
+    if (meta.generated_description) return meta.generated_description;
+    if (meta.description) return String(meta.description).split(/\n\s*#shorts\b/i)[0].trim();
+    const cleanTitle = (title || clip?.filename || '').replace(/\.[^.]+$/, '').trim();
+    return cleanTitle || 'Gameplay clip';
+}
+
+function gameTitleForClip(idx) {
+    const moment = state.moments[idx] || {};
+    const meta = moment.generated_metadata || {};
+    return meta.game_title || moment.game_title || '';
+}
+
+function composeDescriptionPreview({ generated = '', custom = '', autoHashtags = true, gameTitle = '' } = {}) {
+    const parts = [];
+    if (String(generated || '').trim()) parts.push(String(generated).trim());
+    if (String(custom || '').trim()) parts.push(String(custom).trim());
+    if (autoHashtags) parts.push(recommendedDescriptionHashtags(gameTitle).join(' '));
+    return parts.join('\n\n');
+}
+
+function updateScheduledDescriptionPreview(item) {
+    if (!item) return item;
+    const auto = item.description_auto_hashtags !== undefined
+        ? item.description_auto_hashtags !== false
+        : descriptionProfile().auto_hashtags;
+    const final = composeDescriptionPreview({
+        generated: item.description_generated || item.generated_description || item.title || '',
+        custom: item.description_custom_text || '',
+        autoHashtags: auto,
+        gameTitle: item.game_title || '',
+    });
+    item.description_auto_hashtags = auto;
+    item.description = final;
+    item.final_description = final;
+    return item;
+}
+
+function applyGeneratedMetadataToSchedule(item, meta) {
+    if (!item || !meta) return item;
+    const generated = meta.generated_description || meta.description_generated || meta.description || '';
+    if (generated) {
+        item.description_generated = generated;
+        item.generated_description = generated;
+    }
+    if (meta.game_title) item.game_title = meta.game_title;
+    if (meta.tags) item.tags = meta.tags;
+    if (item.description_custom_text === undefined) item.description_custom_text = descriptionProfile().custom_text;
+    if (item.description_auto_hashtags === undefined) item.description_auto_hashtags = descriptionProfile().auto_hashtags;
+    updateScheduledDescriptionPreview(item);
+    return item;
+}
+
+function descriptionFieldsForClip(clip, idx, title = '') {
+    const profile = descriptionProfile();
+    const gameTitle = gameTitleForClip(idx);
+    const generated = generatedDescriptionForClip(clip, idx, title);
+    const final = composeDescriptionPreview({
+        generated,
+        custom: profile.custom_text,
+        autoHashtags: profile.auto_hashtags,
+        gameTitle,
+    });
+    return {
+        game_title: gameTitle,
+        description_generated: generated,
+        generated_description: generated,
+        description_custom_text: profile.custom_text,
+        description_auto_hashtags: profile.auto_hashtags,
+        description: final,
+        final_description: final,
+        recommended_hashtags: recommendedDescriptionHashtags(gameTitle),
+    };
+}
+
+function defaultUploadDescription(title = '') {
+    return composeDescriptionPreview({
+        generated: title,
+        custom: descriptionProfile().custom_text,
+        autoHashtags: descriptionProfile().auto_hashtags,
+    });
+}
+
+function clipIndexById(clipId) {
+    if (!clipId) return -1;
+    return state.results.findIndex(c => c && c.clip_id === clipId);
+}
+
+function resolveScheduledClipIndex(item) {
+    if (!item) return -1;
+    const byId = clipIndexById(item.clip_id);
+    if (byId >= 0) return byId;
+    if (item.clip_filename) {
+        const byName = state.results.findIndex(c => c && c.filename === item.clip_filename);
+        if (byName >= 0) return byName;
+    }
+    if (item.clip_id || item.clip_filename) return -1;
+    const idx = Number(item.clipIdx ?? item.index);
+    if (Number.isInteger(idx) && idx >= 0 && idx < state.results.length) return idx;
+    return -1;
+}
+
+function clipIdentityFields(clip, clipIdx) {
+    return {
+        clipIdx,
+        clip_id: clip?.clip_id || null,
+        source_id: clip?.source_id || null,
+        source_stem: clip?.source_stem || null,
+        clip_filename: clip?.filename || null,
+    };
+}
+
+function channelById(channelId) {
+    return state.channels.find(ch => ch.id === channelId) || null;
+}
+
+function channelIdentityFields(channelId) {
+    const ch = channelById(channelId);
+    return {
+        channel_id: ch?.id || channelId || null,
+        account_id: ch?.account_id || null,
+        channel_title: ch?.title || '',
+        account_title: ch?.account_title || '',
+    };
+}
+
+function normalizeScheduledMetadata(items) {
+    const normalized = [];
+    (items || []).forEach(item => {
+        if (!item) return;
+        const clipIdx = resolveScheduledClipIndex(item);
+        if (clipIdx < 0) return;
+        const hasStructuredDescription = [
+            'description_generated',
+            'generated_description',
+            'description_custom_text',
+            'description_auto_hashtags',
+            'final_description',
+        ].some(key => Object.prototype.hasOwnProperty.call(item, key));
+        Object.assign(item, clipIdentityFields(state.results[clipIdx], clipIdx));
+        item.category_id = DEFAULT_CATEGORY_ID;
+        if (!String(item.tags || '').trim()) item.tags = DEFAULT_UPLOAD_TAGS;
+        if (!hasStructuredDescription && item.description) {
+            item.final_description = item.description;
+            if (item.channel_id && !item.account_id) Object.assign(item, channelIdentityFields(item.channel_id));
+            normalized.push(item);
+            return;
+        }
+        if (!item.description_generated && !item.generated_description) {
+            item.description_generated = generatedDescriptionForClip(state.results[clipIdx], clipIdx, item.title);
+            item.generated_description = item.description_generated;
+        }
+        if (item.description_custom_text === undefined) item.description_custom_text = '';
+        if (item.description_auto_hashtags === undefined) item.description_auto_hashtags = descriptionProfile().auto_hashtags;
+        if (!item.game_title) item.game_title = gameTitleForClip(clipIdx);
+        if (item.channel_id && !item.account_id) Object.assign(item, channelIdentityFields(item.channel_id));
+        updateScheduledDescriptionPreview(item);
+        normalized.push(item);
+    });
+    return normalized;
+}
+
+function visibleClipList(clips) {
+    return (clips || []).filter(c => c && c.filename && (c.url !== '' || (c.size_mb || 0) > 0));
+}
+
+async function loadPersonalization() {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.get_personalization) return;
+    try {
+        const data = await pywebview.api.get_personalization();
+        state.personalization = data || { schema_version: 1, events: [], clips: {} };
+        state.feedbackByClipId = state.personalization.clips || {};
+        renderAllFeedbackStates();
+        renderPreviewFeedbackState();
+        refreshDataPrivacyCard(false);
+    } catch (_) {}
+}
+
+function _feedbackForClip(clip) {
+    return (clip && clip.clip_id && state.feedbackByClipId[clip.clip_id]) || {};
+}
+
+function _feedbackLatest(clip) {
+    return _feedbackForClip(clip).latest || {};
+}
+
+function _feedbackActive(clip, eventType) {
+    const latest = _feedbackLatest(clip);
+    if (eventType === 'like') return !!latest.like;
+    if (eventType === 'dislike') return !!latest.dislike;
+    if (eventType === 'favorite') return !!latest.favorite;
+    return false;
+}
+
+function renderFeedbackState(container, clip) {
+    if (!container || !clip || !clip.clip_id) return;
+    container.querySelectorAll('.feedback-btn').forEach(btn => {
+        const eventType = btn.dataset.feedback;
+        const active = _feedbackActive(clip, eventType);
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
+function renderCardFeedbackState(card, clip) {
+    renderFeedbackState(card, clip);
+}
+
+function renderAllFeedbackStates() {
+    document.querySelectorAll('.result-card').forEach(card => {
+        const idx = Number(card.dataset.clipIdx);
+        if (Number.isInteger(idx) && idx >= 0) renderCardFeedbackState(card, state.results[idx]);
+    });
+}
+
+function renderPreviewFeedbackState() {
+    const panel = document.getElementById('preview-feedback');
+    if (!panel) return;
+    const clip = state.previewClipIdx >= 0 ? state.results[state.previewClipIdx] : null;
+    if (!clip || !clip.clip_id) {
+        panel.classList.add('hidden');
+        return;
+    }
+    panel.classList.remove('hidden');
+    renderFeedbackState(panel, clip);
+    const latest = _feedbackLatest(clip);
+    const status = document.getElementById('preview-feedback-status');
+    if (status) {
+        const flags = [];
+        if (latest.like) flags.push('Liked');
+        if (latest.dislike) flags.push('Disliked');
+        if (latest.favorite) flags.push('Favorite');
+        const reason = latest.reason ? ` - ${latest.reason}` : '';
+        status.textContent = flags.length ? `${flags.join(' / ')}${reason}` : 'No feedback yet';
+    }
+}
+
+function recordPreviewFeedback(eventType) {
+    if (state.previewClipIdx < 0) return;
+    recordClipFeedback(state.previewClipIdx, eventType);
+}
+
+async function recordClipFeedback(clipIdx, eventType) {
+    const clip = state.results[clipIdx];
+    if (!clip || !clip.clip_id) return toast('Clip identity is not ready yet', 'warning');
+    const active = !_feedbackActive(clip, eventType);
+    const label = active ? eventType : `remove ${eventType}`;
+    let reason = window.prompt(`Reason for ${label}?`, '');
+    if (reason === null) reason = '';
+
+    try {
+        const payload = {
+            ...clipIdentityFields(clip, clipIdx),
+            index: clipIdx,
+            event_type: eventType,
+            active,
+            reason,
+        };
+        const r = await pywebview.api.record_feedback(payload);
+        if (r.error) return toast(r.error, 'error');
+        state.feedbackByClipId[clip.clip_id] = r.clip;
+        renderAllFeedbackStates();
+        renderPreviewFeedbackState();
+        refreshDataPrivacyCard(false);
+        toast(active ? `Marked ${eventType}` : `Removed ${eventType}`, 'success');
+    } catch (e) {
+        toast('Could not save feedback', 'error');
+    }
+}
+
+async function refreshDataPrivacyCard(showToast = true) {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.get_data_privacy_summary) return;
+    try {
+        const r = await pywebview.api.get_data_privacy_summary();
+        const p = r.personalization || {};
+        const learning = r.learning || p.learning || {};
+        const eventEl = document.getElementById('privacy-event-count');
+        const clipEl = document.getElementById('privacy-clip-count');
+        const sizeEl = document.getElementById('privacy-data-size');
+        const learningEnabledEl = document.getElementById('learning-enabled');
+        const activeSignalsEl = document.getElementById('learning-active-signals');
+        const learnedCapEl = document.getElementById('learning-cap');
+        const lastFeedbackEl = document.getElementById('learning-last-feedback');
+        if (eventEl) eventEl.textContent = formatNumber(p.event_count || 0);
+        if (clipEl) clipEl.textContent = formatNumber(p.clip_count || 0);
+        if (sizeEl) sizeEl.textContent = formatBytes(p.size_bytes || 0);
+        if (learningEnabledEl) {
+            const enabled = Boolean(learning.enabled);
+            learningEnabledEl.textContent = enabled ? 'Enabled' : 'Idle';
+            learningEnabledEl.classList.toggle('is-active', enabled);
+            learningEnabledEl.classList.toggle('is-idle', !enabled);
+        }
+        if (activeSignalsEl) activeSignalsEl.textContent = formatNumber(learning.active_feedback_signals || 0);
+        if (learnedCapEl) learnedCapEl.textContent = learning.learned_cap_label || formatLearningCap(learning.learned_cap);
+        if (lastFeedbackEl) {
+            lastFeedbackEl.textContent = formatLearningTimestamp(learning.last_feedback_time || p.latest_timestamp);
+            if (learning.last_feedback_time || p.latest_timestamp) lastFeedbackEl.title = learning.last_feedback_time || p.latest_timestamp;
+            else lastFeedbackEl.removeAttribute('title');
+        }
+        if (showToast) toast('Data summary refreshed', 'success');
+    } catch (_) {
+        if (showToast) toast('Could not refresh data summary', 'error');
+    }
+}
+
+async function openDataFolder() {
+    try {
+        const r = await pywebview.api.open_data_folder();
+        if (r && r.error) toast(r.error, 'error');
+    } catch (_) {
+        toast('Could not open data folder', 'error');
+    }
+}
+
+async function openYouTubeOAuthConsole() {
+    try {
+        const r = await pywebview.api.open_youtube_oauth_console();
+        if (r && r.error) return toast(`Open this page: ${r.url}`, 'warning');
+        toast('Opened Google Cloud credentials', 'info');
+    } catch (_) {
+        toast('Could not open Google Cloud credentials', 'error');
+    }
+}
+
+async function openFfmpegDownload() {
+    try {
+        const r = await pywebview.api.open_ffmpeg_download();
+        if (r && r.error) return toast(`Open this page: ${r.url}`, 'warning');
+        toast('Opened FFmpeg download page', 'info');
+    } catch (_) {
+        toast('Could not open FFmpeg download page', 'error');
+    }
+}
+
+async function openAppBinFolder() {
+    try {
+        const r = await pywebview.api.open_app_bin_folder();
+        if (r && r.error) toast(r.error, 'error');
+    } catch (_) {
+        toast('Could not open app bin folder', 'error');
+    }
+}
+
+async function openPersonalizationFile() {
+    try {
+        const r = await pywebview.api.open_personalization_file();
+        if (r && r.error) toast(r.error, 'error');
+    } catch (e) {
+        toast('Could not open feedback file', 'error');
+    }
+}
+
+async function exportPersonalizationFile() {
+    try {
+        const r = await pywebview.api.export_personalization();
+        if (r.cancelled) return;
+        if (r.error) return toast(r.error, 'error');
+        toast('Share-safe feedback copy exported', 'success');
+    } catch (e) {
+        toast('Could not export feedback file', 'error');
+    }
+}
+
+async function clearFeedbackData() {
+    if (!confirm('Clear all local clip feedback? This removes like, dislike, favorite, reason history, and learned selection influence.')) return;
+    try {
+        const r = await pywebview.api.clear_personalization();
+        if (r.error) return toast(r.error, 'error');
+        state.feedbackByClipId = {};
+        state.personalization = r.personalization || { schema_version: 1, events: [], clips: {} };
+        renderAllFeedbackStates();
+        renderPreviewFeedbackState();
+        await refreshDataPrivacyCard(false);
+        toast(r.backup ? 'Feedback cleared and backup created' : 'Feedback data cleared', 'success');
+    } catch (e) {
+        toast('Could not clear feedback data', 'error');
+    }
+}
+
+function refreshDescriptionOptionsStatus() {
+    const profile = descriptionProfile();
+    const toggle = document.getElementById('desc-auto-hashtags-toggle');
+    const status = document.getElementById('description-options-status');
+    if (toggle) toggle.checked = profile.auto_hashtags;
+    if (status) {
+        const parts = [];
+        parts.push(profile.auto_hashtags ? 'Recommended hashtags on' : 'Auto hashtags off');
+        if (profile.custom_text.trim()) parts.push('custom text added');
+        status.textContent = parts.join(' · ');
+    }
+}
+
+function openDescriptionDefaultsModal() {
+    const profile = descriptionProfile();
+    const auto = document.getElementById('desc-default-auto-hashtags');
+    const custom = document.getElementById('desc-default-custom-text');
+    if (auto) auto.checked = profile.auto_hashtags;
+    if (custom) custom.value = profile.custom_text;
+    showModal('description-defaults-modal');
+}
+
+async function toggleDescriptionAutoHashtags(enabled) {
+    const profile = descriptionProfile();
+    setDescriptionProfile({ ...profile, auto_hashtags: enabled });
+    try { await pywebview.api.save_settings(state.settings); } catch (_) {}
+    state.scheduled.forEach(item => {
+        item.description_auto_hashtags = enabled;
+        updateScheduledDescriptionPreview(item);
+    });
+    persistSchedule();
+    renderTimeline();
+    refreshDescriptionOptionsStatus();
+}
+
+async function saveDescriptionDefaults(applyToScheduled = false) {
+    const profile = {
+        auto_hashtags: document.getElementById('desc-default-auto-hashtags')?.checked !== false,
+        custom_text: document.getElementById('desc-default-custom-text')?.value || '',
+    };
+    setDescriptionProfile(profile);
+    try { await pywebview.api.save_settings(state.settings); } catch (_) {}
+    if (applyToScheduled) {
+        state.scheduled.forEach(item => {
+            item.description_auto_hashtags = profile.auto_hashtags;
+            item.description_custom_text = profile.custom_text;
+            updateScheduledDescriptionPreview(item);
+        });
+        persistSchedule();
+        renderTimeline();
+        renderCalendar();
+        toast('Description text applied to scheduled clips', 'success');
+    } else {
+        toast('Description defaults saved', 'success');
+    }
+    closeModal('description-defaults-modal');
+    refreshDescriptionOptionsStatus();
+}
+
+function hideUploadProgressAfter(ms = 1800) {
+    const uploadCard = document.getElementById('upload-progress-card');
+    window.clearTimeout(window._uploadProgressHideTimer);
+    window._uploadProgressHideTimer = window.setTimeout(() => {
+        if (!uploadCard) return;
+        uploadCard.classList.add('hidden');
+        document.getElementById('upload-status').textContent = 'Uploading...';
+        document.getElementById('upload-percent').textContent = '0%';
+        document.getElementById('upload-fill').style.width = '0%';
+        const cancelBtn = document.getElementById('btn-cancel-upload');
+        if (cancelBtn) cancelBtn.disabled = false;
+    }, ms);
+}
+
+function updateOllamaActionButtons(status) {
+    const locationBtn = document.getElementById('btn-ollama-download');
+    const installBtn = document.getElementById('btn-ollama-install');
+    const modelBtn = document.getElementById('btn-ollama-model');
+    const installed = !!(status && (status.installed || status.running || status.install_path));
+    const running = !!(status && status.running);
+    const modelReady = !!(status && status.model_ready);
+    const model = status?.model || 'qwen2.5:3b';
+
+    if (locationBtn) {
+        locationBtn.disabled = false;
+        locationBtn.textContent = installed ? 'Open Ollama Folder' : 'Install Ollama';
+        locationBtn.title = installed
+            ? 'Open the local Ollama install folder'
+            : 'Open the official Ollama download page';
+    }
+
+    if (installBtn) {
+        installBtn.disabled = false;
+        if (running && modelReady) {
+            installBtn.textContent = 'Ollama Installed';
+            installBtn.title = 'Ollama is installed and ready';
+            installBtn.disabled = true;
+        } else if (installed) {
+            installBtn.textContent = 'Repair via PowerShell';
+            installBtn.title = 'Run Ollama’s official installer again if the local service needs repair';
+        } else {
+            installBtn.textContent = 'Install via PowerShell';
+            installBtn.title = 'Run Ollama’s official Windows installer in a visible PowerShell window';
+        }
+    }
+
+    if (modelBtn) {
+        modelBtn.disabled = !running;
+        modelBtn.textContent = modelReady ? 'Title Model Ready' : running ? 'Download Title Model' : 'Start Ollama First';
+        modelBtn.title = modelReady
+            ? `${model} is installed; click to re-check`
+            : running
+                ? `Download ${model} for AI titles`
+                : 'Start or install Ollama before downloading the title model';
+    }
+}
+
+async function refreshOllamaStatus() {
+    const pill = document.getElementById('ollama-status');
+    if (!pill || !window.pywebview || !pywebview.api) return;
+    const label = pill.querySelector('.ollama-label');
+    const settingsDot = document.getElementById('settings-ollama-dot');
+    const settingsState = document.getElementById('settings-ollama-state');
+    const settingsDetail = document.getElementById('settings-ollama-detail');
+    pill.classList.remove('ready', 'partial', 'offline', 'error');
+    pill.classList.add('checking');
+    if (label) label.textContent = 'Ollama...';
+    if (settingsState) settingsState.textContent = 'Checking';
+    if (settingsDetail) settingsDetail.textContent = 'Ollama status';
+    if (settingsDot) settingsDot.className = 'ollama-settings-dot checking';
+    try {
+        const status = await pywebview.api.get_ollama_status();
+        _lastOllamaStatus = status;
+        updateOllamaActionButtons(status);
+        pill.classList.remove('checking');
+        if (status.using_ollama) {
+            pill.classList.add('ready');
+            if (label) label.textContent = 'Ollama on';
+            const version = status.version ? ` ${status.version}` : '';
+            pill.title = `Ollama${version} is running and ${status.model} is ready for AI titles`;
+            if (settingsState) settingsState.textContent = 'Ready';
+            if (settingsDetail) settingsDetail.textContent = `${status.model}${version ? ` • ${version}` : ''}`;
+            if (settingsDot) settingsDot.className = 'ollama-settings-dot ready';
+        } else if (status.running) {
+            pill.classList.add('partial');
+            if (label) label.textContent = 'Model missing';
+            const version = status.version ? ` ${status.version}` : '';
+            pill.title = `Ollama${version} is running, but ${status.model} is not installed yet`;
+            if (settingsState) settingsState.textContent = 'Model Missing';
+            if (settingsDetail) settingsDetail.textContent = `${status.model}${version ? ` • ${version}` : ''}`;
+            if (settingsDot) settingsDot.className = 'ollama-settings-dot partial';
+        } else {
+            pill.classList.add('offline');
+            if (label) label.textContent = 'Ollama off';
+            pill.title = 'Ollama is not running; title generation will use the fallback';
+            if (settingsState) settingsState.textContent = 'Not Running';
+            if (settingsDetail) settingsDetail.textContent = `${status.model || 'qwen2.5:3b'} fallback active`;
+            if (settingsDot) settingsDot.className = 'ollama-settings-dot offline';
+        }
+    } catch (e) {
+        _lastOllamaStatus = null;
+        updateOllamaActionButtons(null);
+        pill.classList.remove('checking');
+        pill.classList.add('error');
+        if (label) label.textContent = 'Ollama ?';
+        pill.title = 'Could not check Ollama status';
+        if (settingsState) settingsState.textContent = 'Unknown';
+        if (settingsDetail) settingsDetail.textContent = 'Could not check Ollama';
+        if (settingsDot) settingsDot.className = 'ollama-settings-dot error';
+    }
+}
+
+async function handleOllamaLocationAction() {
+    if (_lastOllamaStatus && (_lastOllamaStatus.installed || _lastOllamaStatus.running || _lastOllamaStatus.install_path)) {
+        return openOllamaFolder();
+    }
+    return openOllamaDownload();
+}
+
+async function openOllamaFolder() {
+    try {
+        const r = await pywebview.api.open_ollama_folder();
+        if (r && r.error) return toast(r.error, 'error');
+        toast('Opened Ollama folder', 'info');
+    } catch (_) {
+        toast('Could not open Ollama folder', 'error');
+    }
+}
+
+async function openOllamaDownload() {
+    try {
+        const r = await pywebview.api.open_ollama_download();
+        if (r && r.error) return toast(`Open this page: ${r.url}`, 'warning');
+        toast('Opened official Ollama download page', 'info');
+    } catch (_) {
+        toast('Could not open Ollama download page', 'error');
+    }
+}
+
+async function installOllamaWithPowerShell() {
+    if (_lastOllamaStatus && _lastOllamaStatus.running && _lastOllamaStatus.model_ready) {
+        return toast('Ollama is already installed and ready', 'success');
+    }
+    const command = 'irm https://ollama.com/install.ps1 | iex';
+    if (!confirm(`Run the official Ollama Windows installer in PowerShell?\n\n${command}\n\nThis downloads and runs code from ollama.com in a new PowerShell window.`)) {
+        return;
+    }
+    try {
+        const prepared = await pywebview.api.prepare_ollama_install();
+        if (prepared && prepared.error) return toast(prepared.error, 'error');
+        const r = await pywebview.api.install_ollama_with_powershell(prepared.token);
+        if (r && r.error) return toast(r.error, 'error');
+        toast('Opened Ollama installer in PowerShell', 'info');
+    } catch (_) {
+        toast('Could not start Ollama installer', 'error');
+    }
+}
+
+async function downloadOllamaModel() {
+    try {
+        if (_lastOllamaStatus && _lastOllamaStatus.model_ready) {
+            toast(`${_lastOllamaStatus.model} is already ready for AI titles`, 'success');
+            return refreshOllamaStatus();
+        }
+        if (_lastOllamaStatus && !_lastOllamaStatus.running) {
+            toast('Start Ollama before downloading the title model', 'warning');
+            return refreshOllamaStatus();
+        }
+        toast('Downloading title model with Ollama...', 'info');
+        const r = await pywebview.api.ensure_ollama_model();
+        if (r.ready) {
+            toast(`${r.model} is ready for AI titles`, 'success');
+        } else {
+            toast('Ollama is not running yet', 'warning');
+        }
+        refreshOllamaStatus();
+    } catch (_) {
+        toast('Could not download Ollama title model', 'error');
+    }
+}
 
 /* ── Thumbnail generator (queued + lazy) ─────────────────────────────── */
 
@@ -153,12 +862,32 @@ function _debounce(fn, ms) {
     return function (...args) { clearTimeout(timer); timer = setTimeout(() => fn.apply(this, args), ms); };
 }
 
+function applyAppMetadata(meta) {
+    if (!meta) return;
+    const name = meta.name || 'ViriaRevive';
+    const version = meta.version_display || (meta.version ? `v${meta.version}` : '');
+    const fullName = version ? `${name} ${version}` : name;
+    const versionEl = document.getElementById('app-version');
+    if (versionEl && version) {
+        versionEl.textContent = version;
+        versionEl.title = fullName;
+    }
+    const aboutTitle = document.getElementById('about-app-title');
+    if (aboutTitle) aboutTitle.textContent = fullName;
+    document.title = fullName;
+}
+
 /* ── Init ──────────────────────────────────────────────────────────────── */
 
 window.addEventListener('pywebviewready', async () => {
     try {
+        try {
+            applyAppMetadata(await pywebview.api.get_app_metadata());
+        } catch (_) {}
+
         const deps = await pywebview.api.check_dependencies();
-        if (!deps.ffmpeg) showModal('ffmpeg-modal');
+        if (!deps.ffmpeg || !deps.ffprobe) showModal('ffmpeg-modal');
+        refreshOllamaStatus();
 
         // Backend (viria_state.json) is the source of truth for settings.
         // localStorage is a fallback for first-run only.
@@ -167,36 +896,47 @@ window.addEventListener('pywebviewready', async () => {
         // Use backend settings, fall back to localStorage for any missing keys
         state.settings = { ...local, ...backendSettings };
         populateSettings(state.settings);
+        refreshDescriptionOptionsStatus();
 
         // Load persisted state from previous session
         const persisted = await pywebview.api.load_persisted_state();
         if (persisted.clips && persisted.clips.length) {
-            state.results = persisted.clips;
+            state.results = visibleClipList(persisted.clips);
             state.moments = persisted.moments || [];
         }
         if (persisted.scheduled && persisted.scheduled.length) {
-            state.scheduled = persisted.scheduled;
+            state.scheduled = normalizeScheduledMetadata(persisted.scheduled);
+            persistSchedule();
         }
+        await loadPersonalization();
 
         const yt = await pywebview.api.youtube_status();
         if (yt.connected) {
             state.ytConnected = true;
             await loadChannelsAndCategories();
+            if (state.scheduled.length) {
+                state.scheduled = normalizeScheduledMetadata(state.scheduled);
+                persistSchedule();
+            }
             updateYtUI(true);
         }
 
         // Render peak times legend on init
         _renderPeakTimesLegend();
 
-        // Start background upload scheduler
-        await pywebview.api.start_scheduler();
-        if (state.scheduled.some(s => !s.uploaded)) {
+        // Start the local background scheduler only when it can actually upload.
+        if (yt.connected && hasPendingSchedule()) {
+            await pywebview.api.start_scheduler();
             document.getElementById('scheduler-bar').classList.remove('hidden');
         }
     } catch (e) {
         console.error('Init error:', e);
     }
 });
+
+setInterval(() => {
+    if (window.pywebview && pywebview.api) refreshOllamaStatus();
+}, 60000);
 
 // When window is restored from minimized/hidden, flush any queued JS calls
 document.addEventListener('visibilitychange', async () => {
@@ -256,6 +996,8 @@ document.querySelectorAll('.style-option').forEach(opt => {
         document.querySelectorAll('.style-option').forEach(o => o.classList.remove('active'));
         opt.classList.add('active');
         opt.querySelector('input[type="radio"]').checked = true;
+        updateSubtitlePlacementPreview();
+        try { gatherSettings(); } catch (_) {}
     });
 });
 
@@ -264,6 +1006,13 @@ document.querySelectorAll('.style-pick-card').forEach(card => {
         document.querySelectorAll('.style-pick-card').forEach(c => c.classList.remove('active'));
         card.classList.add('active');
         card.querySelector('input[type="radio"]').checked = true;
+    });
+});
+
+document.querySelectorAll('#preview-feedback .feedback-btn').forEach(btn => {
+    btn.addEventListener('click', event => {
+        event.stopPropagation();
+        recordPreviewFeedback(btn.dataset.feedback);
     });
 });
 
@@ -278,6 +1027,7 @@ function navigateTo(section) {
     if (section === 'results') loadResults();
     if (section === 'upload') loadUploadSection();
     if (section === 'library') loadLibrary();
+    if (section === 'settings') refreshDataPrivacyCard(false);
 }
 
 /* ── Generate ──────────────────────────────────────────────────────────── */
@@ -371,7 +1121,7 @@ async function loadEffectsGrid() {
             const card = document.createElement('div');
             card.className = 'effect-card' + (fx.id === (saved.effect || 'none') ? ' active' : '');
             card.dataset.effect = fx.id;
-            card.innerHTML = `<span class="effect-card-name">${fx.label}</span><span class="effect-card-desc">${fx.desc}</span>`;
+            card.innerHTML = `<span class="effect-card-name">${escHtml(fx.label)}</span><span class="effect-card-desc">${escHtml(fx.desc)}</span>`;
             card.onclick = () => {
                 document.querySelectorAll('.effect-card').forEach(c => c.classList.remove('active'));
                 card.classList.add('active');
@@ -722,6 +1472,7 @@ function confirmStyleAndGenerate() {
         const radio = opt.querySelector('input[type="radio"]');
         if (radio) radio.checked = opt.dataset.style === pickedStyle;
     });
+    updateSubtitlePlacementPreview();
 
     // Save wizard choices for next time
     const selectedEffect = document.querySelector('.effect-card.active')?.dataset.effect || 'none';
@@ -904,7 +1655,7 @@ function _onBatchComplete() {
 
     // Refresh results to include all clips from all processed videos
     pywebview.api.get_results().then(r => {
-        state.results = r.clips || [];
+        state.results = visibleClipList(r.clips);
         state.moments = r.moments || state.moments;
     }).catch(() => {});
 }
@@ -1008,6 +1759,15 @@ window.onConsoleLog = function (text) {
 /* ── Progress Callbacks ───────────────────────────────────────────────── */
 
 window.onPipelineProgress = function (stage, percent, message) {
+    if (stage === 'upload') {
+        const pct = Math.min(100, Math.max(0, Math.round(percent)));
+        const uploadCard = document.getElementById('upload-progress-card');
+        if (uploadCard) uploadCard.classList.remove('hidden');
+        document.getElementById('upload-status').textContent = message || 'Uploading...';
+        document.getElementById('upload-percent').textContent = `${pct}%`;
+        document.getElementById('upload-fill').style.width = `${pct}%`;
+        return;
+    }
     const ranges = { download: [0, 15], detect: [15, 30], clips: [30, 95], upload: [0, 100] };
     const r = ranges[stage] || [0, 100];
     setProgress(r[0] + (percent / 100) * (r[1] - r[0]), message);
@@ -1032,7 +1792,44 @@ window.onMomentsDetected = function (moments) {
     moments.forEach((m, i) => grid.appendChild(createClipCard(i + 1, moments.length, m)));
 };
 
-window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) {
+async function refreshScheduleFromBackend(render = false) {
+    try {
+        const r = await pywebview.api.get_all_scheduled();
+        if (r.scheduled) state.scheduled = normalizeScheduledMetadata(r.scheduled);
+    } catch (_) {
+        state.scheduled = normalizeScheduledMetadata(state.scheduled);
+    }
+    if (render) {
+        renderCalendar();
+        renderTimeline();
+        renderClipTray();
+    }
+}
+
+window.onPipelineComplete = async function (success, doneCount, totalCount, errorMsg) {
+    const uploadCard = document.getElementById('upload-progress-card');
+    const uploadVisible = uploadCard && !uploadCard.classList.contains('hidden');
+    if (uploadVisible && document.getElementById('btn-upload')?.disabled) {
+        await refreshScheduleFromBackend(false);
+        const partial = !success && doneCount > 0;
+        const pct = success ? 100 : partial && totalCount ? Math.round((doneCount / totalCount) * 100) : 0;
+        document.getElementById('upload-fill').style.width = `${pct}%`;
+        document.getElementById('upload-percent').textContent = `${pct}%`;
+        document.getElementById('upload-status').textContent = success
+            ? `Upload finished (${doneCount}/${totalCount})`
+            : (errorMsg || 'Upload failed');
+        document.getElementById('btn-upload').disabled = false;
+        const cancelBtn = document.getElementById('btn-cancel-upload');
+        if (cancelBtn) cancelBtn.disabled = true;
+        toast(
+            success ? `Uploaded ${doneCount} clip${doneCount !== 1 ? 's' : ''}` : (errorMsg || 'Upload failed'),
+            success ? 'success' : partial ? 'warning' : 'error'
+        );
+        await loadUploadSection();
+        if (success || partial) hideUploadProgressAfter();
+        return;
+    }
+
     // Mark current batch item
     if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
         state.batchQueue[state.batchIndex].status = success ? 'done' : 'error';
@@ -1051,7 +1848,7 @@ window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) 
 
         // Accumulate results (don't overwrite — append from all batch items)
         pywebview.api.get_results().then(r => {
-            state.results = r.clips || [];
+            state.results = visibleClipList(r.clips);
             state.moments = r.moments || state.moments;
         }).catch(() => {});
     } else {
@@ -1070,7 +1867,23 @@ window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) 
     }
 };
 
-window.onPipelineCancelled = function () {
+window.onPipelineCancelled = async function () {
+    const uploadCard = document.getElementById('upload-progress-card');
+    const uploadVisible = uploadCard && !uploadCard.classList.contains('hidden');
+    if (uploadVisible && document.getElementById('btn-upload')?.disabled) {
+        await refreshScheduleFromBackend(false);
+        document.getElementById('upload-status').textContent = 'Upload stopped';
+        document.getElementById('upload-percent').textContent = '0%';
+        document.getElementById('upload-fill').style.width = '0%';
+        document.getElementById('btn-upload').disabled = false;
+        const cancelBtn = document.getElementById('btn-cancel-upload');
+        if (cancelBtn) cancelBtn.disabled = false;
+        toast('Upload stopped', 'warning');
+        await loadUploadSection();
+        hideUploadProgressAfter(1200);
+        return;
+    }
+
     state.processing = false;
     if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
         state.batchQueue[state.batchIndex].status = 'error';
@@ -1149,11 +1962,7 @@ window.onScheduledUploadDone = function (clipIdx, success, error) {
 };
 
 window.onScheduleUpdated = function () {
-    pywebview.api.get_all_scheduled().then(r => {
-        if (r.scheduled) state.scheduled = r.scheduled;
-        renderCalendar();
-        renderTimeline();
-    }).catch(() => {});
+    refreshScheduleFromBackend(true);
 };
 
 /* ── Progress Helpers ──────────────────────────────────────────────────── */
@@ -1240,17 +2049,18 @@ function _buildResultCard(clip, i) {
     const sc = score >= 0.7 ? 'high' : score >= 0.4 ? 'mid' : 'low';
     const card = document.createElement('div');
     card.className = 'result-card';
+    card.dataset.clipIdx = i;
     card.innerHTML = `
         <div class="result-card-thumb" data-clip-idx="${i}" onclick="previewClip(${i})">
             <div class="thumb-placeholder">
                 <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
             <div class="result-card-overlay">
-                <button class="play-btn">
+                <button class="play-btn" type="button" aria-label="Preview clip ${i + 1}">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 </button>
             </div>
-            <button class="result-card-delete" onclick="event.stopPropagation(); requestDeleteResult(${i})" title="Delete">
+            <button class="result-card-delete" onclick="event.stopPropagation(); requestDeleteResult(${i})" title="Delete" aria-label="Delete clip ${i + 1}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
             </button>
         </div>
@@ -1264,7 +2074,25 @@ function _buildResultCard(clip, i) {
                 ${m.start !== undefined ? `<span>${fmtTime(m.start)} - ${fmtTime(m.end)}</span>` : ''}
                 <span>${clip.size_mb} MB</span>
             </div>
+            <div class="result-feedback" aria-label="Clip feedback">
+                <button type="button" class="feedback-btn" data-feedback="like" title="Like this clip and nudge future picks" aria-label="Like this clip and nudge future picks">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10v11"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2h0a3.13 3.13 0 0 1 3 3.88Z"/></svg>
+                </button>
+                <button type="button" class="feedback-btn" data-feedback="dislike" title="Dislike this clip and reduce similar future picks" aria-label="Dislike this clip and reduce similar future picks">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 14V3"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22h0a3.13 3.13 0 0 1-3-3.88Z"/></svg>
+                </button>
+                <button type="button" class="feedback-btn" data-feedback="favorite" title="Favorite this clip and boost similar future picks" aria-label="Favorite this clip and boost similar future picks">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                </button>
+            </div>
         </div>`;
+    card.querySelectorAll('.feedback-btn').forEach(btn => {
+        btn.addEventListener('click', event => {
+            event.stopPropagation();
+            recordClipFeedback(i, btn.dataset.feedback);
+        });
+    });
+    renderCardFeedbackState(card, clip);
     return card;
 }
 
@@ -1274,7 +2102,12 @@ function toggleFolder(headerEl) {
 }
 
 async function loadResults() {
-    try { const r = await pywebview.api.get_results(); state.results = r.clips || []; state.moments = r.moments || state.moments; } catch (_) {}
+    try {
+        const r = await pywebview.api.get_results();
+        state.results = visibleClipList(r.clips);
+        state.moments = r.moments || state.moments;
+        await loadPersonalization();
+    } catch (_) {}
     const grid = document.getElementById('results-grid');
     const empty = document.getElementById('results-empty');
     const countEl = document.getElementById('results-count');
@@ -1349,6 +2182,7 @@ async function previewClip(idx) {
             const video = document.getElementById('preview-video');
             video.src = r.url;
             document.getElementById('preview-modal-title').textContent = `Clip ${idx + 1}`;
+            renderPreviewFeedbackState();
             showModal('preview-modal');
             video.play().catch(() => {});
         } else {
@@ -1364,6 +2198,7 @@ function closePreview() {
     video.pause();
     video.src = '';
     state.previewClipIdx = -1;
+    renderPreviewFeedbackState();
     closeModal('preview-modal');
 }
 
@@ -1476,7 +2311,7 @@ function _buildLibraryCard(clip) {
     const d = new Date(clip.modified * 1000);
     const dateStr = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
     item.innerHTML = `
-        <div class="library-item-thumb" data-lib-url="${escHtml(clip.url)}" onclick="previewLibraryClip('${escHtml(clip.filename)}', '${escHtml(clip.url)}')">
+        <div class="library-item-thumb" data-lib-url="${escHtml(clip.url)}">
             <div class="thumb-placeholder">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
@@ -1485,7 +2320,7 @@ function _buildLibraryCard(clip) {
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 </button>
             </div>
-            <button class="library-item-delete" onclick="event.stopPropagation(); requestDeleteLibrary('${escHtml(clip.filename)}')" title="Delete">
+            <button class="library-item-delete" title="Delete">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
             </button>
         </div>
@@ -1498,6 +2333,16 @@ function _buildLibraryCard(clip) {
         </div>`;
     // Lazy-load thumbnail
     const thumbEl = item.querySelector('.library-item-thumb');
+    if (thumbEl) {
+        thumbEl.addEventListener('click', () => previewLibraryClip(clip.filename, clip.url));
+    }
+    const deleteBtn = item.querySelector('.library-item-delete');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            requestDeleteLibrary(clip.filename);
+        });
+    }
     if (clip.url && thumbEl) lazyThumb(thumbEl, clip.url);
     return item;
 }
@@ -1565,6 +2410,7 @@ function setLibraryView(view) {
 
 function previewLibraryClip(filename, url) {
     state.previewClipIdx = -1; // not from results
+    renderPreviewFeedbackState();
     const video = document.getElementById('preview-video');
     video.src = url;
     document.getElementById('preview-modal-title').textContent = filename;
@@ -1586,15 +2432,40 @@ async function connectYouTube() {
             state.ytConnected = true;
             await loadChannelsAndCategories();
             updateYtUI(true);
+            if (hasPendingSchedule()) {
+                try { await pywebview.api.start_scheduler(); } catch (_) {}
+            }
+            hideYouTubeSetupCard();
             const name = r.account ? r.account.title : 'YouTube';
             toast(`Connected: ${name}`, 'success');
             addNotification('YouTube Connected', `Account "${name}" linked successfully`, 'success');
         } else {
+            showYouTubeSetupCard(r.error || 'Could not connect to YouTube');
             toast(r.error || 'Connection failed', 'error');
             addNotification('Connection Failed', r.error || 'Could not connect to YouTube', 'error');
         }
-    } catch (e) { toast('Connection failed: ' + e, 'error'); addNotification('Connection Failed', String(e), 'error'); }
+    } catch (e) {
+        showYouTubeSetupCard(String(e));
+        toast('Connection failed: ' + e, 'error');
+        addNotification('Connection Failed', String(e), 'error');
+    }
     btn.innerHTML = origHTML; btn.disabled = false;
+}
+
+function showYouTubeSetupCard(message = '') {
+    const card = document.getElementById('yt-setup-card');
+    const msg = document.getElementById('yt-setup-message');
+    if (!card) return;
+    if (msg && message) {
+        msg.textContent = message.includes('client_secrets.json')
+            ? 'Add a Desktop app OAuth JSON named client_secrets.json to the app data folder. Keep the OAuth app in Testing and add yourself as a test user before clicking Add Account.'
+            : message;
+    }
+    card.classList.remove('hidden');
+}
+
+function hideYouTubeSetupCard() {
+    document.getElementById('yt-setup-card')?.classList.add('hidden');
 }
 
 async function disconnectAccount(accountId) {
@@ -1629,6 +2500,7 @@ async function loadChannelsAndCategories() {
         const [chRes, catRes] = await Promise.all([pywebview.api.get_channels(), pywebview.api.get_categories()]);
         state.channels = chRes.channels || [];
         state.categories = catRes.categories || [];
+        if (!state.categories.length) state.categories = [{ id: DEFAULT_CATEGORY_ID, title: 'Gaming' }];
         const list = document.getElementById('yt-channel-list');
         list.innerHTML = '';
 
@@ -1649,9 +2521,20 @@ async function loadChannelsAndCategories() {
             if (showAccountHeaders) {
                 const header = document.createElement('div');
                 header.className = 'yt-account-header';
-                header.innerHTML = `
-                    <span class="yt-account-name">${escHtml(group.title)}</span>
-                    <button class="yt-account-remove" onclick="event.stopPropagation(); disconnectAccount('${acctId}')" title="Remove account">&times;</button>`;
+                const name = document.createElement('span');
+                name.className = 'yt-account-name';
+                name.textContent = group.title;
+                const remove = document.createElement('button');
+                remove.className = 'yt-account-remove';
+                remove.type = 'button';
+                remove.title = 'Remove account';
+                remove.setAttribute('aria-label', `Remove account ${group.accountTitle || acctId}`);
+                remove.textContent = '×';
+                remove.addEventListener('click', event => {
+                    event.stopPropagation();
+                    disconnectAccount(acctId);
+                });
+                header.append(name, remove);
                 list.appendChild(header);
             }
 
@@ -1660,14 +2543,43 @@ async function loadChannelsAndCategories() {
                 const card = document.createElement('div');
                 card.className = 'yt-channel-card' + (isSelected ? ' selected' : '');
                 card.dataset.channelId = ch.id;
+                card.tabIndex = 0;
+                card.setAttribute('role', 'button');
+                card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
                 card.onclick = () => selectChannel(ch.id);
-                card.innerHTML = `
-                    <img class="yt-channel-thumb" src="${ch.thumbnail}" alt="">
-                    <div class="yt-channel-info">
-                        <span class="yt-channel-title">${escHtml(ch.title)}</span>
-                        <span class="yt-channel-subs">${formatNumber(ch.subscribers)} subscribers</span>
-                    </div>
-                    ${!showAccountHeaders ? `<button class="yt-account-remove yt-channel-remove-inline" onclick="event.stopPropagation(); disconnectAccount('${ch.account_id || ch.id}')" title="Remove account">&times;</button>` : ''}`;
+                card.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        selectChannel(ch.id);
+                    }
+                });
+                const img = document.createElement('img');
+                img.className = 'yt-channel-thumb';
+                img.alt = '';
+                img.src = safeMediaUrl(ch.thumbnail);
+                const info = document.createElement('div');
+                info.className = 'yt-channel-info';
+                const title = document.createElement('span');
+                title.className = 'yt-channel-title';
+                title.textContent = ch.title || 'YouTube channel';
+                const subs = document.createElement('span');
+                subs.className = 'yt-channel-subs';
+                subs.textContent = `${formatNumber(ch.subscribers)} subscribers`;
+                info.append(title, subs);
+                card.append(img, info);
+                if (!showAccountHeaders) {
+                    const remove = document.createElement('button');
+                    remove.className = 'yt-account-remove yt-channel-remove-inline';
+                    remove.type = 'button';
+                    remove.title = 'Remove account';
+                    remove.setAttribute('aria-label', `Remove account ${ch.account_title || ch.title || ch.id}`);
+                    remove.textContent = '×';
+                    remove.addEventListener('click', event => {
+                        event.stopPropagation();
+                        disconnectAccount(ch.account_id || ch.id);
+                    });
+                    card.appendChild(remove);
+                }
                 list.appendChild(card);
             });
         });
@@ -1675,26 +2587,33 @@ async function loadChannelsAndCategories() {
         if (state.channels.length && !state.selectedChannel) state.selectedChannel = state.channels[0].id;
         updateModalCategoryDropdown();
         _populateScheduleChannelDropdown();
+        if (state.scheduled.length) {
+            state.scheduled = normalizeScheduledMetadata(state.scheduled);
+        }
     } catch (e) { console.error('Load channels/cats error:', e); }
 }
 
 function selectChannel(id) {
     state.selectedChannel = id;
-    document.querySelectorAll('.yt-channel-card').forEach(c => c.classList.toggle('selected', c.dataset.channelId === id));
+    document.querySelectorAll('.yt-channel-card').forEach(c => {
+        const selected = c.dataset.channelId === id;
+        c.classList.toggle('selected', selected);
+        c.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    });
 }
 
 function updateModalCategoryDropdown() {
     const sel = document.getElementById('modal-meta-category');
     if (!sel) return;
-    const cur = sel.value;
     sel.innerHTML = '';
+    if (!state.categories.length) state.categories = [{ id: DEFAULT_CATEGORY_ID, title: 'Gaming' }];
     state.categories.forEach(cat => {
         const opt = document.createElement('option');
         opt.value = cat.id; opt.textContent = cat.title;
-        if (cat.id === '22') opt.selected = true;
+        if (cat.id === DEFAULT_CATEGORY_ID) opt.selected = true;
         sel.appendChild(opt);
     });
-    if (cur) sel.value = cur;
+    sel.value = DEFAULT_CATEGORY_ID;
 }
 
 /* ── Upload / Calendar Section ────────────────────────────────────────── */
@@ -1706,22 +2625,29 @@ async function loadUploadSection() {
     // Import any clips dropped into the clips/ folder + refresh results
     try {
         const r = await pywebview.api.import_folder_clips();
-        if (r.clips && r.clips.length) {
-            state.results = r.clips;
-            state.moments = r.moments || state.moments;
-        }
+        state.results = visibleClipList(r.clips || []);
+        state.moments = r.moments || [];
     } catch (_) {
         // Fallback: just refresh from backend
         try {
             const r = await pywebview.api.get_results();
-            if (r.clips && r.clips.length) {
-                state.results = r.clips;
-                state.moments = r.moments || state.moments;
-            }
+            state.results = visibleClipList(r.clips || []);
+            state.moments = r.moments || [];
         } catch (_) {}
     }
 
-    if (!state.results.length) { empty.style.display = ''; content.classList.add('hidden'); return; }
+    await refreshScheduleFromBackend(false);
+
+    if (!state.results.length) {
+        state.scheduled = [];
+        persistSchedule();
+        empty.style.display = '';
+        content.classList.add('hidden');
+        renderTimeline();
+        renderCalendar();
+        renderClipTray();
+        return;
+    }
     empty.style.display = 'none';
     content.classList.remove('hidden');
 
@@ -1841,7 +2767,7 @@ function _createTrayClipEl(clip, idx) {
     el.dataset.clipIdx = idx;
     const isScheduled = state.scheduled.some(s => s.clipIdx === idx && !s.uploaded);
     if (isScheduled) el.classList.add('scheduled');
-    el.innerHTML = `<span class="tray-clip-num">C${idx+1}</span><span class="tray-clip-name">${clip.filename}</span><span class="tray-clip-size">${clip.size_mb} MB</span>`;
+    el.innerHTML = `<span class="tray-clip-num">C${idx+1}</span><span class="tray-clip-name">${escHtml(clip.filename)}</span><span class="tray-clip-size">${escHtml(clip.size_mb)} MB</span>`;
     el.addEventListener('dragstart', e => {
         e.dataTransfer.setData('text/plain', String(idx));
         e.dataTransfer.effectAllowed = 'copy';
@@ -1913,15 +2839,27 @@ function _getPeakTimesForDay(count) {
     return slots.sort();
 }
 
+function _availableScheduleSlotsForDate(dateStr, count, now = new Date()) {
+    const usedTimes = new Set(state.scheduled
+        .filter(s => s.date === dateStr && !s.uploaded)
+        .map(s => s.time));
+    return _getPeakTimesForDay(count)
+        .filter(t => !usedTimes.has(t))
+        .filter(t => _isFutureScheduleSlot(dateStr, t, now));
+}
+
 function _nextPeakTimeForDate(dateStr) {
     // Find the next available peak time for a given date (not already taken)
+    const available = _availableScheduleSlotsForDate(dateStr, PEAK_TIMES.length);
+    if (available.length) return available[0];
+    if (_isTodayDateStr(dateStr)) {
+        const future = new Date(Date.now() + SCHEDULE_BUFFER_MINUTES * 60 * 1000);
+        return `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
+    }
+    // All peak slots taken — use next hour after last used
     const usedTimes = state.scheduled
         .filter(s => s.date === dateStr && !s.uploaded)
         .map(s => s.time);
-    for (const t of PEAK_TIMES) {
-        if (!usedTimes.includes(t)) return t;
-    }
-    // All peak slots taken — use next hour after last used
     if (usedTimes.length) {
         const last = usedTimes.sort().pop();
         const [h, m] = last.split(':').map(Number);
@@ -1929,6 +2867,25 @@ function _nextPeakTimeForDate(dateStr) {
         return `${String(nextH).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     }
     return '12:00';
+}
+
+function _resolveSchedulableDateTime(dateStr, requestedTime = null) {
+    let cursor = new Date(`${dateStr}T12:00:00`);
+    if (Number.isNaN(cursor.getTime())) cursor = new Date();
+    for (let guard = 0; guard < 370; guard++) {
+        const currentDateStr = _toDateStr(cursor);
+        const usedTimes = new Set(state.scheduled
+            .filter(s => s.date === currentDateStr && !s.uploaded)
+            .map(s => s.time));
+        if (requestedTime && !usedTimes.has(requestedTime) && _isFutureScheduleSlot(currentDateStr, requestedTime)) {
+            return { date: currentDateStr, time: requestedTime };
+        }
+        const available = _availableScheduleSlotsForDate(currentDateStr, PEAK_TIMES.length);
+        if (available.length) return { date: currentDateStr, time: available[0] };
+        requestedTime = null;
+        cursor.setDate(cursor.getDate() + 1);
+    }
+    return { date: _toDateStr(new Date()), time: '12:00' };
 }
 
 /* ── Calendar ─────────────────────────────────────────────────────────── */
@@ -1998,7 +2955,7 @@ function renderCalendar() {
 
             visible.forEach(s => {
                 const chip = document.createElement('div');
-                const isMissed = !s.uploaded && isPast;
+                const isMissed = isScheduleMissed(s);
                 chip.className = 'cal-chip' + (s.uploaded ? ' uploaded' : isMissed ? ' missed' : '');
                 chip.innerHTML = `<span>C${s.clipIdx + 1}</span><span class="cal-chip-time">${s.time || ''}</span>`;
                 chip.title = `${s.title || 'Clip ' + (s.clipIdx + 1)} — ${s.time}${s.uploaded ? ' (uploaded)' : isMissed ? ' (missed)' : ''}`;
@@ -2074,8 +3031,14 @@ function _renderCalChannelTabs() {
         const tab = document.createElement('button');
         tab.className = 'cal-ch-tab' + (state.calChannelFilter === ch.id ? ' active' : '');
         tab.dataset.channel = ch.id;
-        if (ch.thumbnail) tab.innerHTML = `<img class="cal-ch-thumb" src="${ch.thumbnail}" alt="">`;
-        tab.innerHTML += escHtml(ch.title);
+        if (ch.thumbnail) {
+            const img = document.createElement('img');
+            img.className = 'cal-ch-thumb';
+            img.src = safeMediaUrl(ch.thumbnail);
+            img.alt = '';
+            tab.appendChild(img);
+        }
+        tab.appendChild(document.createTextNode(ch.title || ch.id));
         tab.onclick = () => filterCalendarByChannel(ch.id);
         tabs.appendChild(tab);
     });
@@ -2095,14 +3058,13 @@ function openDayDetailView(dateStr, dayItems) {
 
     const list = document.getElementById('day-detail-list');
     list.innerHTML = '';
-    const nowStr = _toDateStr(new Date());
     const sorted = [...dayItems].sort((a, b) => (a.time || '').localeCompare(b.time || ''));
 
     // Add status summary line
     let sPending = 0, sUploaded = 0, sMissed = 0;
     sorted.forEach(s => {
         if (s.uploaded) sUploaded++;
-        else if (s.date < nowStr) sMissed++;
+        else if (isScheduleMissed(s)) sMissed++;
         else sPending++;
     });
     const summaryParts = [];
@@ -2120,7 +3082,7 @@ function openDayDetailView(dateStr, dayItems) {
     }
 
     sorted.forEach(s => {
-        const isMissed = !s.uploaded && s.date < nowStr;
+        const isMissed = isScheduleMissed(s);
         const statusClass = s.uploaded ? 'uploaded' : isMissed ? 'missed' : 'pending';
         const statusLabel = s.uploaded ? 'Uploaded' : isMissed ? 'Missed' : 'Pending';
 
@@ -2179,9 +3141,7 @@ function closeDayDetailAndAddClip() {
 }
 
 function _checkMissedUploads() {
-    const now = new Date();
-    const nowStr = now.toISOString().slice(0, 10);
-    const missed = state.scheduled.filter(s => !s.uploaded && s.date < nowStr);
+    const missed = state.scheduled.filter(s => isScheduleMissed(s));
     const banner = document.getElementById('missed-uploads-banner');
     if (missed.length > 0) {
         document.getElementById('missed-uploads-text').textContent =
@@ -2310,55 +3270,54 @@ function _scheduleClipIndices(clipIndices, opts = {}) {
         }
     }
 
-    // Distribute clips across days using peak time slots
-    let dayOffset = 0;
-    let slotIdx = clearExisting ? 0 : (() => {
-        // Find which slot index we should continue from on the start date
-        const dateStr = _toDateStr(startDate);
-        const usedCount = state.scheduled.filter(s => s.date === dateStr && !s.uploaded).length;
-        return usedCount % perDay;
-    })();
+    // Distribute clips across future peak time slots. If Today has no future slots left,
+    // automatically roll into tomorrow instead of creating missed uploads.
+    const cursorDate = new Date(startDate);
+    const scheduledDates = new Set();
+    let firstScheduledDate = null;
 
     clipIndices.forEach(i => {
         const clip = state.results[i];
         if (!clip) return;
 
-        const d = new Date(startDate);
-        d.setDate(d.getDate() + dayOffset);
-        const dateStr = _toDateStr(d);
-        const time = peakSlots[slotIdx];
+        let dateStr = _toDateStr(cursorDate);
+        let availableSlots = _availableScheduleSlotsForDate(dateStr, perDay);
+        while (!availableSlots.length) {
+            cursorDate.setDate(cursorDate.getDate() + 1);
+            dateStr = _toDateStr(cursorDate);
+            availableSlots = _availableScheduleSlotsForDate(dateStr, perDay);
+        }
+        const time = availableSlots[0];
+        if (!firstScheduledDate) firstScheduledDate = new Date(cursorDate);
+        scheduledDates.add(dateStr);
 
+        const title = clip.filename.replace(/\.mp4$/i, '');
         state.scheduled.push({
-            clipIdx: i,
+            ...clipIdentityFields(clip, i),
+            ...descriptionFieldsForClip(clip, i, title),
+            ...channelIdentityFields(resolvedChannel),
             date: dateStr,
             time: time,
-            title: clip.filename.replace(/\.mp4$/i, ''),
-            description: '#shorts #viral',
-            tags: 'shorts, viral, clips',
-            category_id: '22',
+            title,
+            tags: DEFAULT_UPLOAD_TAGS,
+            category_id: DEFAULT_CATEGORY_ID,
             privacy: privacy,
             uploaded: false,
-            channel_id: resolvedChannel,
         });
-
-        slotIdx++;
-        if (slotIdx >= peakSlots.length) {
-            slotIdx = 0;
-            dayOffset++;
-        }
     });
 
     persistSchedule();
 
     // Navigate calendar to the first scheduled date
-    state.calYear = startDate.getFullYear();
-    state.calMonth = startDate.getMonth();
+    const navDate = firstScheduledDate || startDate;
+    state.calYear = navDate.getFullYear();
+    state.calMonth = navDate.getMonth();
 
     renderTimeline();
     renderCalendar();
     renderClipTray();
 
-    const totalDays = Math.ceil(clipIndices.length / perDay);
+    const totalDays = Math.max(1, scheduledDates.size);
     const timesStr = peakSlots.map(t => {
         const [h, m] = t.split(':');
         const hr = parseInt(h);
@@ -2384,11 +3343,16 @@ async function generateAITitles() {
             return;
         }
         let updated = 0;
+        const metaByIndex = {};
+        (r.metadata || []).forEach(m => { metaByIndex[m.index] = m; });
         state.scheduled.forEach(s => {
             if (s.uploaded) return;
             const idx = s.clipIdx;
             if (idx >= 0 && idx < r.titles.length && r.titles[idx]) {
                 s.title = r.titles[idx];
+                if (metaByIndex[idx]) {
+                    applyGeneratedMetadataToSchedule(s, metaByIndex[idx]);
+                }
                 updated++;
             }
         });
@@ -2431,6 +3395,7 @@ window.onTitlesDone = function (r) {
             state.scheduled.forEach(s => {
                 if (s.clipIdx === t.index && !s.uploaded) {
                     s.title = t.title;
+                    applyGeneratedMetadataToSchedule(s, t);
                     schedUpdated++;
                 }
             });
@@ -2449,7 +3414,7 @@ window.onTitlesDone = function (r) {
     // Refresh results from backend to get updated filenames + source_stems
     pywebview.api.get_results().then(fresh => {
         if (fresh.clips && fresh.clips.length) {
-            state.results = fresh.clips;
+            state.results = visibleClipList(fresh.clips);
             state.moments = fresh.moments || state.moments;
         }
         renderClipTray();
@@ -2502,6 +3467,7 @@ async function generateAITitlesForFolder(stem, btn) {
                 state.scheduled.forEach(s => {
                     if (s.clipIdx === t.index && !s.uploaded) {
                         s.title = t.title;
+                        applyGeneratedMetadataToSchedule(s, t);
                         schedUpdated++;
                     }
                 });
@@ -2519,7 +3485,7 @@ async function generateAITitlesForFolder(stem, btn) {
 
         pywebview.api.get_results().then(fresh => {
             if (fresh.clips && fresh.clips.length) {
-                state.results = fresh.clips;
+                state.results = visibleClipList(fresh.clips);
                 state.moments = fresh.moments || state.moments;
             }
             renderClipTray();
@@ -2549,12 +3515,18 @@ async function regenerateTitle(schedIdx) {
         const r = await pywebview.api.generate_title_for_clip(s.clipIdx);
         if (r.title) {
             s.title = r.title;
+            applyGeneratedMetadataToSchedule(s, r);
             persistSchedule();
             renderTimeline();
             renderCalendar();
             // Update meta modal if open
             const titleInput = document.getElementById('modal-meta-title');
             if (titleInput) titleInput.value = r.title;
+            const descInput = document.getElementById('modal-meta-desc');
+            if (descInput) descInput.value = s.description_custom_text || '';
+            updateMetaDescriptionPreview();
+            const tagsInput = document.getElementById('modal-meta-tags');
+            if (tagsInput && r.tags) tagsInput.value = r.tags;
             toast('Title regenerated', 'success');
         } else {
             toast(r.error || 'No transcript available', 'warning');
@@ -2585,14 +3557,13 @@ function renderTimeline() {
     panel.classList.remove('hidden');
 
     const now = new Date();
-    const nowStr = _toDateStr(now);
 
     // Single-pass: count + build sorted array, with channel filter
     const filter = state.calChannelFilter;
     let uploadedCount = 0, missedCount = 0;
     const sorted = state.scheduled.map((s, i) => {
         if (s.uploaded) uploadedCount++;
-        else if (s.date < nowStr) missedCount++;
+        else if (isScheduleMissed(s, now)) missedCount++;
         return { ...s, _idx: i };
     }).filter(s => filter === 'all' || !s.channel_id || s.channel_id === filter)
       .sort((a, b) => (`${a.date}T${a.time}` > `${b.date}T${b.time}` ? 1 : -1));
@@ -2610,7 +3581,7 @@ function renderTimeline() {
 
     const frag = document.createDocumentFragment();
     sorted.forEach(s => {
-        const isMissed = !s.uploaded && s.date < nowStr;
+        const isMissed = isScheduleMissed(s, now);
         const statusClass = s.uploaded ? 'uploaded' : isMissed ? 'missed' : 'pending';
         const statusLabel = s.uploaded ? 'Uploaded' : isMissed ? 'Missed' : s.privacy;
         const dateFmt = _fmtDateFull(s.date, s.time);
@@ -2665,7 +3636,7 @@ function clearSchedule() {
 /* ── Missed upload actions ────────────────────────────────────────────── */
 
 function rescheduleOverdue() {
-    const nowStr = _toDateStr(new Date());
+    const now = new Date();
     const perDay = _getClipsPerDay();
     const peakSlots = _getPeakTimesForDay(perDay);
 
@@ -2676,9 +3647,11 @@ function rescheduleOverdue() {
     let slotIdx = 0;
 
     state.scheduled.forEach(s => {
-        if (!s.uploaded && s.date < nowStr) {
+        if (isScheduleMissed(s, now)) {
             s.date = _toDateStr(nextDate);
             s.time = peakSlots[slotIdx];
+            delete s.scheduler_status;
+            delete s.missed_at;
             rescheduled++;
             slotIdx++;
             if (slotIdx >= peakSlots.length) {
@@ -2695,16 +3668,20 @@ function rescheduleOverdue() {
 }
 
 function uploadOverdueNow() {
+    if (!state.ytConnected) {
+        return toast('Connect a YouTube account before uploading missed clips', 'warning');
+    }
     const now = new Date();
     const todayStr = _toDateStr(now);
     const nowTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const nowStr = todayStr;
 
     let count = 0;
     state.scheduled.forEach(s => {
-        if (!s.uploaded && s.date < nowStr) {
+        if (isScheduleMissed(s, now)) {
             s.date = todayStr;
             s.time = nowTime;
+            delete s.scheduler_status;
+            delete s.missed_at;
             count++;
         }
     });
@@ -2712,10 +3689,10 @@ function uploadOverdueNow() {
     persistSchedule();
     renderTimeline();
     renderCalendar();
+    ensureSchedulerForPending();
 
     if (count > 0) {
         toast(`${count} clip${count > 1 ? 's' : ''} queued for immediate upload`, 'success');
-        try { pywebview.api.start_scheduler(); } catch (_) {}
     }
 }
 
@@ -2727,17 +3704,20 @@ function dropClipOnDate(clipIdx, dateStr) {
     const clip = state.results[clipIdx];
     if (!clip) return;
 
+    const title = clip.filename.replace(/\.mp4$/i, '');
+    const channelId = _getScheduleChannelId() || state.selectedChannel || null;
+    const scheduledAt = _resolveSchedulableDateTime(dateStr);
     state.scheduled.push({
-        clipIdx,
-        date: dateStr,
-        time: _nextPeakTimeForDate(dateStr),
-        title: clip.filename.replace(/\.mp4$/i, ''),
-        description: '#shorts #viral',
-        tags: 'shorts, viral, clips',
-        category_id: '22',
+        ...clipIdentityFields(clip, clipIdx),
+        ...descriptionFieldsForClip(clip, clipIdx, title),
+        ...channelIdentityFields(channelId),
+        date: scheduledAt.date,
+        time: scheduledAt.time,
+        title,
+        tags: DEFAULT_UPLOAD_TAGS,
+        category_id: DEFAULT_CATEGORY_ID,
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
-        channel_id: _getScheduleChannelId() || state.selectedChannel || null,
     });
 
     persistSchedule();
@@ -2751,17 +3731,18 @@ function dropClipOnDate(clipIdx, dateStr) {
 
 function openClipPicker(dateStr) {
     if (!state.results.length) return toast('No clips available. Generate clips first.', 'warning');
-    state.pickerDate = dateStr;
+    const scheduledAt = _resolveSchedulableDateTime(dateStr);
+    state.pickerDate = scheduledAt.date;
 
-    document.getElementById('clip-picker-title').textContent = `Schedule on ${dateStr}`;
-    document.getElementById('picker-time').value = _nextPeakTimeForDate(dateStr);
+    document.getElementById('clip-picker-title').textContent = `Schedule on ${scheduledAt.date}`;
+    document.getElementById('picker-time').value = scheduledAt.time;
 
     const list = document.getElementById('clip-picker-list');
     list.innerHTML = '';
     state.results.forEach((clip, i) => {
         const item = document.createElement('div');
         item.className = 'clip-picker-item';
-        item.innerHTML = `<span class="tray-clip-num">Clip ${i+1}</span><span class="tray-clip-name">${clip.filename}</span>`;
+        item.innerHTML = `<span class="tray-clip-num">Clip ${i+1}</span><span class="tray-clip-name">${escHtml(clip.filename)}</span>`;
         item.onclick = () => pickClipForDate(i);
         list.appendChild(item);
     });
@@ -2777,17 +3758,20 @@ function pickClipForDate(clipIdx) {
     const clip = state.results[clipIdx];
     if (!clip) return;
 
+    const title = clip.filename.replace(/\.mp4$/i, '');
+    const channelId = state.selectedChannel || null;
+    const scheduledAt = _resolveSchedulableDateTime(dateStr, time);
     state.scheduled.push({
-        clipIdx,
-        date: dateStr,
-        time: time,
-        title: clip.filename.replace(/\.mp4$/i, ''),
-        description: '#shorts #viral',
-        tags: 'shorts, viral, clips',
-        category_id: '22',
+        ...clipIdentityFields(clip, clipIdx),
+        ...descriptionFieldsForClip(clip, clipIdx, title),
+        ...channelIdentityFields(channelId),
+        date: scheduledAt.date,
+        time: scheduledAt.time,
+        title,
+        tags: DEFAULT_UPLOAD_TAGS,
+        category_id: DEFAULT_CATEGORY_ID,
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
-        channel_id: state.selectedChannel || null,
     });
 
     persistSchedule();
@@ -2803,6 +3787,7 @@ function persistSchedule() {
     try {
         pywebview.api.save_scheduled(state.scheduled);
     } catch (_) {}
+    ensureSchedulerForPending();
 }
 
 /* ── Meta Modal (edit scheduled item) ─────────────────────────────────── */
@@ -2814,27 +3799,45 @@ function openMetaModal(schedIdx) {
 
     document.getElementById('meta-modal-title').textContent = `Clip ${item.clipIdx + 1} — ${item.date}`;
     document.getElementById('modal-meta-title').value = item.title;
-    document.getElementById('modal-meta-desc').value = item.description;
+    document.getElementById('modal-meta-desc').value = item.description_custom_text || '';
     document.getElementById('modal-meta-tags').value = item.tags;
     document.getElementById('modal-meta-privacy').value = item.privacy;
     document.getElementById('modal-meta-time').value = item.time;
 
-    if (state.categories.length) updateModalCategoryDropdown();
-    document.getElementById('modal-meta-category').value = item.category_id;
+    updateModalCategoryDropdown();
+    item.category_id = DEFAULT_CATEGORY_ID;
+    document.getElementById('modal-meta-category').value = DEFAULT_CATEGORY_ID;
 
     showModal('meta-modal');
+    updateMetaDescriptionPreview();
+}
+
+function updateMetaDescriptionPreview() {
+    const idx = state.editingScheduleIdx;
+    const preview = document.getElementById('modal-description-preview');
+    if (!preview || idx < 0 || !state.scheduled[idx]) return;
+    const item = { ...state.scheduled[idx] };
+    item.title = document.getElementById('modal-meta-title')?.value || item.title || 'Untitled';
+    item.description_custom_text = document.getElementById('modal-meta-desc')?.value || '';
+    item.description_generated = item.description_generated || item.generated_description || item.title;
+    updateScheduledDescriptionPreview(item);
+    preview.textContent = item.final_description || item.description || '';
 }
 
 function saveMetaModal() {
     const idx = state.editingScheduleIdx;
     if (idx < 0 || !state.scheduled[idx]) return;
 
-    state.scheduled[idx].title = document.getElementById('modal-meta-title').value || 'Untitled';
-    state.scheduled[idx].description = document.getElementById('modal-meta-desc').value;
-    state.scheduled[idx].tags = document.getElementById('modal-meta-tags').value;
-    state.scheduled[idx].category_id = document.getElementById('modal-meta-category').value;
-    state.scheduled[idx].privacy = document.getElementById('modal-meta-privacy').value;
-    state.scheduled[idx].time = document.getElementById('modal-meta-time').value;
+    const item = state.scheduled[idx];
+    item.title = document.getElementById('modal-meta-title').value || 'Untitled';
+    item.description_custom_text = document.getElementById('modal-meta-desc').value || '';
+    item.description_generated = item.description_generated || item.generated_description || item.title;
+    item.generated_description = item.description_generated;
+    item.tags = document.getElementById('modal-meta-tags').value;
+    item.category_id = DEFAULT_CATEGORY_ID;
+    item.privacy = document.getElementById('modal-meta-privacy').value;
+    item.time = document.getElementById('modal-meta-time').value;
+    updateScheduledDescriptionPreview(item);
 
     closeModal('meta-modal');
     persistSchedule();
@@ -2865,47 +3868,95 @@ async function refreshUploadClips() {
     toast('Clips refreshed', 'success');
 }
 
+async function cancelUpload() {
+    try {
+        await pywebview.api.cancel_upload();
+        await pywebview.api.cancel_processing();
+    } catch (_) {}
+    document.getElementById('upload-status').textContent = 'Stopping upload...';
+    document.getElementById('btn-cancel-upload').disabled = true;
+    toast('Stopping upload...', 'warning');
+}
+
 // Called from Python when a clip is auto-deleted after upload
-window.onClipDeleted = function(clipIdx, filename) {
+window.onClipDeleted = async function(clipIdx, filename) {
     toast(`Deleted "${filename}" from disk`, 'info');
-    // Refresh the library if visible
-    if (document.getElementById('section-library')?.classList.contains('active')) {
-        loadLibrary();
+    const idx = state.results.findIndex((clip, i) => i === Number(clipIdx) || clip.filename === filename);
+    if (idx >= 0) {
+        state.results.splice(idx, 1);
+        if (idx < state.moments.length) state.moments.splice(idx, 1);
+        await refreshScheduleFromBackend(false);
+        renderClipTray();
+        renderTimeline();
+        renderCalendar();
+    }
+    if (document.getElementById('section-results')?.classList.contains('active')) {
+        await loadResults();
+    } else if (document.getElementById('section-upload')?.classList.contains('active')) {
+        await loadUploadSection();
+    } else if (document.getElementById('section-library')?.classList.contains('active')) {
+        await loadLibrary();
     }
 };
 
 async function startUpload() {
     if (!state.scheduled.length) return toast('Click "Schedule All Clips" to create a schedule first', 'warning');
 
-    const clipsMetadata = state.scheduled.filter(s => !s.uploaded).map(s => ({
+    state.scheduled = normalizeScheduledMetadata(state.scheduled);
+    const pending = state.scheduled
+        .filter(s => !s.uploaded)
+        .map(s => ({ ...s, _scheduledDate: scheduledLocalDate(s) }))
+        .sort((a, b) => {
+            const ad = a._scheduledDate ? a._scheduledDate.getTime() : Number.MAX_SAFE_INTEGER;
+            const bd = b._scheduledDate ? b._scheduledDate.getTime() : Number.MAX_SAFE_INTEGER;
+            return ad - bd;
+        });
+
+    if (pending.some(s => !s._scheduledDate)) {
+        return toast('One or more scheduled clips has an invalid date or time', 'error');
+    }
+
+    const clipsMetadata = pending.map(s => ({
         index: s.clipIdx,
+        clip_id: s.clip_id,
+        source_id: s.source_id,
+        source_stem: s.source_stem,
+        clip_filename: s.clip_filename,
         title: s.title,
-        description: s.description,
+        description: s.final_description || s.description,
+        final_description: s.final_description || s.description,
+        description_generated: s.description_generated || s.generated_description || '',
+        generated_description: s.generated_description || s.description_generated || '',
+        description_custom_text: s.description_custom_text || '',
+        description_auto_hashtags: s.description_auto_hashtags !== false,
+        game_title: s.game_title || '',
         tags: (s.tags || '').split(',').map(t => t.trim()).filter(Boolean),
-        category_id: s.category_id || '22',
+        category_id: DEFAULT_CATEGORY_ID,
         privacy: s.privacy || 'private',
+        channel_id: s.channel_id,
+        account_id: s.account_id,
+        ...scheduledPublishFields(s),
     }));
 
     if (!clipsMetadata.length) return toast('All clips already uploaded', 'warning');
-    if (!state.selectedChannel) return toast('Please select a YouTube channel first', 'warning');
-
-    const pending = state.scheduled.filter(s => !s.uploaded);
-    const sorted = [...pending].sort((a, b) => (`${a.date}T${a.time}` > `${b.date}T${b.time}` ? 1 : -1));
-    const scheduleStart = sorted[0] ? `${sorted[0].date}T${sorted[0].time}` : null;
-
-    let interval = 24;
-    if (sorted.length > 1) {
-        const first = new Date(`${sorted[0].date}T${sorted[0].time}`);
-        const last = new Date(`${sorted[sorted.length-1].date}T${sorted[sorted.length-1].time}`);
-        interval = Math.max(1, (last - first) / (3600000 * (sorted.length - 1)));
+    if (!clipsMetadata.every(meta => meta.account_id)) return toast('Please select a YouTube channel first', 'warning');
+    if (!clipsMetadata.every(meta => meta.publish_at)) return toast('Scheduled clips need a valid publish time', 'error');
+    const now = new Date();
+    if (pending.some(s => s.privacy === 'public' && s._scheduledDate <= now)) {
+        return toast('One or more public uploads is scheduled in the past. Reschedule missed uploads first.', 'error');
     }
 
-    // Store channel_id in each scheduled item for background scheduler
-    state.scheduled.forEach(s => { s.channel_id = state.selectedChannel; });
-    pywebview.api.save_scheduled(state.scheduled);
+    try {
+        await pywebview.api.save_scheduled(state.scheduled);
+    } catch (e) {
+        return toast('Could not save the schedule before upload', 'error');
+    }
 
     document.getElementById('upload-progress-card').classList.remove('hidden');
+    window.clearTimeout(window._uploadProgressHideTimer);
     document.getElementById('btn-upload').disabled = true;
+    const cancelBtn = document.getElementById('btn-cancel-upload');
+    if (cancelBtn) cancelBtn.disabled = false;
 
     const pendingCount = clipsMetadata.length;
     addNotification(
@@ -2915,20 +3966,31 @@ async function startUpload() {
     );
 
     try {
-        const r = await pywebview.api.start_upload(clipsMetadata, scheduleStart, interval, state.selectedChannel);
+        const r = await pywebview.api.start_upload(clipsMetadata, null, null, null);
         if (r.error) {
             toast(r.error, 'error');
             addNotification('Upload Error', r.error, 'error');
             document.getElementById('btn-upload').disabled = false;
+            const cancelBtn = document.getElementById('btn-cancel-upload');
+            if (cancelBtn) cancelBtn.disabled = true;
         }
     } catch (e) {
         toast('Upload failed: ' + e, 'error');
         addNotification('Upload Failed', String(e), 'error');
         document.getElementById('btn-upload').disabled = false;
+        const cancelBtn = document.getElementById('btn-cancel-upload');
+        if (cancelBtn) cancelBtn.disabled = true;
     }
 }
 
-function showYouTubeSetup() { showModal('youtube-modal'); }
+async function showYouTubeSetup() {
+    try {
+        const r = await pywebview.api.get_app_paths();
+        const pathEl = document.getElementById('youtube-client-secret-path');
+        if (pathEl && r.client_secrets_file) pathEl.textContent = r.client_secrets_file;
+    } catch (_) {}
+    showModal('youtube-modal');
+}
 
 /* ── Settings ──────────────────────────────────────────────────────────── */
 
@@ -2956,11 +4018,16 @@ function populateSettings(s) {
     setVal('set-language', s.whisper_language || '');
     const crop = document.getElementById('set-crop-vertical');
     if (crop) crop.checked = s.crop_vertical !== false;
+    const subtitlePlacement = s.subtitle_placement || {};
+    setSlider('set-subtitle-x', subtitlePlacement.x_pct ?? 50);
+    setSlider('set-subtitle-y', subtitlePlacement.y_pct ?? 82);
+    setSlider('set-subtitle-width', subtitlePlacement.width_pct ?? 86);
     const style = s.subtitle_style || 'tiktok';
     document.querySelectorAll('.style-option').forEach(opt => {
         opt.classList.toggle('active', opt.dataset.style === style);
         opt.querySelector('input').checked = opt.dataset.style === style;
     });
+    updateSubtitlePlacementPreview();
 }
 
 function gatherSettings() {
@@ -2972,10 +4039,17 @@ function gatherSettings() {
         whisper_model: getVal('set-model'),
         whisper_language: getVal('set-language') || null,
         subtitle_style: document.querySelector('input[name="subtitle-style"]:checked')?.value || 'tiktok',
+        subtitle_placement: {
+            x_pct: parseInt(getVal('set-subtitle-x') || '50'),
+            y_pct: parseInt(getVal('set-subtitle-y') || '82'),
+            width_pct: parseInt(getVal('set-subtitle-width') || '86'),
+        },
         ffmpeg_preset: getVal('set-preset'),
         video_crf: getVal('set-crf'),
         crop_vertical: document.getElementById('set-crop-vertical')?.checked ?? true,
+        description_profile: descriptionProfile(),
     };
+    state.settings = { ...state.settings, ...s };
     saveLocal('settings', s);
     // Also persist to Python backend (survives localStorage clears)
     try { pywebview.api.save_settings(s); } catch (_) {}
@@ -2984,7 +4058,42 @@ function gatherSettings() {
 
 function resetSettings() {
     localStorage.removeItem('viria_settings');
-    pywebview.api.get_settings().then(s => { state.settings = s; populateSettings(s); toast('Settings reset', 'success'); });
+    Promise.resolve()
+        .then(() => pywebview.api.save_settings({}))
+        .then(() => pywebview.api.get_settings())
+        .then(s => {
+            state.settings = s;
+            populateSettings(s);
+            refreshDescriptionOptionsStatus();
+            toast('Settings reset', 'success');
+        })
+        .catch(() => toast('Could not reset settings', 'error'));
+}
+
+function updateSubtitlePlacementPreview() {
+    const box = document.getElementById('subtitle-placement-box');
+    if (!box) return;
+    const panel = document.querySelector('.subtitle-placement-panel');
+    const x = Math.max(10, Math.min(90, parseInt(getVal('set-subtitle-x') || '50')));
+    const y = Math.max(12, Math.min(92, parseInt(getVal('set-subtitle-y') || '82')));
+    const width = Math.max(45, Math.min(96, parseInt(getVal('set-subtitle-width') || '86')));
+    const safe = 2;
+    const maxLeft = Math.max(safe, 100 - safe - width);
+    const leftEdge = Math.max(safe, Math.min(maxLeft, x - (width / 2)));
+    const adjustedX = leftEdge + (width / 2);
+    const style = document.querySelector('input[name="subtitle-style"]:checked')?.value || 'tiktok';
+    const captionsOff = style === 'none';
+
+    if (panel) {
+        panel.classList.toggle('captions-disabled', captionsOff);
+        panel.querySelectorAll('input[type="range"]').forEach(input => { input.disabled = captionsOff; });
+    }
+
+    box.style.left = adjustedX + '%';
+    box.style.top = y + '%';
+    box.style.width = width + '%';
+    box.className = `subtitle-placement-box subtitle-placement-${style}`;
+    box.textContent = captionsOff ? 'NO CAPTIONS' : 'TRANSCRIPT TEXT';
 }
 
 function updateSliderLabel(el) {
@@ -3001,6 +4110,9 @@ function updateSliderLabel(el) {
         }
     } else if (el.id === 'set-min-gap') {
         lbl.textContent = el.value + 's';
+    } else if (el.id === 'set-subtitle-x' || el.id === 'set-subtitle-y' || el.id === 'set-subtitle-width') {
+        lbl.textContent = el.value + '%';
+        updateSubtitlePlacementPreview();
     } else {
         lbl.textContent = el.value;
     }
@@ -3010,7 +4122,24 @@ function updateSliderLabel(el) {
 
 function fmtTime(s) { s = Math.round(s); return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); }
 function formatNumber(n) { n = parseInt(n)||0; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return String(n); }
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function formatBytes(n) { n = Number(n)||0; if (n >= 1048576) return (n/1048576).toFixed(1)+' MB'; if (n >= 1024) return (n/1024).toFixed(1)+' KB'; return n + ' B'; }
+function formatLearningCap(n) { n = Number(n)||0; return '+/-' + n.toFixed(2); }
+function formatLearningTimestamp(value) {
+    if (!value) return 'Never';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function safeMediaUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    try {
+        const parsed = new URL(raw, window.location.href);
+        if (['http:', 'https:', 'data:', 'blob:'].includes(parsed.protocol)) return raw;
+    } catch (_) {}
+    return '';
+}
 function setSlider(id, val) { const el = document.getElementById(id); if (el) { el.value = val; updateSliderLabel(el); } }
 function setSelect(id, val) { const el = document.getElementById(id); if (el) el.value = val; }
 function setVal(id, val) { const el = document.getElementById(id); if (el) el.value = val; }

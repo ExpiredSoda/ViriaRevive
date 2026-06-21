@@ -1,9 +1,13 @@
 # ── Credentials & Secrets ─────────────────────────────────────────────
 client_secrets.json
+client_secret*.json
+credentials*.json
+token.json
 tokens/
 *.pickle
 .env
 .env.*
+!client_secrets.example.json
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
@@ -20,13 +24,19 @@ env/
 dist/
 build/
 *.spec
+!viria.spec
 *.exe
+release/
+installer/Output/
 
 # ── Media & Output (user-generated, large files) ─────────────────────
 downloads/
 clips/
 subtitles/
 music/
+bin/*.dll
+bin/*.exe
+bin/*.zip
 
 # ── ML Models ─────────────────────────────────────────────────────────
 *.pt
@@ -36,6 +46,14 @@ models/*.onnx
 
 # ── App State ─────────────────────────────────────────────────────────
 viria_state.json
+viria_state.*.bak
+viria_state.json.*.tmp
+personalization.json
+personalization.*.bak
+personalization.json.*.tmp
+personalization_export*.json
+*_candidate_debug.json
+*_run_debug.json
 
 # ── IDE / Editor ──────────────────────────────────────────────────────
 .vscode/

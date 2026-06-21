@@ -45,7 +45,9 @@ def transcribe_clip(
             raise CancelledError("Transcription cancelled")
         if seg.words:
             for w in seg.words:
-                words.append({"text": w.word.strip(), "start": w.start, "end": w.end})
+                text = w.word.strip()
+                if text:
+                    words.append({"text": text, "start": w.start, "end": w.end})
 
     print(f"[+] Transcribed {len(words)} words  (lang: {info.language})")
     return words
