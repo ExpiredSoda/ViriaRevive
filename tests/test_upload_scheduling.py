@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from api_bridge import ApiBridge  # noqa: E402
+import uploader  # noqa: E402
 from uploader import upload_to_youtube  # noqa: E402
 
 
@@ -171,6 +172,54 @@ class UploadSchedulingTests(unittest.TestCase):
         self.assertEqual(bridge._scheduled[0].get("scheduler_status"), "missed")
         self.assertTrue(any("window.onScheduleUpdated()" in msg for msg in bridge._js_messages))
 
+    def test_scheduler_skips_disconnected_account_items(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._scheduler_running = True
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "title": "Disconnected",
+            "privacy": "private",
+            "date": "2026-01-01",
+            "time": "12:00",
+            "uploaded": False,
+            "scheduler_status": "account_disconnected",
+        }]
+        bridge._results = [Path("missing.mp4")]
+        bridge._moments = []
+        bridge._processing = False
+        bridge._save_state = lambda: None
+        bridge._js_messages = []
+        bridge._js = bridge._js_messages.append
+
+        def stop_after_first_loop(_seconds):
+            bridge._scheduler_running = False
+
+        with patch("api_bridge.time.sleep", side_effect=stop_after_first_loop):
+            with patch("api_bridge.upload_to_youtube") as upload:
+                bridge._scheduler_loop()
+
+        upload.assert_not_called()
+        self.assertEqual(len(bridge._scheduled), 1)
+        self.assertEqual(bridge._scheduled[0].get("scheduler_status"), "account_disconnected")
+
+    def test_scheduled_upload_failure_sets_retry_backoff(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        item = {"title": "Retry Me"}
+        now = datetime(2026, 6, 22, 12, 0, 0)
+
+        bridge._mark_scheduled_upload_failed(item, RuntimeError("auth failed"), now)
+
+        self.assertEqual(item["scheduler_status"], "upload_failed")
+        self.assertEqual(item["failure_count"], 1)
+        self.assertIn("auth failed", item["last_error"])
+        self.assertEqual(item["retry_after"], "2026-06-22T12:05:00")
+        self.assertFalse(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 4, 59)))
+        self.assertTrue(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 5, 0)))
+
+        bridge._mark_scheduled_upload_failed(item, RuntimeError("still failed"), now)
+        self.assertEqual(item["failure_count"], 2)
+        self.assertEqual(item["retry_after"], "2026-06-22T12:10:00")
+
     def test_public_scheduled_upload_sets_youtube_publish_at(self):
         class FakeRequest:
             def next_chunk(self):
@@ -241,6 +290,45 @@ class UploadSchedulingTests(unittest.TestCase):
 
         self.assertEqual(result["id"], "video-id")
         self.assertEqual(progress, [100])
+
+    def test_upload_loop_has_chunk_cap(self):
+        class FakeRequest:
+            def next_chunk(self):
+                return None, None
+
+        class FakeService:
+            def videos(self):
+                return self
+
+            def insert(self, part, body, media_body):
+                return FakeRequest()
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video_file:
+            with patch("uploader.get_youtube_service", return_value=FakeService()):
+                with patch("googleapiclient.http.MediaFileUpload", return_value=object()):
+                    with patch.object(uploader, "YOUTUBE_UPLOAD_MAX_CHUNKS", 2):
+                        with self.assertRaises(TimeoutError):
+                            upload_to_youtube(Path(video_file.name), title="Stuck", privacy="private")
+
+    def test_upload_loop_has_wall_clock_timeout(self):
+        class FakeRequest:
+            def next_chunk(self):
+                return None, None
+
+        class FakeService:
+            def videos(self):
+                return self
+
+            def insert(self, part, body, media_body):
+                return FakeRequest()
+
+        times = iter([0, 10_000])
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video_file:
+            with patch("uploader.get_youtube_service", return_value=FakeService()):
+                with patch("googleapiclient.http.MediaFileUpload", return_value=object()):
+                    with patch("uploader.time.monotonic", side_effect=lambda: next(times)):
+                        with self.assertRaises(TimeoutError):
+                            upload_to_youtube(Path(video_file.name), title="Stuck", privacy="private")
 
 
 if __name__ == "__main__":

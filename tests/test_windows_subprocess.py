@@ -10,9 +10,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import windows_subprocess  # noqa: E402
+import subprocess_utils  # noqa: E402
 
 
 class WindowsSubprocessTests(unittest.TestCase):
+    def test_subprocess_wrapper_returns_empty_output_for_quiet_capture(self):
+        text_result = subprocess_utils.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(text_result.stdout, "")
+        self.assertEqual(text_result.stderr, "")
+
+        binary_result = subprocess_utils.run(
+            [sys.executable, "-c", ""],
+            capture_output=True,
+        )
+        self.assertEqual(binary_result.stdout, b"")
+        self.assertEqual(binary_result.stderr, b"")
+
     def test_create_new_console_launches_are_not_hidden(self):
         class FakeStartupInfo:
             def __init__(self):

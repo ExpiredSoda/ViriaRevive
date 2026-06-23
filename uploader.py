@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +29,9 @@ _NON_ACCOUNT_TOKEN_FILES = {
     "client_secrets.example.json",
 }
 _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+YOUTUBE_HTTP_TIMEOUT_SECONDS = 120
+YOUTUBE_UPLOAD_TIMEOUT_SECONDS = 2 * 60 * 60
+YOUTUBE_UPLOAD_MAX_CHUNKS = 2048
 
 
 # ── Authentication ───────────────────────────────────────────────────────────
@@ -74,7 +78,14 @@ def _ensure_tokens_dir():
 
 def _build_service(creds):
     from googleapiclient.discovery import build
-    return build("youtube", "v3", credentials=creds)
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=YOUTUBE_HTTP_TIMEOUT_SECONDS))
+        return build("youtube", "v3", http=http)
+    except Exception:
+        return build("youtube", "v3", credentials=creds)
 
 
 def _validate_account_id(account_id: str) -> str:
@@ -418,9 +429,16 @@ def upload_to_youtube(
     request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
+    started = time.monotonic()
+    chunks = 0
     while response is None:
         if cancel_check and cancel_check():
             raise RuntimeError("Upload cancelled")
+        if time.monotonic() - started > YOUTUBE_UPLOAD_TIMEOUT_SECONDS:
+            raise TimeoutError("YouTube upload timed out")
+        if chunks >= YOUTUBE_UPLOAD_MAX_CHUNKS:
+            raise TimeoutError("YouTube upload exceeded the maximum chunk count")
+        chunks += 1
         status, response = request.next_chunk()
         if response is not None:
             break

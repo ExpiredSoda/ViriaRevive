@@ -33,6 +33,8 @@ installer/Output/
 downloads/
 clips/
 subtitles/
+analysis_cache/
+carryover_backups/
 music/
 bin/*.dll
 bin/*.exe
@@ -52,6 +54,12 @@ personalization.json
 personalization.*.bak
 personalization.json.*.tmp
 personalization_export*.json
+voice_profile.json
+voice_profile.*.bak
+voice_profile.json.*.tmp
+processing_history.json
+processing_history.*.bak
+processing_history.json.*.tmp
 *_candidate_debug.json
 *_run_debug.json
 

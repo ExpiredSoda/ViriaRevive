@@ -11,11 +11,15 @@ Body-aware cropping: the crop is positioned so the person's head is at ~30%
 from the top ("rule of thirds"), keeping their full body visible.
 """
 
+import hashlib
+import os
+import re
 import subprocess
-import threading
+import time
 import numpy as np
 from pathlib import Path
 
+from config import ANALYSIS_CACHE_DIR, CROP_DEBUG_FRAMES
 from subprocess_utils import run as _run, is_cancelled, CancelledError
 
 
@@ -360,21 +364,34 @@ def _detect_faces_haar(frame, cascades, scale=0.5):
 # ── Main detection pipeline ──────────────────────────────────────────────────
 
 
-def _read_frame_safe(cap, timeout=5.0):
-    """Read a frame from VideoCapture with a timeout to avoid hangs on corrupt video."""
-    result = [False, None]
-
-    def _read():
-        result[0], result[1] = cap.read()
-
-    t = threading.Thread(target=_read, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        # Frame read hung — return failure (thread will die with daemon=True)
-        print("[!] cv2.VideoCapture.read() timed out — skipping frame")
+def _read_frame_at(cv2, video_path: Path, seconds: float, timeout=5.0):
+    """Read one frame via killable ffmpeg subprocess instead of OpenCV decode."""
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-ss", f"{max(0.0, float(seconds or 0.0)):.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-f", "image2pipe",
+        "-vcodec", "png",
+        "-",
+    ]
+    try:
+        result = _run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _read_frame_at.last_status = "timeout"
+        print("[!] ffmpeg frame extraction timed out — skipping frame")
         return False, None
-    return result[0], result[1]
+    except Exception:
+        _read_frame_at.last_status = "error"
+        return False, None
+    if result.returncode != 0 or not result.stdout:
+        _read_frame_at.last_status = "error"
+        return False, None
+    frame = cv2.imdecode(np.frombuffer(result.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+    _read_frame_at.last_status = "ok" if frame is not None else "error"
+    return frame is not None, frame
 
 
 def _detect_all_persons(video_path, start, end, width, height, sample_count):
@@ -394,7 +411,7 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
         import cv2
     except ImportError:
         print("[!] opencv not installed -> center crop")
-        return []
+        return [], 1.0, 1.0
 
     # Try YOLO first (much more reliable)
     yolo = _get_yolo_model()
@@ -410,12 +427,8 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
         else:
             cascades = _load_cascades(cv2)
             if not cascades:
-                return []
+                return [], 1.0, 1.0
             print("[i] Using Haar cascade face detector (fallback)")
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return []
 
     duration = max(1, end - start)
     # Dense sampling — at least 4 samples per second for smooth tracking
@@ -433,8 +446,10 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
 
     # ── Detect dimension mismatch (rotation / codec quirks) ───────────
     # Read one frame to get actual OpenCV dimensions
-    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
-    ok, test_frame = _read_frame_safe(cap, timeout=10.0)
+    ok, test_frame = _read_frame_at(cv2, video_path, start, timeout=10.0)
+    if not ok and getattr(_read_frame_at, "last_status", "") == "timeout":
+        print("[!] Crop tracking timed out while reading first frame -> center crop")
+        return [], 1.0, 1.0
     scale_x, scale_y = 1.0, 1.0
     if ok and test_frame is not None:
         cv_h, cv_w = test_frame.shape[:2]
@@ -456,13 +471,13 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
     for t in sample_times:
         # ── Check cancellation every frame ──
         if is_cancelled():
-            cap.release()
             raise CancelledError("Person detection cancelled")
 
-        cap.set(cv2.CAP_PROP_POS_MSEC, (start + t) * 1000)
-
         # Timeout-safe frame read — OpenCV can hang on corrupt frames
-        ok, frame = _read_frame_safe(cap, timeout=5.0)
+        ok, frame = _read_frame_at(cv2, video_path, start + t, timeout=5.0)
+        if not ok and getattr(_read_frame_at, "last_status", "") == "timeout":
+            print("[!] Crop tracking frame read timed out -> using detections so far")
+            break
         if not ok or frame is None:
             continue
 
@@ -514,8 +529,8 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
             detected_frames += 1
             last_good_persons = persons  # remember for gap-filling
 
-            # Save debug frame on first detection (to verify crop visually)
-            if not debug_saved and use_yolo:
+            # Save debug frame on first detection only when explicitly enabled.
+            if not debug_saved and use_yolo and _crop_debug_enabled():
                 _save_debug_frame(frame, persons, width, height, scale_x, scale_y,
                                   video_path)
                 debug_saved = True
@@ -524,8 +539,6 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
             # Carry forward the LAST known position so the crop holds steady
             # instead of having a gap that could cause a jump to center.
             detections.append((t, last_good_persons))
-
-    cap.release()
 
     total_persons = sum(len(p) for _, p in detections)
     method = "YOLO" if use_yolo else "face detection"
@@ -585,10 +598,6 @@ def _refine_transitions(detections, video_path, start, width, height,
         return detections
 
     import cv2
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return detections
-
     insertions = []  # (insert_after_index, [(t, persons), ...])
 
     for orig_idx, t_lo, t_hi, old_person_x in transitions:
@@ -600,12 +609,13 @@ def _refine_transitions(detections, video_path, start, width, height,
                 break
 
             if is_cancelled():
-                cap.release()
                 raise CancelledError("Person detection cancelled")
 
             t_mid = (lo + hi) / 2.0
-            cap.set(cv2.CAP_PROP_POS_MSEC, (start + t_mid) * 1000)
-            ok, frame = _read_frame_safe(cap, timeout=5.0)
+            ok, frame = _read_frame_at(cv2, video_path, start + t_mid, timeout=5.0)
+            if not ok and getattr(_read_frame_at, "last_status", "") == "timeout":
+                print("[!] Transition refinement frame read timed out -> skipping refinement")
+                return detections
             if not ok or frame is None:
                 break
 
@@ -637,8 +647,6 @@ def _refine_transitions(detections, video_path, start, width, height,
 
         if refined:
             insertions.append((orig_idx, refined))
-
-    cap.release()
 
     if not insertions:
         return detections
@@ -882,9 +890,10 @@ def _save_debug_frame(frame, persons, ffprobe_w, ffprobe_h, scale_x, scale_y,
                       video_path):
     """Save an annotated debug frame showing YOLO detections + crop region.
 
-    Writes to <video_dir>/crop_debug.jpg so you can visually verify
-    what YOLO detected and where the crop would land.
+    Writes to the app analysis cache only when crop debug frames are enabled.
     """
+    if not _crop_debug_enabled():
+        return None
     try:
         import cv2
         debug = frame.copy()
@@ -947,12 +956,30 @@ def _save_debug_frame(frame, persons, ffprobe_w, ffprobe_h, scale_x, scale_y,
             cv2.putText(debug, f"RESCALE: {scale_x:.2f}x{scale_y:.2f}", (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # Save
-        debug_path = Path(video_path).parent / "crop_debug.jpg"
+        debug_path = _crop_debug_path(video_path)
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(debug_path), debug)
         print(f"[i] Debug frame saved: {debug_path}")
+        return debug_path
     except Exception as e:
         print(f"[!] Debug frame save failed: {e}")
+        return None
+
+
+def _crop_debug_enabled() -> bool:
+    if CROP_DEBUG_FRAMES:
+        return True
+    text = os.environ.get("VIRIA_CROP_DEBUG_FRAMES", "").strip().lower()
+    return text in {"1", "true", "yes", "on", "enabled"}
+
+
+def _crop_debug_path(video_path) -> Path:
+    raw_stem = Path(video_path).stem or "video"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_stem).strip("._") or "video"
+    safe_stem = safe_stem[:48]
+    digest = hashlib.sha1(str(video_path).encode("utf-8", "ignore")).hexdigest()[:8]
+    stamp = int(time.time() * 1000)
+    return ANALYSIS_CACHE_DIR / "crop_debug" / f"{safe_stem}_{digest}_{stamp}.jpg"
 
 
 def _frange(start, stop, step):

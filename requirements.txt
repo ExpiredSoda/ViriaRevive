@@ -1,6 +1,7 @@
 yt-dlp==2026.6.9
 pydub==0.25.1
 numpy==2.4.6
+scenedetect-headless==0.7.0
 faster-whisper==1.2.1
 google-api-python-client==2.197.0
 google-auth-oauthlib==1.4.0

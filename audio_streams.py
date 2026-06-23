@@ -8,6 +8,9 @@ while still mixing all source audio into detection and rendered clips.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,12 +18,30 @@ from subprocess_utils import run as _run
 
 
 VOICE_KEYWORDS = ("microphone", "mic", "voice", "commentary", "narration")
+_LAST_AUDIO_STREAM_DIAGNOSTICS: dict = {}
 
 
 @lru_cache(maxsize=64)
 def get_audio_streams(video_path: str | Path) -> tuple[dict, ...]:
     """Return audio streams with both ffmpeg ordinal and file stream index."""
+    global _LAST_AUDIO_STREAM_DIAGNOSTICS
     path = str(Path(video_path))
+    started = time.monotonic()
+    diagnostics = {
+        "status": "unknown",
+        "path": path,
+        "elapsed_seconds": 0.0,
+        "timeout_seconds": 10,
+        "returncode": None,
+        "stream_count": 0,
+        "stderr_tail": "",
+    }
+    if not shutil.which("ffprobe"):
+        diagnostics["status"] = "ffprobe_missing"
+        _LAST_AUDIO_STREAM_DIAGNOSTICS = diagnostics
+        print("[audio] Could not inspect audio streams: ffprobe not found")
+        return ()
+
     try:
         r = _run(
             [
@@ -33,8 +54,26 @@ def get_audio_streams(video_path: str | Path) -> tuple[dict, ...]:
             ],
             capture_output=True, text=True, timeout=10, errors="replace",
         )
+        diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        diagnostics["returncode"] = r.returncode
+        diagnostics["stderr_tail"] = _tail(r.stderr or "")
+        if r.returncode != 0:
+            diagnostics["status"] = "ffprobe_error"
+            _LAST_AUDIO_STREAM_DIAGNOSTICS = diagnostics
+            print(f"[audio] Could not inspect audio streams: ffprobe exited {r.returncode}")
+            return ()
         data = json.loads(r.stdout or "{}")
+    except subprocess.TimeoutExpired:
+        diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        diagnostics["status"] = "timeout"
+        _LAST_AUDIO_STREAM_DIAGNOSTICS = diagnostics
+        print("[audio] Audio stream inspection timed out")
+        return ()
     except Exception as e:
+        diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        diagnostics["status"] = "ffprobe_error"
+        diagnostics["stderr_tail"] = str(e)[-1200:]
+        _LAST_AUDIO_STREAM_DIAGNOSTICS = diagnostics
         print(f"[audio] Could not inspect audio streams: {e}")
         return ()
 
@@ -50,7 +89,19 @@ def get_audio_streams(video_path: str | Path) -> tuple[dict, ...]:
             "title": tags.get("title", ""),
             "language": tags.get("language", ""),
         })
+    diagnostics["stream_count"] = len(streams)
+    diagnostics["status"] = "ok" if streams else "no_audio"
+    _LAST_AUDIO_STREAM_DIAGNOSTICS = diagnostics
     return tuple(streams)
+
+
+def get_last_audio_stream_diagnostics() -> dict:
+    """Return diagnostics from the most recent audio stream probe."""
+    return dict(_LAST_AUDIO_STREAM_DIAGNOSTICS)
+
+
+def _tail(text: str, limit: int = 1200) -> str:
+    return text[-limit:] if len(text) > limit else text
 
 
 def pick_voice_stream_ordinal(video_path: str | Path) -> int | None:

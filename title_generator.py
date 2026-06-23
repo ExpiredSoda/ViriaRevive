@@ -20,6 +20,39 @@ YOUTUBE_TAG_LIMIT = 500
 YOUTUBE_TAG_TARGET = YOUTUBE_TAG_LIMIT - 100
 DEFAULT_VIDEO_CATEGORY_ID = "20"  # Gaming
 TITLE_CONTEXT_SCHEMA_VERSION = 1
+AI_MOMENT_CLASSIFICATION_SCHEMA_VERSION = 2
+AI_CLASSIFICATION_TIMEOUT = 12
+
+AI_MOMENT_CATEGORIES = (
+    "high_energy",
+    "death_or_failure",
+    "tutorial_or_explainer",
+    "commentary_or_review",
+    "lore_or_story",
+    "atmosphere_or_visual",
+    "low_value",
+)
+
+AI_FINE_LABELS = (
+    "chase_panic",
+    "combat_action",
+    "funny_failure",
+    "death_scene",
+    "tutorial_tip",
+    "lore_story",
+    "scenic_atmosphere",
+    "creator_reaction",
+    "game_narration",
+    "navigation_setup",
+)
+
+AI_VIRAL_DIMENSIONS = (
+    "hook",
+    "flow",
+    "value",
+    "platform_fit",
+    "game_context",
+)
 
 
 MOMENT_SIGNAL_RULES = (
@@ -327,16 +360,34 @@ def summarize_clip_context(
         if isinstance(clip_context.get("detector_scores"), dict)
         else {}
     )
+    moment_categories = (
+        clip_context.get("moment_categories")
+        if isinstance(clip_context.get("moment_categories"), dict)
+        else {}
+    )
+    visual = (
+        clip_context.get("visual_diagnostics")
+        if isinstance(clip_context.get("visual_diagnostics"), dict)
+        else {}
+    )
+    ai_classification = (
+        clip_context.get("ai_moment_classification")
+        if isinstance(clip_context.get("ai_moment_classification"), dict)
+        else {}
+    )
     text = transcript or clip_context.get("transcript") or ""
     normal = _normal_text(text)
     matched = _matching_signal_phrases(normal)
-    moment_type = _infer_moment_type(normal, ranker, matched)
+    moment_type = _infer_moment_type(normal, ranker, matched, clip_context)
 
     resolved_game = (game_title or clip_context.get("game_title") or "").strip()
     summary = {
         "schema_version": TITLE_CONTEXT_SCHEMA_VERSION,
         "game_title": resolved_game,
         "moment_type": moment_type,
+        "primary_category": clip_context.get("primary_category") or moment_categories.get("primary"),
+        "ai_primary_category": ai_classification.get("primary_category"),
+        "ai_fine_labels": ai_classification.get("fine_labels", []) if isinstance(ai_classification.get("fine_labels"), list) else [],
         "hook_phrases": matched[:6],
         "quality_score": _round_or_none(clip_context.get("quality_score")),
         "detector_score": _round_or_none(clip_context.get("detector_score")),
@@ -350,6 +401,23 @@ def summarize_clip_context(
         "learned_quality_score": _round_or_none(clip_context.get("learned_quality_score")),
         "quality_rank": clip_context.get("quality_rank"),
         "word_count": clip_context.get("word_count"),
+        "visual": {
+            "status": visual.get("status"),
+            "labels": visual.get("labels", [])[:6] if isinstance(visual.get("labels"), list) else [],
+            "visual_energy": _round_or_none(visual.get("visual_energy")),
+            "possible_failure_score": _round_or_none(visual.get("possible_failure_score")),
+            "scenic_score": _round_or_none(visual.get("scenic_score")),
+            "ui_density": _round_or_none(visual.get("ui_density")),
+        },
+        "ai_moment_classification": {
+            "status": ai_classification.get("status"),
+            "provider": ai_classification.get("provider"),
+            "primary_category": ai_classification.get("primary_category"),
+            "fine_labels": ai_classification.get("fine_labels", [])[:5]
+            if isinstance(ai_classification.get("fine_labels"), list) else [],
+            "confidence": _round_or_none(ai_classification.get("confidence")),
+            "fallback_used": bool(ai_classification.get("fallback_used")),
+        },
         "timing": {
             "start": clip_context.get("start"),
             "end": clip_context.get("end"),
@@ -399,7 +467,7 @@ def _build_ollama_prompt(
         "- Good examples: 'Alan Wake Had Me Running For My Life', "
         "'This Chase Got Way Too Close', 'This Boss Fight Got Personal'\n\n"
         f"Clip analysis from detector/ranker:\n{analysis_block}\n\n"
-        f'Transcript: "{transcript[:900]}"\n\n'
+        f'Transcript: "{_prompt_safe_text(transcript, limit=900)}"\n\n'
         "Reply with ONLY the title. Nothing else."
     )
 
@@ -442,6 +510,472 @@ def _ask_ollama(
     except Exception as e:
         print(f"[title-gen] Ollama error: {e}")
     return None
+
+
+def ask_ollama_json(
+    prompt: str,
+    model: str = DEFAULT_MODEL,
+    *,
+    timeout: int = AI_CLASSIFICATION_TIMEOUT,
+    num_predict: int = 160,
+    temperature: float = 0.2,
+) -> dict | None:
+    """Ask local Ollama for a JSON object and parse it safely."""
+    body = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": float(temperature),
+            "num_predict": int(num_predict),
+        },
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if getattr(resp, "status", 200) != 200:
+            return None
+        data = json.loads(resp.read())
+    response = str(data.get("response", "") if isinstance(data, dict) else "")
+    parsed = _extract_json_object(response)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def classify_moment_ai(
+    transcript: str | None,
+    game_title: str | None = None,
+    clip_context: dict | None = None,
+    *,
+    enabled: bool = True,
+    model: str = DEFAULT_MODEL,
+    ollama_ready: bool | None = None,
+    timeout: int = AI_CLASSIFICATION_TIMEOUT,
+) -> dict:
+    """Classify a gameplay moment using local Ollama with a deterministic fallback."""
+    clip_context = clip_context if isinstance(clip_context, dict) else {}
+    fallback = _heuristic_moment_classification(transcript, game_title, clip_context)
+    fallback["enabled"] = bool(enabled)
+    fallback["model"] = model
+
+    if not enabled:
+        fallback["status"] = "disabled"
+        fallback["fallback_used"] = True
+        return fallback
+
+    ready = is_ollama_model_ready(model) if ollama_ready is None else bool(ollama_ready)
+    if not ready:
+        fallback["status"] = "model_not_ready"
+        fallback["fallback_used"] = True
+        return fallback
+
+    prompt = _build_moment_classification_prompt(transcript, game_title, clip_context)
+    try:
+        response = ask_ollama_json(
+            prompt,
+            model=model,
+            timeout=timeout,
+            num_predict=240,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        fallback["status"] = "ollama_error"
+        fallback["fallback_used"] = True
+        fallback["error"] = str(exc)[:160]
+        return fallback
+
+    sanitized = _sanitize_ai_classification(response, fallback, model)
+    if sanitized is None:
+        fallback["status"] = "invalid_response"
+        fallback["fallback_used"] = True
+        return fallback
+    return sanitized
+
+
+def _build_moment_classification_prompt(
+    transcript: str | None,
+    game_title: str | None = None,
+    clip_context: dict | None = None,
+) -> str:
+    clip_context = clip_context if isinstance(clip_context, dict) else {}
+    context = summarize_clip_context(transcript, game_title, clip_context)
+    categories = clip_context.get("moment_categories") if isinstance(clip_context.get("moment_categories"), dict) else {}
+    category_scores = categories.get("scores") if isinstance(categories.get("scores"), dict) else {}
+    visual = context.get("visual") if isinstance(context.get("visual"), dict) else {}
+    ranker = context.get("ranker") if isinstance(context.get("ranker"), dict) else {}
+    detector = {
+        "audio": context.get("audio_score"),
+        "variance": context.get("variance_score"),
+        "scene": context.get("scene_score"),
+    }
+    payload = {
+        "game_title": context.get("game_title") or "",
+        "heuristic_primary": context.get("primary_category") or categories.get("primary") or "general_gameplay",
+        "heuristic_scores": {
+            key: _round_or_none(category_scores.get(key))
+            for key in AI_MOMENT_CATEGORIES
+            if category_scores.get(key) is not None
+        },
+        "detector_scores": detector,
+        "ranker": {
+            "hook_points": ranker.get("hook_points"),
+            "weak_points": ranker.get("weak_points"),
+            "aftermath_points": ranker.get("aftermath_points"),
+        },
+        "visual": visual,
+        "word_count": context.get("word_count"),
+        "transcript_preview": _prompt_safe_text(
+            transcript or clip_context.get("transcript") or "",
+            limit=700,
+        ),
+    }
+    allowed = ", ".join(AI_MOMENT_CATEGORIES)
+    fine = ", ".join(AI_FINE_LABELS)
+    return (
+        "You classify gameplay clips for a local Shorts clipping app.\n"
+        "Use only the compact transcript preview and numeric detector metadata below.\n"
+        "Do not invent names, locations, mechanics, enemies, or events.\n"
+        "Return exactly one JSON object with this schema:\n"
+        "{\"primary_category\":\"one allowed category\",\"fine_labels\":[\"compact_label\"],"
+        "\"confidence\":0.0,\"reason\":\"short grounded reason\","
+        "\"ai_viral_score\":0,\"ai_viral_reason\":\"short score reason\","
+        "\"ai_dimensions\":{\"hook\":0.0,\"flow\":0.0,\"value\":0.0,"
+        "\"platform_fit\":0.0,\"game_context\":0.0}}\n"
+        f"Allowed primary_category values: {allowed}\n"
+        f"Allowed fine_labels values: {fine}\n"
+        "Score 0-99 for short-form potential, grounded in hook, flow, value, platform fit, and game context.\n"
+        "If uncertain, use the heuristic primary. Avoid low_value unless the moment is truly weak, menu, navigation, or filler.\n\n"
+        f"Clip metadata JSON:\n{json.dumps(payload, ensure_ascii=True, sort_keys=True)}\n"
+    )
+
+
+def _clamp01(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:
+        return 0.0
+    return max(0.0, min(1.0, number))
+
+
+def _viral_dimensions_from_context(
+    transcript: str | None,
+    clip_context: dict | None,
+    primary: str,
+    fine_labels: list[str],
+    confidence: float | None,
+) -> tuple[dict, int, str]:
+    clip_context = clip_context if isinstance(clip_context, dict) else {}
+    context = summarize_clip_context(transcript, None, clip_context)
+    ranker = clip_context.get("ranker") if isinstance(clip_context.get("ranker"), dict) else {}
+    categories = clip_context.get("moment_categories") if isinstance(clip_context.get("moment_categories"), dict) else {}
+    scores = categories.get("scores") if isinstance(categories.get("scores"), dict) else {}
+    visual = clip_context.get("visual_diagnostics") if isinstance(clip_context.get("visual_diagnostics"), dict) else {}
+    normal = _normal_text(transcript or clip_context.get("transcript") or "")
+    word_count = _float_or_zero(clip_context.get("word_count") or context.get("word_count"))
+    hook_hits = len(_matching_signal_phrases(normal))
+    hook = _clamp01(
+        0.18
+        + 0.18 * hook_hits
+        + 0.10 * _float_or_zero(ranker.get("hook_points"))
+        + (0.18 if primary in {"high_energy", "death_or_failure"} else 0.0)
+        + (0.10 if {"chase_panic", "combat_action", "funny_failure"} & set(fine_labels) else 0.0)
+    )
+    first_word_start = _float_or_zero(ranker.get("first_word_start"))
+    late_start_penalty = 0.18 if first_word_start and first_word_start > 8.0 else 0.0
+    flow = _clamp01(
+        0.50
+        + (0.10 if 8 <= word_count <= 90 else -0.12)
+        + (0.08 if _float_or_zero(ranker.get("last_word_end")) >= 6.0 else 0.0)
+        - late_start_penalty
+        - (0.18 if primary == "low_value" else 0.0)
+    )
+    value = _clamp01(
+        0.35
+        + (0.22 if primary in {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual"} else 0.0)
+        + (0.12 if primary == "tutorial_or_explainer" else 0.0)
+        + (0.08 if primary == "lore_or_story" else 0.0)
+        + 0.12 * _float_or_zero(scores.get(primary))
+        - (0.25 if primary == "low_value" else 0.0)
+    )
+    platform_fit = _clamp01(
+        0.62
+        + (0.10 if 6 <= word_count <= 80 else -0.12)
+        - 0.22 * _float_or_zero(visual.get("black_frame_ratio"))
+        - 0.12 * _float_or_zero(visual.get("ui_density"))
+        - (0.18 if primary == "low_value" else 0.0)
+    )
+    game_context = _clamp01(
+        0.38
+        + 0.16 * _float_or_zero(context.get("audio_score"))
+        + 0.14 * _float_or_zero(context.get("variance_score"))
+        + 0.14 * _float_or_zero(visual.get("visual_energy"))
+        + 0.16 * _float_or_zero(visual.get("possible_failure_score"))
+        + 0.12 * _float_or_zero(visual.get("scenic_score"))
+        + (0.08 if primary in {"high_energy", "death_or_failure", "atmosphere_or_visual"} else 0.0)
+    )
+    dimensions = {
+        "hook": round(hook, 4),
+        "flow": round(flow, 4),
+        "value": round(value, 4),
+        "platform_fit": round(platform_fit, 4),
+        "game_context": round(game_context, 4),
+    }
+    score = round(
+        99
+        * (
+            0.25 * hook
+            + 0.20 * flow
+            + 0.24 * value
+            + 0.16 * platform_fit
+            + 0.15 * game_context
+        )
+        * (0.82 + 0.18 * _clamp01(confidence if confidence is not None else 0.45))
+    )
+    score = int(max(0, min(99, score)))
+    strongest = max(dimensions.items(), key=lambda item: item[1])[0].replace("_", " ")
+    reason = f"Diagnostic score led by {strongest}; category={primary or 'unknown'}."
+    return dimensions, score, reason
+
+
+def _sanitize_ai_dimensions(dimensions, fallback: dict) -> dict:
+    fallback = fallback if isinstance(fallback, dict) else {}
+    source = dimensions if isinstance(dimensions, dict) else {}
+    cleaned = {}
+    for key in AI_VIRAL_DIMENSIONS:
+        raw = source.get(key, fallback.get(key, 0.0))
+        cleaned[key] = round(_clamp01(raw), 4)
+    return cleaned
+
+
+def _sanitize_ai_viral_fields(response: dict, fallback: dict) -> dict:
+    response = response if isinstance(response, dict) else {}
+    fallback = fallback if isinstance(fallback, dict) else {}
+    fallback_dimensions = fallback.get("ai_dimensions") if isinstance(fallback.get("ai_dimensions"), dict) else {}
+    dimensions = _sanitize_ai_dimensions(response.get("ai_dimensions"), fallback_dimensions)
+    score = _round_or_none(response.get("ai_viral_score"))
+    if score is None:
+        score = _round_or_none(fallback.get("ai_viral_score"))
+    if score is None:
+        score = 0
+    score = int(max(0, min(99, round(float(score)))))
+    reason = re.sub(
+        r"\s+",
+        " ",
+        str(response.get("ai_viral_reason") or fallback.get("ai_viral_reason") or fallback.get("reason") or ""),
+    ).strip()
+    if len(reason) > 180:
+        reason = reason[:177].rstrip() + "..."
+    confidence = _round_or_none(response.get("ai_confidence"))
+    if confidence is None:
+        confidence = _round_or_none(response.get("confidence"))
+    if confidence is None:
+        confidence = _round_or_none(fallback.get("ai_confidence"))
+    return {
+        "ai_viral_score": score,
+        "ai_viral_reason": reason,
+        "ai_dimensions": dimensions,
+        "ai_confidence": round(_clamp01(confidence if confidence is not None else 0.0), 4),
+        "ai_adjustment": 0.0,
+        "ai_rank_delta": None,
+        "ai_scoring_eligible": False,
+    }
+
+
+def _heuristic_moment_classification(
+    transcript: str | None,
+    game_title: str | None,
+    clip_context: dict | None,
+) -> dict:
+    clip_context = clip_context if isinstance(clip_context, dict) else {}
+    context = summarize_clip_context(transcript, game_title, clip_context)
+    categories = clip_context.get("moment_categories") if isinstance(clip_context.get("moment_categories"), dict) else {}
+    visual = clip_context.get("visual_diagnostics") if isinstance(clip_context.get("visual_diagnostics"), dict) else {}
+    primary = str(clip_context.get("primary_category") or categories.get("primary") or "").strip()
+    confidence = _round_or_none(categories.get("confidence"))
+    moment_type = context.get("moment_type") or "general gameplay"
+    fine_labels = []
+    if visual.get("possible_failure_score", 0) and _float_or_zero(visual.get("possible_failure_score")) >= 0.45:
+        primary = "death_or_failure"
+        fine_labels.append("death_scene")
+        confidence = max(confidence or 0.0, 0.62)
+    if visual.get("scenic_score", 0) and _float_or_zero(visual.get("scenic_score")) >= 0.55 and primary not in {"death_or_failure", "high_energy"}:
+        primary = "atmosphere_or_visual"
+        fine_labels.append("scenic_atmosphere")
+        confidence = max(confidence or 0.0, 0.58)
+    if not primary or primary not in AI_MOMENT_CATEGORIES:
+        if moment_type == "chase/panic":
+            primary = "high_energy"
+        elif moment_type == "combat/fight":
+            primary = "high_energy"
+        elif moment_type == "funny failure":
+            primary = "death_or_failure"
+        elif moment_type == "exploration/setup":
+            primary = "low_value"
+        else:
+            primary = "low_value" if not str(transcript or "").strip() else "commentary_or_review"
+    if moment_type == "chase/panic":
+        fine_labels.append("chase_panic")
+    elif moment_type == "combat/fight":
+        fine_labels.append("combat_action")
+    elif moment_type == "funny failure":
+        fine_labels.append("funny_failure")
+    elif primary == "tutorial_or_explainer":
+        fine_labels.append("tutorial_tip")
+    elif primary == "lore_or_story":
+        fine_labels.append("lore_story")
+    elif primary == "commentary_or_review":
+        fine_labels.append("creator_reaction")
+    fine_labels = _sanitize_fine_labels(fine_labels)
+    confidence_value = round(max(0.0, min(1.0, confidence if confidence is not None else 0.45)), 4)
+    dimensions, viral_score, viral_reason = _viral_dimensions_from_context(
+        transcript,
+        clip_context,
+        primary,
+        fine_labels,
+        confidence_value,
+    )
+    return {
+        "schema_version": AI_MOMENT_CLASSIFICATION_SCHEMA_VERSION,
+        "enabled": True,
+        "status": "heuristic",
+        "provider": "heuristic",
+        "model": "",
+        "primary_category": primary,
+        "fine_labels": fine_labels,
+        "confidence": confidence_value,
+        "reason": _classification_reason(primary, fine_labels, visual),
+        "fallback_used": True,
+        "ai_viral_score": viral_score,
+        "ai_viral_reason": viral_reason,
+        "ai_dimensions": dimensions,
+        "ai_confidence": confidence_value,
+        "ai_adjustment": 0.0,
+        "ai_rank_delta": None,
+        "ai_scoring_eligible": False,
+        "selection_impact": "none",
+        "output_changed": False,
+    }
+
+
+def _sanitize_ai_classification(response, fallback: dict, model: str) -> dict | None:
+    if not isinstance(response, dict):
+        return None
+    primary = str(
+        response.get("primary_category")
+        or response.get("primary")
+        or response.get("category")
+        or ""
+    ).strip().lower()
+    primary = primary.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "tutorial_explainer": "tutorial_or_explainer",
+        "commentary_review": "commentary_or_review",
+        "lore_story": "lore_or_story",
+        "atmosphere_scenic": "atmosphere_or_visual",
+        "death_failure": "death_or_failure",
+        "funny_failure": "death_or_failure",
+        "general_gameplay": fallback.get("primary_category", "low_value"),
+    }
+    primary = aliases.get(primary, primary)
+    if primary not in AI_MOMENT_CATEGORIES:
+        return None
+    confidence = _round_or_none(response.get("confidence"))
+    if confidence is None:
+        confidence = fallback.get("confidence", 0.45)
+    confidence = max(0.0, min(1.0, float(confidence)))
+    fine_labels = response.get("fine_labels")
+    if not isinstance(fine_labels, list):
+        fine_labels = [response.get("fine_label")] if response.get("fine_label") else []
+    fine_labels = _sanitize_fine_labels(fine_labels)
+    reason = re.sub(r"\s+", " ", str(response.get("reason") or "")).strip()
+    if len(reason) > 180:
+        reason = reason[:177].rstrip() + "..."
+    viral_fields = _sanitize_ai_viral_fields(response, fallback)
+    return {
+        "schema_version": AI_MOMENT_CLASSIFICATION_SCHEMA_VERSION,
+        "enabled": True,
+        "status": "ok",
+        "provider": "ollama",
+        "model": model,
+        "primary_category": primary,
+        "fine_labels": fine_labels,
+        "confidence": round(confidence, 4),
+        "reason": reason or _classification_reason(primary, fine_labels, {}),
+        "fallback_used": False,
+        "fallback_primary_category": fallback.get("primary_category"),
+        **viral_fields,
+        "selection_impact": "none",
+        "output_changed": False,
+    }
+
+
+def _sanitize_fine_labels(labels) -> list[str]:
+    cleaned = []
+    seen = set()
+    for label in labels or []:
+        value = str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if value not in AI_FINE_LABELS or value in seen:
+            continue
+        cleaned.append(value)
+        seen.add(value)
+        if len(cleaned) >= 5:
+            break
+    return cleaned
+
+
+def _extract_json_object(text: str):
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start:end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _classification_reason(primary: str, fine_labels: list[str], visual: dict) -> str:
+    if primary == "death_or_failure":
+        return "Failure/death cues from transcript, ranker, or visual diagnostics."
+    if primary == "high_energy":
+        return "High-energy action, panic, combat, or strong hook cues."
+    if primary == "tutorial_or_explainer":
+        return "Instructional or explanation-style language."
+    if primary == "lore_or_story":
+        return "Story, lore, or narrative-context language."
+    if primary == "atmosphere_or_visual":
+        return "Atmospheric or scenic visual/context cues."
+    if primary == "commentary_or_review":
+        return "Creator commentary or opinion-focused moment."
+    if primary == "low_value":
+        return "Weak, filler, navigation, menu, or low-payoff moment."
+    return "Compact deterministic fallback classification."
+
+
+def _prompt_safe_text(text: str | None, *, limit: int = 900) -> str:
+    """Keep local LLM prompts grounded without leaking obvious local secrets."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    value = re.sub(
+        r"(?i)\b(refresh_token|access_token|client_secret|api[_-]?key|gemini_api_key)\s*[:=]\s*[\w.\-~+/=]+",
+        r"\1=[redacted]",
+        value,
+    )
+    value = re.sub(r"\b[A-Za-z]:\\[^\s\"']+", "[local-path]", value)
+    value = re.sub(r"/(?:Users|home|mnt|media|Volumes)/[^\s\"']+", "[local-path]", value)
+    return value[: max(0, int(limit))]
 
 
 def _heuristic_title(
@@ -615,9 +1149,24 @@ def generate_titles_batch(
 def _analysis_prompt_lines(context: dict) -> list[str]:
     ranker = context.get("ranker") or {}
     timing = context.get("timing") or {}
+    visual = context.get("visual") if isinstance(context.get("visual"), dict) else {}
+    ai_classification = (
+        context.get("ai_moment_classification")
+        if isinstance(context.get("ai_moment_classification"), dict)
+        else {}
+    )
     lines = [
         f"- Moment type: {context.get('moment_type') or 'general gameplay'}",
     ]
+    category_parts = []
+    if context.get("primary_category"):
+        category_parts.append(f"heuristic={context['primary_category']}")
+    if context.get("ai_primary_category"):
+        category_parts.append(f"ai={context['ai_primary_category']}")
+    if category_parts:
+        lines.append(f"- Moment category labels: {', '.join(category_parts)}")
+    if context.get("ai_fine_labels"):
+        lines.append(f"- AI fine labels: {', '.join(context['ai_fine_labels'][:5])}")
     if context.get("hook_phrases"):
         lines.append(f"- Spoken hooks/payoffs: {', '.join(context['hook_phrases'][:5])}")
     score_parts = []
@@ -654,6 +1203,23 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         ranker_parts.append(f"reject_reason={ranker['reject_reason']}")
     if ranker_parts:
         lines.append(f"- Ranker signals: {', '.join(ranker_parts)}")
+    visual_parts = []
+    if visual.get("labels"):
+        visual_parts.append(f"labels={', '.join(visual['labels'][:5])}")
+    for key in ("visual_energy", "possible_failure_score", "scenic_score", "ui_density"):
+        if visual.get(key) is not None:
+            visual_parts.append(f"{key}={visual[key]}")
+    if visual_parts:
+        lines.append(f"- Visual diagnostics: {', '.join(visual_parts)}")
+    if ai_classification.get("status"):
+        ai_parts = [
+            f"status={ai_classification.get('status')}",
+            f"provider={ai_classification.get('provider')}",
+            f"primary={ai_classification.get('primary_category')}",
+        ]
+        if ai_classification.get("confidence") is not None:
+            ai_parts.append(f"confidence={ai_classification.get('confidence')}")
+        lines.append(f"- AI moment label: {', '.join(part for part in ai_parts if part)}")
     time_parts = []
     for key in ("start", "end", "duration", "peak_time"):
         if timing.get(key) is not None:
@@ -689,14 +1255,42 @@ def _context_sentence(context: dict, game_title: str | None) -> str:
         return f"A tense {game} chase/panic moment pulled from the strongest spoken hook."
     if moment_type == "combat/fight":
         return f"An intense {game} fight moment picked from the clip's strongest action beat."
+    if moment_type == "high-energy gameplay":
+        return f"A high-energy {game} moment selected from action, panic, or reaction cues."
+    if moment_type == "death/failure":
+        return f"A {game} failure or danger moment selected from the strongest payoff."
     if moment_type == "funny failure":
         return f"A funny {game} failure moment selected from the clip's clearest payoff."
     if moment_type == "exploration/setup":
         return f"A {game} gameplay moment selected from the clearest spoken setup."
+    if moment_type == "tutorial/explainer":
+        return f"A helpful {game} explanation or tutorial-style moment."
+    if moment_type == "commentary/review":
+        return f"A {game} commentary moment focused on creator reaction or opinion."
+    if moment_type == "lore/story":
+        return f"A {game} story or lore moment with narrative context."
+    if moment_type == "atmosphere/visual":
+        return f"An atmospheric {game} moment selected for visual or mood cues."
     return ""
 
 
-def _infer_moment_type(normal: str, ranker: dict, matched_phrases: list[str]) -> str:
+def _infer_moment_type(
+    normal: str,
+    ranker: dict,
+    matched_phrases: list[str],
+    clip_context: dict | None = None,
+) -> str:
+    clip_context = clip_context if isinstance(clip_context, dict) else {}
+    categories = (
+        clip_context.get("moment_categories")
+        if isinstance(clip_context.get("moment_categories"), dict)
+        else {}
+    )
+    ai_classification = (
+        clip_context.get("ai_moment_classification")
+        if isinstance(clip_context.get("ai_moment_classification"), dict)
+        else {}
+    )
     phrase_set = set(matched_phrases)
     hook_points = _float_or_zero(ranker.get("hook_points"))
     weak_points = _float_or_zero(ranker.get("weak_points"))
@@ -704,6 +1298,15 @@ def _infer_moment_type(normal: str, ranker: dict, matched_phrases: list[str]) ->
     for rule in MOMENT_SIGNAL_RULES:
         if any(phrase in phrase_set for phrase in rule["phrases"]):
             return rule["type"]
+    ai_primary = str(ai_classification.get("primary_category") or "").strip()
+    if ai_primary and _float_or_zero(ai_classification.get("confidence")) >= 0.55:
+        mapped = _moment_type_from_category(ai_primary)
+        if mapped != "general gameplay":
+            return mapped
+    primary = str(clip_context.get("primary_category") or categories.get("primary") or "").strip()
+    mapped = _moment_type_from_category(primary)
+    if mapped != "general gameplay":
+        return mapped
     if hook_points >= 4 and any(word in normal for word in ("run", "behind", "hide", "scary", "please")):
         return "chase/panic"
     if any(word in normal for word in ("boss", "fight", "kill", "hit", "shoot")):
@@ -713,6 +1316,18 @@ def _infer_moment_type(normal: str, ranker: dict, matched_phrases: list[str]) ->
     if weak_points >= 2:
         return "exploration/setup"
     return "general gameplay"
+
+
+def _moment_type_from_category(category: str) -> str:
+    return {
+        "high_energy": "high-energy gameplay",
+        "death_or_failure": "death/failure",
+        "tutorial_or_explainer": "tutorial/explainer",
+        "commentary_or_review": "commentary/review",
+        "lore_or_story": "lore/story",
+        "atmosphere_or_visual": "atmosphere/visual",
+        "low_value": "exploration/setup",
+    }.get(str(category or "").strip(), "general gameplay")
 
 
 def _matching_signal_phrases(normal: str) -> list[str]:

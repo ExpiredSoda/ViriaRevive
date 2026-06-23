@@ -2,10 +2,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from audio_streams import audio_output_args, get_audio_streams, pick_voice_stream_ordinal
+from config import FFMPEG_VERBOSE_COMMANDS
 from subprocess_utils import run as _run
 
 
@@ -14,6 +16,86 @@ class ClipResult:
     path: Path | None
     subtitles_burned: bool = True
     warning: str | None = None
+
+
+def _verbose_ffmpeg_commands() -> bool:
+    if FFMPEG_VERBOSE_COMMANDS:
+        return True
+    text = os.environ.get("VIRIA_FFMPEG_VERBOSE_COMMANDS", "").strip().lower()
+    return text in {"1", "true", "yes", "on", "enabled"}
+
+
+def _log_ffmpeg_command(label: str, cmd: list[str]):
+    if _verbose_ffmpeg_commands():
+        print(f"    {label}: {' '.join(cmd)}")
+    else:
+        print(f"    {label}")
+
+
+def _ffmpeg_timeout_seconds(
+    duration: float | int | None,
+    *,
+    minimum: int = 120,
+    multiplier: float = 12.0,
+    maximum: int = 1800,
+) -> int:
+    seconds = max(0.0, float(duration or 0.0))
+    return int(min(maximum, max(minimum, seconds * multiplier)))
+
+
+def _run_ffmpeg(
+    cmd: list[str],
+    *,
+    duration: float | int | None = None,
+    phase: str = "ffmpeg",
+    timeout: int | None = None,
+    minimum: int = 120,
+    multiplier: float = 12.0,
+    maximum: int = 1800,
+    **kwargs,
+):
+    timeout = timeout or _ffmpeg_timeout_seconds(
+        duration,
+        minimum=minimum,
+        multiplier=multiplier,
+        maximum=maximum,
+    )
+    try:
+        return _run(cmd, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        timeout_msg = f"{phase} timed out after {timeout}s"
+        print(f"[!] {timeout_msg}")
+        text_mode = bool(
+            kwargs.get("text")
+            or kwargs.get("universal_newlines")
+            or kwargs.get("encoding")
+            or kwargs.get("errors")
+        )
+        stdout = getattr(exc, "stdout", None)
+        if stdout is None:
+            stdout = getattr(exc, "output", None)
+        stderr = getattr(exc, "stderr", None)
+        if text_mode:
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            stdout = stdout if stdout is not None else ""
+            stderr = f"{stderr}\n{timeout_msg}" if stderr else timeout_msg
+        else:
+            if isinstance(stdout, str):
+                stdout = stdout.encode()
+            if isinstance(stderr, str):
+                stderr = stderr.encode()
+            stdout = stdout if stdout is not None else b""
+            timeout_bytes = timeout_msg.encode()
+            stderr = stderr + b"\n" + timeout_bytes if stderr else timeout_bytes
+        return subprocess.CompletedProcess(
+            cmd,
+            124,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 # ── Subtitle filter detection (cached) ────────────────────────────────────────
@@ -128,8 +210,16 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         *audio_args,
         str(output_path),
     ]
-    print(f"    Subs attempt 1 (cwd): {' '.join(cmd)}")
-    r = _run(cmd, capture_output=True, text=True, errors="replace", cwd=str(sub_dir))
+    _log_ffmpeg_command("Subs attempt 1 (cwd)", cmd)
+    r = _run_ffmpeg(
+        cmd,
+        phase="Subtitle burn",
+        timeout=420,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        cwd=str(sub_dir),
+    )
     if r.returncode == 0:
         if r.stderr:
             # Log stderr to catch font warnings
@@ -153,8 +243,15 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         *audio_args,
         str(output_path),
     ]
-    print(f"    Subs attempt 2 (escaped path): {' '.join(cmd2)}")
-    r2 = _run(cmd2, capture_output=True, text=True, errors="replace")
+    _log_ffmpeg_command("Subs attempt 2 (escaped path)", cmd2)
+    r2 = _run_ffmpeg(
+        cmd2,
+        phase="Subtitle burn",
+        timeout=420,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     if r2.returncode == 0:
         if r2.stderr:
             stderr_lines = [l for l in r2.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
@@ -179,8 +276,16 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
                 *audio_args,
                 str(output_path),
             ]
-            print(f"    Subs attempt 3 ({other} filter): {' '.join(cmd3)}")
-            r3 = _run(cmd3, capture_output=True, text=True, errors="replace", cwd=str(sub_dir))
+            _log_ffmpeg_command(f"Subs attempt 3 ({other} filter)", cmd3)
+            r3 = _run_ffmpeg(
+                cmd3,
+                phase="Subtitle burn",
+                timeout=420,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                cwd=str(sub_dir),
+            )
             if r3.returncode == 0:
                 if r3.stderr:
                     stderr_lines = [l for l in r3.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
@@ -333,8 +438,17 @@ def extract_clip(
             *audio_output_args(video_path, bitrate="192k"),
             str(temp_cropped),
         ]
-        print(f"    Pass 1 (crop): {' '.join(cmd1)}")
-        r1 = _run(cmd1, capture_output=True, text=True, errors="replace")
+        _log_ffmpeg_command("Pass 1 (crop)", cmd1)
+        r1 = _run_ffmpeg(
+            cmd1,
+            duration=duration,
+            phase="Crop render",
+            minimum=180,
+            multiplier=18,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
 
         if r1.returncode != 0:
             print(f"[!] Pass 1 crop failed:\n{r1.stderr[-500:]}")
@@ -371,8 +485,17 @@ def extract_clip(
             *audio_output_args(video_path, bitrate="128k"),
             str(output_path),
         ]
-        print(f"    cmd (crop): {' '.join(cmd)}")
-        r = _run(cmd, capture_output=True, text=True, errors="replace")
+        _log_ffmpeg_command("Crop render", cmd)
+        r = _run_ffmpeg(
+            cmd,
+            duration=duration,
+            phase="Crop render",
+            minimum=180,
+            multiplier=18,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
         if r.returncode != 0:
             print(f"[!] Crop failed:\n{r.stderr[-400:]}")
             result = _fallback_stream_copy(video_path, start, duration, output_path)
@@ -390,7 +513,16 @@ def extract_clip(
             *audio_output_args(video_path, bitrate="128k"),
             str(temp_input),
         ]
-        r_ext = _run(cmd_extract, capture_output=True, text=True, errors="replace")
+        r_ext = _run_ffmpeg(
+            cmd_extract,
+            duration=duration,
+            phase="Clip extraction",
+            minimum=180,
+            multiplier=18,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
         if r_ext.returncode != 0:
             _cleanup(temp_input)
             _cleanup(temp_sub)
@@ -423,7 +555,17 @@ def extract_clip(
             "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
             "-t", str(duration), "-c", "copy", str(output_path),
         ]
-    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    r = _run_ffmpeg(
+        cmd,
+        duration=duration,
+        phase="Stream copy",
+        minimum=90,
+        multiplier=8,
+        maximum=900,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     if r.returncode != 0:
         print(f"[!] Stream copy failed:\n{r.stderr[-400:]}")
         return ClipResult(path=None)
@@ -444,7 +586,17 @@ def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         str(output_path),
     ]
-    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    r = _run_ffmpeg(
+        cmd,
+        duration=end - start,
+        phase="Audio extraction",
+        minimum=60,
+        multiplier=6,
+        maximum=420,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     if r.returncode != 0:
         print(f"[!] Audio extraction error:\n{r.stderr[-400:]}")
         return None
@@ -478,7 +630,17 @@ def _fallback_stream_copy(video_path, start, duration, output_path):
             "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
             "-t", str(duration), "-c", "copy", str(output_path),
         ]
-    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    r = _run_ffmpeg(
+        cmd,
+        duration=duration,
+        phase="Fallback stream copy",
+        minimum=90,
+        multiplier=8,
+        maximum=900,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     if r.returncode != 0:
         print(f"[!] Stream copy also failed:\n{r.stderr[-400:]}")
         return None
@@ -583,7 +745,17 @@ def add_background_music(
 
     trim_info = f", trim {trim_start:.1f}-{trim_end:.1f}s" if has_trim else ""
     print(f"[*] Mixing background music ({volume:.0%} vol{trim_info})...")
-    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    r = _run_ffmpeg(
+        cmd,
+        duration=clip_dur,
+        phase="Music mix",
+        minimum=120,
+        multiplier=12,
+        maximum=900,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
 
     if r.returncode == 0 and temp_out.exists():
         _rename_safe(temp_out, clip_path)
@@ -672,7 +844,17 @@ def apply_video_effect(
     ]
 
     print(f"[*] Applying '{effect}' effect...")
-    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    r = _run_ffmpeg(
+        cmd,
+        duration=120,
+        phase="Video effect",
+        minimum=120,
+        multiplier=12,
+        maximum=900,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
 
     if r.returncode == 0 and temp_out.exists():
         _rename_safe(temp_out, clip_path)

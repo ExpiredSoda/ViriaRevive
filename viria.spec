@@ -76,6 +76,8 @@ HIDDEN_IMPORTS = [
     "google.oauth2.credentials",
     "google.auth.transport.requests",
     "faster_whisper",
+    "scenedetect",
+    "scenedetect.detectors",
     "cv2",
     "numpy",
     "ultralytics",

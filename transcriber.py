@@ -1,4 +1,7 @@
 from pathlib import Path
+import multiprocessing
+import queue
+import wave
 
 _model_cache = {}
 
@@ -21,20 +24,71 @@ def transcribe_clip(
 
     Returns list of dicts: [{'text': str, 'start': float, 'end': float}, ...]
     """
-    from faster_whisper import WhisperModel
-
-    device, compute = _get_device()
-
-    if model_size not in _model_cache:
-        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
-        _model_cache[model_size] = WhisperModel(
-            model_size, device=device, compute_type=compute
-        )
-    model = _model_cache[model_size]
-
+    timeout = _transcription_timeout_seconds(audio_path)
     print(f"[*] Transcribing {audio_path.name}...")
+    payload = _run_transcription_process(audio_path, model_size, language, timeout)
+    if payload.get("timeout"):
+        print(f"[!] Transcription timed out after {timeout}s: {audio_path.name}")
+        return []
+    if payload.get("error"):
+        print(f"[!] Transcription failed for {audio_path.name}: {payload['error']}")
+        return []
+    words = payload.get("words") or []
+    detected_language = payload.get("language") or ""
+
+    print(f"[+] Transcribed {len(words)} words  (lang: {detected_language})")
+    return words
+
+
+def _run_transcription_process(audio_path: Path, model_size: str, language: str | None, timeout: int) -> dict:
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_transcribe_process_worker,
+        args=(str(audio_path), model_size, language, result_queue),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            try:
+                proc.kill()
+            except AttributeError:
+                proc.terminate()
+            proc.join(2)
+        return {"timeout": True}
+    try:
+        return result_queue.get_nowait()
+    except queue.Empty:
+        if proc.exitcode not in (0, None):
+            return {"error": f"worker exited with code {proc.exitcode}"}
+        return {"error": "worker produced no result"}
+
+
+def _transcribe_process_worker(audio_path: str, model_size: str, language: str | None, result_queue):
+    try:
+        from faster_whisper import WhisperModel
+
+        device, compute = _get_device()
+        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
+        model = WhisperModel(model_size, device=device, compute_type=compute)
+        words, detected_language = _transcribe_words(model, Path(audio_path), language)
+        result_queue.put({"words": words, "language": detected_language})
+    except Exception as exc:
+        try:
+            result_queue.put({"error": str(exc)})
+        except Exception:
+            pass
+
+
+def _transcribe_words(model, audio_path: Path, language: str = None) -> tuple[list, str]:
     segments, info = model.transcribe(
-        str(audio_path), word_timestamps=True, language=language
+        str(audio_path),
+        word_timestamps=True,
+        language=language,
     )
 
     from subprocess_utils import is_cancelled, CancelledError
@@ -49,8 +103,22 @@ def transcribe_clip(
                 if text:
                     words.append({"text": text, "start": w.start, "end": w.end})
 
-    print(f"[+] Transcribed {len(words)} words  (lang: {info.language})")
-    return words
+    return words, getattr(info, "language", "")
+
+
+def _audio_duration_seconds(audio_path: Path) -> float:
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate() or 1
+            return max(0.0, frames / float(rate))
+    except Exception:
+        return 30.0
+
+
+def _transcription_timeout_seconds(audio_path: Path) -> int:
+    duration = _audio_duration_seconds(audio_path)
+    return int(min(900, max(90, duration * 8.0)))
 
 
 # ── Sentence-boundary detection ───────────────────────────────────────────────

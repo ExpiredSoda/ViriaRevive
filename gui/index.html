@@ -70,7 +70,7 @@
             </div>
 
             <div class="sidebar-footer">
-                <span class="version" id="app-version">v2.1.0</span>
+                <span class="version" id="app-version">v2.2.0</span>
                 <button class="ollama-status checking" id="ollama-status" onclick="refreshOllamaStatus()" title="Checking Ollama status">
                     <span class="ollama-dot"></span>
                     <span class="ollama-label">Ollama</span>
@@ -162,9 +162,14 @@
                             <span>Detect</span>
                         </div>
                         <div class="stage-line"></div>
+                        <div class="stage" data-stage="candidates">
+                            <div class="stage-dot"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
+                            <span>Candidates</span>
+                        </div>
+                        <div class="stage-line"></div>
                         <div class="stage" data-stage="clips">
                             <div class="stage-dot"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>
-                            <span>Process</span>
+                            <span>Render</span>
                         </div>
                         <div class="stage-line"></div>
                         <div class="stage" data-stage="done">
@@ -172,12 +177,23 @@
                             <span>Done</span>
                         </div>
                     </div>
+                    <div id="batch-progress-card" class="batch-progress-card card hidden" aria-live="polite">
+                        <div class="batch-progress-top">
+                            <span id="batch-progress-kicker" class="batch-progress-kicker">Processing source</span>
+                            <span id="batch-progress-counts" class="batch-progress-counts"></span>
+                        </div>
+                        <div id="batch-progress-source" class="batch-progress-source" title="">Preparing source...</div>
+                        <div class="batch-progress-bar"><div id="batch-progress-fill" class="batch-progress-fill" style="width: 0%"></div></div>
+                        <div id="batch-progress-queue" class="batch-progress-queue" aria-label="Batch source progress"></div>
+                    </div>
                     <div class="progress-card card">
                         <div class="progress-header">
                             <span id="progress-status" class="progress-status">Initializing...</span>
                             <span id="progress-percent" class="progress-percent">0%</span>
                         </div>
                         <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width: 0%"></div></div>
+                        <div id="progress-eta" class="progress-eta">ETA will appear after progress starts.</div>
+                        <div id="progress-detail" class="progress-detail hidden" aria-live="polite"></div>
                     </div>
                     <div id="clip-cards" class="clip-progress-grid"></div>
                     <div class="progress-actions">
@@ -232,6 +248,7 @@
                         </button>
                     </div>
                 </div>
+                <div id="results-moment-filters" class="moment-filter-bar hidden" aria-label="Result moment filters"></div>
                 <div id="results-grid" class="results-grid">
                     <div class="empty-state" id="results-empty">
                         <div class="empty-state-icon">
@@ -275,6 +292,7 @@
                         </div>
                         <span id="preview-feedback-status" class="preview-feedback-status">No feedback yet</span>
                     </div>
+                    <div id="preview-moment-label" class="preview-moment-label hidden"></div>
                 </div>
             </div>
 
@@ -343,6 +361,7 @@
                         </button>
                     </div>
                 </div>
+                <div id="library-moment-filters" class="moment-filter-bar hidden" aria-label="Library moment filters"></div>
 
                 <!-- Library grid -->
                 <div id="library-grid" class="library-grid">
@@ -637,6 +656,45 @@
                             </div>
                         </div>
                         <div class="setting-row">
+                            <label for="set-detection-preference">Detection preference</label>
+                            <select id="set-detection-preference" class="form-select">
+                                <option value="auto" selected>Auto</option>
+                                <option value="quality">Quality</option>
+                                <option value="quantity">Quantity</option>
+                            </select>
+                            <span class="setting-hint">Quality returns fewer stronger moments. Quantity keeps a broader set.</span>
+                        </div>
+                        <div class="setting-row">
+                            <label>Visual frame analysis</label>
+                            <div class="toggle-group">
+                                <label class="toggle">
+                                    <input type="checkbox" id="set-visual-diagnostics" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="setting-hint">Samples tiny local frames so moment labels understand action, darkness, UI, and scenery.</span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <label>Use moment labels in ranking</label>
+                            <div class="toggle-group">
+                                <label class="toggle">
+                                    <input type="checkbox" id="set-moment-category-ranking">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="setting-hint">Small capped label/visual nudge for close calls; Processing Depth can turn it on automatically.</span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <label>AI moment labels</label>
+                            <div class="toggle-group">
+                                <label class="toggle">
+                                    <input type="checkbox" id="set-ai-moment-classification">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="setting-hint">Uses local Ollama when ready; otherwise keeps local fallback labels.</span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
                             <label>Clip duration</label>
                             <div class="slider-group">
                                 <input type="range" id="set-clip-duration" min="10" max="3000" step="5" value="30" oninput="updateSliderLabel(this)">
@@ -712,7 +770,7 @@
                     <div class="card settings-card ollama-settings-card">
                         <h3>
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4"/><path d="M12 18v4"/><path d="m4.93 4.93 2.83 2.83"/><path d="m16.24 16.24 2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="m4.93 19.07 2.83-2.83"/><path d="m16.24 7.76 2.83-2.83"/></svg>
-                            AI Titles
+                            Local AI
                         </h3>
                         <div class="ollama-settings-status">
                             <span class="ollama-settings-dot" id="settings-ollama-dot"></span>
@@ -724,10 +782,10 @@
                         <div class="data-privacy-actions">
                             <button class="btn-secondary btn-sm" id="btn-ollama-download" onclick="handleOllamaLocationAction()">Install Ollama</button>
                             <button class="btn-secondary btn-sm" id="btn-ollama-install" onclick="installOllamaWithPowerShell()">Install via PowerShell</button>
-                            <button class="btn-secondary btn-sm" id="btn-ollama-model" onclick="downloadOllamaModel()">Download Title Model</button>
+                            <button class="btn-secondary btn-sm" id="btn-ollama-model" onclick="downloadOllamaModel()">Download AI Model</button>
                             <button class="btn-secondary btn-sm" onclick="refreshOllamaStatus()">Refresh</button>
                         </div>
-                        <p class="setting-hint">Optional and local. PowerShell install asks first and runs Ollama's official Windows command in a new window.</p>
+                        <p class="setting-hint">Optional and local. Powers AI titles, moment labels, and Deep Analysis AI ranking when enabled. PowerShell install asks first and runs Ollama's official Windows command in a new window.</p>
                     </div>
 
                     <div class="card settings-card">
@@ -798,11 +856,16 @@
                             </label>
                         </div>
                         <div class="subtitle-placement-panel">
-                            <div class="subtitle-placement-preview" id="subtitle-placement-preview" aria-hidden="true">
+                            <button class="subtitle-placement-preview" id="subtitle-placement-preview" type="button" onclick="openSubtitlePreviewModal()" aria-label="Open larger subtitle preview">
+                                <div class="subtitle-placement-snapshot-empty" id="subtitle-placement-snapshot-empty">Preview uses your latest clip when available</div>
                                 <div class="subtitle-placement-guide"></div>
                                 <div class="subtitle-placement-box" id="subtitle-placement-box">TRANSCRIPT TEXT</div>
-                            </div>
+                            </button>
                             <div class="subtitle-placement-controls">
+                                <div class="subtitle-preview-actions">
+                                    <button class="btn-secondary btn-sm" type="button" onclick="refreshSubtitlePreviewSnapshot(true)">Refresh Preview</button>
+                                    <button class="btn-secondary btn-sm" type="button" onclick="resetSubtitlePreviewSnapshot()">Reset</button>
+                                </div>
                                 <div class="setting-row">
                                     <label for="set-subtitle-x">Horizontal position</label>
                                     <div class="slider-group">
@@ -834,55 +897,20 @@
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
                             Data & Privacy
                         </h3>
-                        <div class="data-privacy-summary">
-                            <div class="data-privacy-stat">
-                                <span class="data-privacy-value" id="privacy-event-count">0</span>
-                                <span class="data-privacy-label">Feedback Clicks</span>
-                            </div>
-                            <div class="data-privacy-stat">
-                                <span class="data-privacy-value" id="privacy-clip-count">0</span>
-                                <span class="data-privacy-label">Clips You Rated</span>
-                            </div>
-                            <div class="data-privacy-stat">
-                                <span class="data-privacy-value" id="privacy-data-size">0 KB</span>
-                                <span class="data-privacy-label">Local Feedback File</span>
-                            </div>
+                        <div class="privacy-card-hero">
+                            <strong>Your data stays on this PC.</strong>
+                            <p>Ratings, learning signals, optional voice profile data, OAuth files, and generated clips are stored locally. ViriaRevive only contacts YouTube when you connect or upload, and Ollama runs through your local machine when enabled.</p>
                         </div>
-                        <div class="learning-status-panel">
-                            <div class="learning-status-heading">
-                                <span class="learning-status-title">How Learning Is Working</span>
-                                <span class="learning-status-pill is-idle" id="learning-enabled">Idle</span>
-                            </div>
-                            <div class="learning-status-grid">
-                                <div class="learning-status-stat">
-                                    <span class="learning-status-value" id="learning-active-signals">0</span>
-                                    <span class="learning-status-label">Feedback Used Now</span>
-                                </div>
-                                <div class="learning-status-stat">
-                                    <span class="learning-status-value" id="learning-cap">+/-0.06</span>
-                                    <span class="learning-status-label">Learning Limit</span>
-                                </div>
-                                <div class="learning-status-stat">
-                                    <span class="learning-status-value" id="learning-last-feedback">Never</span>
-                                    <span class="learning-status-label">Last Rating</span>
-                                </div>
-                            </div>
+                        <div class="privacy-card-points">
+                            <span>Local feedback</span>
+                            <span>Share-safe exports</span>
+                            <span>Optional learning</span>
                         </div>
-                        <div class="setting-row">
-                            <p class="data-privacy-copy">Your ratings stay on this PC in <code>personalization.json</code>. They help future runs slightly favor clips like the ones you liked, but the normal detector still makes the main decision.</p>
-                            <ul class="privacy-explain-list">
-                                <li><strong>Feedback used now</strong> counts ratings that are still active.</li>
-                                <li><strong>Learning limit</strong> is the biggest nudge learning can add or subtract.</li>
-                                <li><strong>Share-safe export</strong> makes a copy with transcripts, notes, filenames, exact times, and raw IDs removed.</li>
-                                <li>YouTube is contacted only when you connect or upload. Ollama stays local at <code>127.0.0.1:11434</code>.</li>
-                            </ul>
-                        </div>
-                        <div class="data-privacy-actions">
-                            <button class="btn-secondary btn-sm" onclick="refreshDataPrivacyCard()">Refresh</button>
-                            <button class="btn-secondary btn-sm" onclick="openDataFolder()">Open Data Folder</button>
-                            <button class="btn-secondary btn-sm" onclick="openPersonalizationFile()">Open Raw Feedback File</button>
-                            <button class="btn-secondary btn-sm" onclick="exportPersonalizationFile()">Export Share-Safe Copy</button>
-                            <button class="btn-danger btn-sm" onclick="clearFeedbackData()">Clear Learning Feedback</button>
+                        <div class="privacy-card-actions">
+                            <button class="btn-primary btn-sm" onclick="openDataPrivacyModal()">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                Advanced Features
+                            </button>
                         </div>
                     </div>
 
@@ -893,8 +921,8 @@
                         </h3>
                         <div class="setting-row">
                             <p style="color:var(--text-2);font-size:12.5px;line-height:1.6">
-                                <strong id="about-app-title">ViriaRevive v2.1.0</strong> turns long gameplay videos into short vertical clips.
-                                This fork focuses on transcript-aware detection, multi-track audio, optional subtitles, local learning, local Ollama titles, and optional YouTube scheduling.
+                                <strong id="about-app-title">ViriaRevive v2.2.0</strong> turns long gameplay videos into short vertical clips.
+                                This fork focuses on transcript-aware detection, multi-track audio, optional subtitles, local learning, local Ollama titles and AI moment labels, and optional YouTube scheduling.
                             </p>
                         </div>
                         <div class="setting-row">
@@ -972,6 +1000,206 @@
                 <button class="btn-secondary" onclick="openYouTubeOAuthConsole()">Open Google Credentials</button>
                 <button class="btn-secondary" onclick="openDataFolder()">Open Data Folder</button>
                 <button class="btn-primary" onclick="closeModal('youtube-modal')">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Data & Privacy advanced modal -->
+    <div id="data-privacy-modal" class="modal hidden">
+        <div class="modal-content card data-privacy-modal-body">
+            <div class="meta-modal-header">
+                <div>
+                    <h2>Data & Privacy</h2>
+                    <p class="privacy-modal-subtitle">Everything here is local-first. These controls are grouped away from the main Settings card so new users only see the essentials.</p>
+                </div>
+                <button class="meta-modal-close" onclick="closeModal('data-privacy-modal')">&times;</button>
+            </div>
+
+            <div class="data-privacy-tabs" role="tablist" aria-label="Data and privacy sections">
+                <button class="data-privacy-tab active" type="button" data-privacy-tab="overview" onclick="setDataPrivacyTab('overview')">Overview</button>
+                <button class="data-privacy-tab" type="button" data-privacy-tab="learning" onclick="setDataPrivacyTab('learning')">Learning</button>
+                <button class="data-privacy-tab" type="button" data-privacy-tab="analysis" onclick="setDataPrivacyTab('analysis')">Local Analysis</button>
+                <button class="data-privacy-tab" type="button" data-privacy-tab="voice" onclick="setDataPrivacyTab('voice')">Voice Profile</button>
+                <button class="data-privacy-tab" type="button" data-privacy-tab="files" onclick="setDataPrivacyTab('files')">Files & Sharing</button>
+            </div>
+
+            <div class="data-privacy-tab-panel active" data-privacy-panel="overview">
+                <div class="privacy-modal-section">
+                    <h3>Local Data Summary</h3>
+                    <div class="data-privacy-summary">
+                        <div class="data-privacy-stat">
+                            <span class="data-privacy-value" id="privacy-event-count">0</span>
+                            <span class="data-privacy-label">Feedback Clicks</span>
+                        </div>
+                        <div class="data-privacy-stat">
+                            <span class="data-privacy-value" id="privacy-clip-count">0</span>
+                            <span class="data-privacy-label">Clips You Rated</span>
+                        </div>
+                        <div class="data-privacy-stat">
+                            <span class="data-privacy-value" id="privacy-data-size">0 KB</span>
+                            <span class="data-privacy-label">Feedback File</span>
+                        </div>
+                    </div>
+                    <p class="data-privacy-copy">ViriaRevive keeps clip feedback, app settings, optional voice profile features, and YouTube OAuth files in your local app data folder. Cloud services are not contacted for local learning.</p>
+                </div>
+                <div class="data-privacy-actions">
+                    <button class="btn-secondary btn-sm" onclick="refreshDataPrivacyCard()">Refresh</button>
+                    <button class="btn-secondary btn-sm" onclick="openDataFolder()">Open Data Folder</button>
+                </div>
+            </div>
+
+            <div class="data-privacy-tab-panel" data-privacy-panel="learning">
+                <div class="privacy-modal-section">
+                    <h3>Clip Feedback Learning</h3>
+                    <p class="data-privacy-copy">Likes, dislikes, and favorites help future runs make a small local adjustment. The normal clip detector still does the main scoring.</p>
+                    <div class="learning-status-panel">
+                        <div class="learning-status-heading">
+                            <span class="learning-status-title">How Learning Is Working</span>
+                            <span class="learning-status-pill is-idle" id="learning-enabled">Idle</span>
+                        </div>
+                        <div class="learning-status-grid">
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="learning-active-signals">0</span>
+                                <span class="learning-status-label">Feedback Used Now</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="learning-cap">+/-0.06</span>
+                                <span class="learning-status-label">Learning Limit</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="learning-last-feedback">Never</span>
+                                <span class="learning-status-label">Last Rating</span>
+                            </div>
+                        </div>
+                    </div>
+                    <ul class="privacy-explain-list">
+                        <li><strong>Feedback used now</strong> counts ratings that are still active.</li>
+                        <li><strong>Learning limit</strong> is the biggest nudge learning can add or subtract.</li>
+                        <li><strong>Clearing feedback</strong> removes future learned-ranking influence and creates a local backup first.</li>
+                    </ul>
+                </div>
+                <div class="data-privacy-actions">
+                    <button class="btn-secondary btn-sm" onclick="openPersonalizationFile()">Open Raw Feedback File</button>
+                    <button class="btn-danger btn-sm" onclick="clearFeedbackData()">Clear Learning Feedback</button>
+                </div>
+            </div>
+
+            <div class="data-privacy-tab-panel" data-privacy-panel="analysis">
+                <div class="privacy-modal-section">
+                    <h3>Local Analysis Features</h3>
+                    <p class="data-privacy-copy">These features inspect local transcript, audio, and small frame samples. Labels can explain and filter clips; only ranking features can change which moments are selected.</p>
+                    <div class="learning-status-panel">
+                        <div class="learning-status-heading">
+                            <span class="learning-status-title">Current Analysis Settings</span>
+                            <span class="learning-status-pill is-idle" id="analysis-depth">Balanced</span>
+                        </div>
+                        <div class="learning-status-grid">
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-scene">Sampled</span>
+                                <span class="learning-status-label">Scene Detection</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-visual">On</span>
+                                <span class="learning-status-label">Visual Analysis</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-ai-labels">Off</span>
+                                <span class="learning-status-label">AI Labels</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-ranking">Off</span>
+                                <span class="learning-status-label">Label Ranking</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-voice">Off</span>
+                                <span class="learning-status-label">Voice Ranking</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="analysis-ranking-cap">+/-0.020</span>
+                                <span class="learning-status-label">Label Nudge</span>
+                            </div>
+                        </div>
+                    </div>
+                    <ul class="privacy-explain-list">
+                        <li><strong>Scene detection</strong> can be sampled, targeted, full, or inactive in Fast for long recordings.</li>
+                        <li><strong>Visual analysis</strong> helps labels understand what is happening on screen.</li>
+                        <li><strong>AI labels</strong> use local Ollama when available and otherwise fall back locally; Deep Analysis can use high-confidence local labels as a tiny guarded ranking nudge.</li>
+                        <li><strong>Moment-label ranking</strong> can turn on by depth; <strong>voice ranking</strong> is a separate opt-in and only influences eligible runs after the profile is enrolled and candidate voice scores are available.</li>
+                    </ul>
+                </div>
+                <div class="privacy-modal-section">
+                    <h3>Processing Time Learning</h3>
+                    <p class="data-privacy-copy">ViriaRevive keeps a local timing history so future estimates can learn from this PC. It stores durations and settings, not transcripts.</p>
+                    <div class="learning-status-grid">
+                        <div class="learning-status-stat">
+                            <span class="learning-status-value" id="processing-history-runs">0</span>
+                            <span class="learning-status-label">Timed Runs</span>
+                        </div>
+                        <div class="learning-status-stat">
+                            <span class="learning-status-value" id="processing-history-last">Never</span>
+                            <span class="learning-status-label">Last Runtime</span>
+                        </div>
+                        <div class="learning-status-stat">
+                            <span class="learning-status-value" id="processing-history-error">Learning</span>
+                            <span class="learning-status-label">Last Estimate</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="data-privacy-tab-panel" data-privacy-panel="voice">
+                <div class="privacy-modal-section">
+                    <h3>Creator Voice Profile</h3>
+                    <p class="data-privacy-copy voice-profile-copy">Optional. Build & Enable creates a small local numeric profile from current clips. Voice ranking is a separate opt-in and can only make a tiny capped nudge after samples are enrolled and candidate voice scores are available. No raw audio is saved.</p>
+                    <div class="voice-profile-panel">
+                        <div class="learning-status-heading">
+                            <span class="learning-status-title">Creator Voice Profile</span>
+                            <span class="learning-status-pill is-idle" id="voice-profile-enabled">Off</span>
+                        </div>
+                        <div class="learning-status-grid">
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="voice-profile-samples">0</span>
+                                <span class="learning-status-label">Samples</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="voice-profile-size">0 KB</span>
+                                <span class="learning-status-label">Local Profile</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="voice-profile-updated">Never</span>
+                                <span class="learning-status-label">Updated</span>
+                            </div>
+                            <div class="learning-status-stat">
+                                <span class="learning-status-value" id="voice-profile-ranking">Off</span>
+                                <span class="learning-status-label">Ranking</span>
+                            </div>
+                        </div>
+                        <p class="voice-profile-guidance" id="voice-profile-guidance">Enable the profile, then build it from clips with clear creator commentary.</p>
+                    </div>
+                </div>
+                <div class="data-privacy-actions">
+                    <button class="btn-secondary btn-sm" id="voice-profile-toggle-btn" onclick="toggleVoiceProfileEnabled()">Enable Voice Profile</button>
+                    <button class="btn-secondary btn-sm" id="voice-profile-ranking-toggle-btn" onclick="toggleVoiceProfileRanking()">Use Voice In Ranking</button>
+                    <button class="btn-secondary btn-sm" onclick="enrollVoiceProfile()">Build &amp; Enable From Current Clips</button>
+                    <button class="btn-danger btn-sm" onclick="resetVoiceProfile()">Reset Voice Profile</button>
+                </div>
+            </div>
+
+            <div class="data-privacy-tab-panel" data-privacy-panel="files">
+                <div class="privacy-modal-section">
+                    <h3>Files, Exports, And Connections</h3>
+                    <p class="data-privacy-copy">Use these when you want to inspect, share, or remove local learning data. YouTube is contacted only when you connect or upload. Ollama stays local at <code>127.0.0.1:11434</code>.</p>
+                    <ul class="privacy-explain-list">
+                        <li><strong>Raw feedback</strong> opens your local <code>personalization.json</code>.</li>
+                        <li><strong>Share-safe export</strong> removes transcripts, notes, filenames, exact times, and raw IDs.</li>
+                        <li><strong>Data folder</strong> is where the installed app stores settings, tokens, clips, and local learning files.</li>
+                    </ul>
+                </div>
+                <div class="data-privacy-actions">
+                    <button class="btn-secondary btn-sm" onclick="openDataFolder()">Open Data Folder</button>
+                    <button class="btn-secondary btn-sm" onclick="openPersonalizationFile()">Open Raw Feedback File</button>
+                    <button class="btn-secondary btn-sm" onclick="exportPersonalizationFile()">Export Share-Safe Copy</button>
+                </div>
             </div>
         </div>
     </div>
@@ -1066,6 +1294,41 @@
         </div>
     </div>
 
+    <!-- Feedback reason modal -->
+    <div id="feedback-modal" class="modal hidden">
+        <div class="modal-content card feedback-modal-body">
+            <div class="meta-modal-header">
+                <h2 id="feedback-modal-title">Feedback</h2>
+                <button class="meta-modal-close" onclick="closeFeedbackModal()">&times;</button>
+            </div>
+            <p id="feedback-modal-copy" class="feedback-modal-copy">Tell ViriaRevive what to learn from this clip.</p>
+            <div class="feedback-reason-chips" id="feedback-reason-chips"></div>
+            <div class="meta-field">
+                <label for="feedback-reason-note">Optional note</label>
+                <textarea class="form-input" id="feedback-reason-note" rows="3" placeholder="Add anything specific you want the local learning to remember..."></textarea>
+            </div>
+            <div class="meta-modal-actions feedback-modal-actions">
+                <button class="btn-secondary btn-sm" type="button" onclick="closeFeedbackModal()">Cancel</button>
+                <button class="btn-primary btn-sm" type="button" onclick="submitFeedbackModal()">Save Feedback</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Large subtitle placement preview -->
+    <div id="subtitle-preview-modal" class="modal hidden">
+        <div class="modal-content card subtitle-preview-modal-body">
+            <div class="meta-modal-header">
+                <h2>Subtitle Preview</h2>
+                <button class="meta-modal-close" onclick="closeModal('subtitle-preview-modal')">&times;</button>
+            </div>
+            <div class="subtitle-placement-preview-large" id="subtitle-placement-preview-large">
+                <div class="subtitle-placement-snapshot-empty" id="subtitle-placement-large-empty">Preview uses your latest clip when available</div>
+                <div class="subtitle-placement-guide"></div>
+                <div class="subtitle-placement-box" id="subtitle-placement-box-large">TRANSCRIPT TEXT</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Clip picker modal (for calendar day click) -->
     <div id="clip-picker-modal" class="modal hidden">
         <div class="modal-content card clip-picker-body">
@@ -1099,16 +1362,20 @@
         </div>
     </div>
 
-    <!-- Pre-processing Wizard Modal (style → effects → music) -->
+    <!-- Pre-processing Wizard Modal (style → detection → audio → effects → music) -->
     <div id="style-picker-modal" class="modal hidden">
         <div class="modal-content card style-picker-body">
             <!-- Step indicators -->
             <div class="wizard-steps">
                 <div class="wizard-step active" data-step="1"><span class="wizard-step-num">1</span><span>Style</span></div>
                 <div class="wizard-step-line"></div>
-                <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span><span>Effects</span></div>
+                <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span><span>Detection</span></div>
                 <div class="wizard-step-line"></div>
-                <div class="wizard-step" data-step="3"><span class="wizard-step-num">3</span><span>Music</span></div>
+                <div class="wizard-step" data-step="3"><span class="wizard-step-num">3</span><span>Audio</span></div>
+                <div class="wizard-step-line"></div>
+                <div class="wizard-step" data-step="4"><span class="wizard-step-num">4</span><span>Effects</span></div>
+                <div class="wizard-step-line"></div>
+                <div class="wizard-step" data-step="5"><span class="wizard-step-num">5</span><span>Music</span></div>
             </div>
 
             <!-- STEP 1: Subtitle Style -->
@@ -1202,13 +1469,145 @@
                     </label>
                 </div>
                 <button class="btn-primary style-picker-go" onclick="wizardNext(2)">
-                    Next: Effects
+                    Next: Detection
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
                 </button>
             </div>
 
-            <!-- STEP 2: Video Effects -->
+            <!-- STEP 2: Detection -->
             <div class="wizard-page" id="wizard-step-2">
+                <div class="meta-modal-header">
+                    <h2>Detection</h2>
+                    <button class="meta-modal-close" onclick="closeModal('style-picker-modal')">&times;</button>
+                </div>
+                <p class="style-picker-hint">Choose how deeply ViriaRevive should inspect the video before rendering final clips.</p>
+                <div class="depth-preset-grid" id="wizard-depth-presets">
+                    <button type="button" class="depth-preset" data-depth="fast" onclick="selectProcessingDepth('fast')">
+                        <strong>Fast</strong>
+                        <span>Fewer candidates and lighter analysis for quicker batches.</span>
+                    </button>
+                    <button type="button" class="depth-preset active" data-depth="balanced" onclick="selectProcessingDepth('balanced')">
+                        <strong>Balanced</strong>
+                        <span>Default quality path with sampled scene checks on long videos.</span>
+                    </button>
+                    <button type="button" class="depth-preset" data-depth="deep" onclick="selectProcessingDepth('deep')">
+                        <strong>Deep Analysis</strong>
+                        <span>More candidates, visual/category passes, and deeper targeted scene analysis.</span>
+                    </button>
+                </div>
+                <div class="wizard-detection-grid">
+                    <div class="wizard-detection-row">
+                        <label for="wizard-detection-preference">Output preference</label>
+                        <select id="wizard-detection-preference" class="form-select">
+                            <option value="auto" selected>Auto</option>
+                            <option value="quality">Quality</option>
+                            <option value="quantity">Quantity</option>
+                        </select>
+                        <div id="wizard-detection-preference-fixed" class="wizard-static-value hidden">Quality</div>
+                    </div>
+                    <div class="wizard-detection-row">
+                        <label for="wizard-num-clips">Number of clips</label>
+                        <select id="wizard-num-clips" class="form-select">
+                            <option value="auto" selected>Auto</option>
+                            <option value="3">3</option>
+                            <option value="5">5</option>
+                            <option value="10">10</option>
+                            <option value="20">20</option>
+                            <option value="33">33</option>
+                        </select>
+                    </div>
+                    <div class="wizard-detection-row">
+                        <label for="wizard-clip-duration">Clip duration</label>
+                        <div class="slider-group">
+                            <input type="range" id="wizard-clip-duration" min="10" max="3000" step="5" value="30" oninput="document.getElementById('val-wizard-clip-duration').textContent = this.value + 's'; syncWizardEstimate()">
+                            <span class="slider-val" id="val-wizard-clip-duration">30s</span>
+                        </div>
+                    </div>
+                    <div class="wizard-detection-row">
+                        <label for="wizard-min-gap">Minimum gap</label>
+                        <div class="slider-group">
+                            <input type="range" id="wizard-min-gap" min="5" max="60" step="5" value="15" oninput="document.getElementById('val-wizard-min-gap').textContent = this.value + 's'; syncWizardEstimate()">
+                            <span class="slider-val" id="val-wizard-min-gap">15s</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="wizard-estimate" id="wizard-estimate">Long recordings can take a while. Balanced is a good default.</div>
+                <div class="wizard-nav">
+                    <button class="btn-secondary" onclick="wizardNext(1)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                        Back
+                    </button>
+                    <button class="btn-primary" onclick="wizardNext(3)">
+                        Next: Audio
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- STEP 3: Audio Sources -->
+            <div class="wizard-page" id="wizard-step-3">
+                <div class="meta-modal-header">
+                    <h2>Audio Sources</h2>
+                    <button class="meta-modal-close" onclick="closeModal('style-picker-modal')">&times;</button>
+                </div>
+                <p class="style-picker-hint">Choose which source should create subtitles. Final clips keep the full game and mic audio mix.</p>
+                <div class="audio-source-panel">
+                    <div class="audio-source-status" id="wizard-audio-source-status">
+                        Checking audio sources...
+                    </div>
+                    <div class="audio-source-options">
+                        <label class="audio-source-option">
+                            <input type="radio" name="wizard-audio-mode" value="auto" checked>
+                            <span>
+                                <strong>Auto detect commentary</strong>
+                                <small>Best default for most videos</small>
+                            </span>
+                        </label>
+                        <label class="audio-source-option" id="wizard-audio-stream-option">
+                            <input type="radio" name="wizard-audio-mode" value="stream">
+                            <span>
+                                <strong>Use selected track</strong>
+                                <small>Good for OBS recordings with separate mic/game tracks</small>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="audio-source-select-field">
+                        <label for="wizard-audio-stream-select">Detected tracks</label>
+                        <select id="wizard-audio-stream-select" class="form-select" disabled>
+                            <option value="">No separate tracks detected yet</option>
+                        </select>
+                        <span class="audio-source-helper">Auto is safest for most videos. Use a specific track only when you know which one has your mic.</span>
+                    </div>
+                    <label class="auto-check audio-source-guard">
+                        <input type="checkbox" id="wizard-mixed-audio-guard" checked>
+                        Use the single-track speech guard when mic and game audio are mixed
+                    </label>
+                    <div class="audio-source-policy">
+                        <div>
+                            <label for="wizard-mixed-audio-subtitle-policy">Mixed-track subtitle preference</label>
+                            <span class="audio-source-helper">When one track has your mic plus game/NPC dialogue.</span>
+                        </div>
+                        <select id="wizard-mixed-audio-subtitle-policy" class="form-select">
+                            <option value="creator" selected>Prefer my commentary</option>
+                            <option value="all">Include all speech</option>
+                            <option value="game">Prefer game/NPC speech</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="wizard-nav">
+                    <button class="btn-secondary" onclick="wizardNext(2)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                        Back
+                    </button>
+                    <button class="btn-primary" onclick="wizardNext(4)">
+                        Next: Effects
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- STEP 4: Video Effects -->
+            <div class="wizard-page" id="wizard-step-4">
                 <div class="meta-modal-header">
                     <h2>Video Effect</h2>
                     <button class="meta-modal-close" onclick="closeModal('style-picker-modal')">&times;</button>
@@ -1218,19 +1617,19 @@
                     <!-- Populated by JS -->
                 </div>
                 <div class="wizard-nav">
-                    <button class="btn-secondary" onclick="wizardNext(1)">
+                    <button class="btn-secondary" onclick="wizardNext(3)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
                         Back
                     </button>
-                    <button class="btn-primary" onclick="wizardNext(3)">
+                    <button class="btn-primary" onclick="wizardNext(5)">
                         Next: Music
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
                     </button>
                 </div>
             </div>
 
-            <!-- STEP 3: Background Music -->
-            <div class="wizard-page" id="wizard-step-3">
+            <!-- STEP 5: Background Music -->
+            <div class="wizard-page" id="wizard-step-5">
                 <div class="meta-modal-header">
                     <h2>Background Music</h2>
                     <button class="meta-modal-close" onclick="closeModal('style-picker-modal')">&times;</button>
@@ -1296,7 +1695,7 @@
                 </div>
 
                 <div class="wizard-nav">
-                    <button class="btn-secondary" onclick="wizardNext(2)">
+                    <button class="btn-secondary" onclick="wizardNext(4)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
                         Back
                     </button>

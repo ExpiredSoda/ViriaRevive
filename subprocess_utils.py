@@ -40,7 +40,14 @@ def is_cancelled() -> bool:
 
 class CancelledError(Exception):
     """Raised when a subprocess is interrupted by cancellation."""
-    pass
+
+    def __init__(self, message="Pipeline cancelled", output=None, stderr=None, stdout=None):
+        super().__init__(message)
+        if output is None and stdout is not None:
+            output = stdout
+        self.output = output
+        self.stdout = output
+        self.stderr = stderr
 
 
 def run(*args, **kwargs):
@@ -62,6 +69,12 @@ def run(*args, **kwargs):
 
     timeout = kwargs.pop("timeout", None)
     check = kwargs.pop("check", False)
+    text_mode = bool(
+        kwargs.get("text")
+        or kwargs.get("universal_newlines")
+        or kwargs.get("encoding")
+        or kwargs.get("errors")
+    )
 
     proc = subprocess.Popen(*args, **kwargs)
     with _lock:
@@ -94,6 +107,24 @@ def run(*args, **kwargs):
             t.start()
             drain_threads.append(t)
 
+        def _combine_captured_output(join_timeout=5):
+            for thread in drain_threads:
+                thread.join(timeout=join_timeout)
+            stdout_captured = proc.stdout is not None
+            stderr_captured = proc.stderr is not None
+            empty_output = "" if text_mode else b""
+            if stdout_chunks:
+                joiner = b'' if isinstance(stdout_chunks[0], bytes) else ''
+                stdout = joiner.join(stdout_chunks)
+            else:
+                stdout = empty_output if stdout_captured else None
+            if stderr_chunks:
+                joiner = b'' if isinstance(stderr_chunks[0], bytes) else ''
+                stderr = joiner.join(stderr_chunks)
+            else:
+                stderr = empty_output if stderr_captured else None
+            return stdout, stderr
+
         # Poll the process, checking cancel flag every 0.5s
         elapsed = 0.0
         poll_interval = 0.5
@@ -104,14 +135,24 @@ def run(*args, **kwargs):
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                raise CancelledError("Pipeline cancelled")
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                stdout, stderr = _combine_captured_output(join_timeout=1)
+                raise CancelledError("Pipeline cancelled", output=stdout, stderr=stderr)
             if timeout is not None and elapsed >= timeout:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                raise subprocess.TimeoutExpired(proc.args, timeout)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                stdout, stderr = _combine_captured_output(join_timeout=1)
+                raise subprocess.TimeoutExpired(proc.args, timeout, output=stdout, stderr=stderr)
             # Wait a bit before next poll
             try:
                 proc.wait(timeout=poll_interval)
@@ -122,23 +163,11 @@ def run(*args, **kwargs):
         # Check cancel one more time after process exits (process may have been
         # killed externally by request_cancel via _active_processes)
         if _cancel_flag.is_set():
-            raise CancelledError("Pipeline cancelled")
+            stdout, stderr = _combine_captured_output(join_timeout=1)
+            raise CancelledError("Pipeline cancelled", output=stdout, stderr=stderr)
 
         # Wait for drain threads to finish reading
-        for t in drain_threads:
-            t.join(timeout=5)
-
-        # Combine captured output
-        if stdout_chunks:
-            joiner = b'' if isinstance(stdout_chunks[0], bytes) else ''
-            stdout = joiner.join(stdout_chunks)
-        else:
-            stdout = None
-        if stderr_chunks:
-            joiner = b'' if isinstance(stderr_chunks[0], bytes) else ''
-            stderr = joiner.join(stderr_chunks)
-        else:
-            stderr = None
+        stdout, stderr = _combine_captured_output(join_timeout=5)
 
         result = subprocess.CompletedProcess(
             args=proc.args,

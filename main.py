@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import multiprocessing
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -43,13 +44,20 @@ from cropper import get_crop_params, get_dimensions
 from audio_streams import get_audio_streams, pick_voice_stream_ordinal
 from candidate_ranker import (
     apply_learned_scoring,
+    apply_moment_category_scoring,
+    build_moment_category_ranking_report,
     build_shadow_scoring_report,
     evaluate_candidate,
     needs_stream_retry,
     select_best_candidates,
     write_debug_report,
 )
-from speech_stream_selector import select_speech_stream
+from speech_stream_selector import (
+    get_last_speech_stream_selection,
+    profile_words_for_stream,
+    select_speech_stream,
+    should_accept_alternate_stream,
+)
 from uploader import upload_to_youtube, build_schedule
 
 
@@ -96,6 +104,63 @@ def _print_shadow_summary(shadow_scoring: dict):
     )
 
 
+def _print_category_summary(moment_category_ranking: dict):
+    if not moment_category_ranking:
+        return
+    if not moment_category_ranking.get("ranking_enabled"):
+        return
+    if not moment_category_ranking.get("has_category_scores"):
+        print("[rank] Moment-label ranking enabled; no usable category signals found")
+        return
+    changes = moment_category_ranking.get("top_changes", [])
+    added = sum(1 for row in changes if row.get("selection_delta") == "added_by_category")
+    dropped = sum(1 for row in changes if row.get("selection_delta") == "dropped_by_category")
+    cap = moment_category_ranking.get("moment_category_selection_max_adjustment", 0)
+    changed = "changed selection" if moment_category_ranking.get("output_changed") else "kept the same selection"
+    print(
+        f"[rank] Moment-label blend: cap ±{cap}, {len(changes)} reorder signal(s), "
+        f"{added} added, {dropped} dropped; {changed}"
+    )
+
+
+def _apply_cli_moment_category_ranking(
+    evaluations: list[dict],
+    learned_selected: list[dict],
+    *,
+    enabled: bool = False,
+    num_clips: int = NUM_CLIPS,
+    min_gap: int = MIN_GAP,
+) -> tuple[list[dict], dict, str]:
+    effective_gap = max(8, int(min_gap or 0))
+    category_summary = apply_moment_category_scoring(
+        evaluations,
+        enabled=bool(enabled),
+        score_key="learned_quality_score",
+    )
+    selection_score_key = "learned_quality_score"
+    selected = learned_selected
+    category_selected = learned_selected
+    if category_summary.get("ranking_enabled") and category_summary.get("has_category_scores"):
+        selection_score_key = "moment_category_quality_score"
+        category_selected = select_best_candidates(
+            evaluations,
+            num_clips,
+            min_gap=effective_gap,
+            score_key=selection_score_key,
+        )
+        selected = category_selected
+
+    moment_category_ranking = build_moment_category_ranking_report(
+        evaluations,
+        learned_selected,
+        category_selected,
+        enabled=category_summary.get("ranking_enabled", False),
+        max_count=num_clips,
+        min_gap=effective_gap,
+    )
+    return selected, moment_category_ranking, selection_score_key
+
+
 def _video_duration(video_path: Path) -> float:
     from subprocess_utils import run as _run
 
@@ -125,6 +190,7 @@ def process(
     schedule_hours: int = 24,
     crop: bool = CROP_VERTICAL,
     subtitle_placement: dict | None = None,
+    moment_category_ranking: bool = False,
 ):
     _check_deps()
     subtitle_placement = normalize_subtitle_placement(subtitle_placement or SUBTITLE_PLACEMENT)
@@ -158,6 +224,19 @@ def process(
     speech_stream = select_speech_stream(
         video_path, candidates, model, language, SUBTITLES_DIR
     )
+    stream_selection = get_last_speech_stream_selection()
+    source_audio_streams = [
+        {
+            "ordinal": int(stream.get("ordinal", 0)),
+            "index": stream.get("index"),
+            "title": stream.get("title") or f"Track {int(stream.get('ordinal', 0)) + 1}",
+            "codec": stream.get("codec") or "",
+            "channels": stream.get("channels"),
+            "layout": stream.get("layout") or "",
+            "language": stream.get("language") or "",
+        }
+        for stream in get_audio_streams(video_path)
+    ]
 
     # ── 3. Transcript-rank candidates ────────────────────────────────────
     print("\n══ 3 · Ranking candidates by transcript quality ══")
@@ -203,15 +282,22 @@ def process(
         personalization_snapshot,
         source_stem=stem,
     )
-    selected = select_best_candidates(
+    learned_selected = select_best_candidates(
         evaluations,
         num_clips,
         min_gap=max(8, MIN_GAP),
         score_key="learned_quality_score",
     )
+    selected, moment_category_report, selection_score_key = _apply_cli_moment_category_ranking(
+        evaluations,
+        learned_selected,
+        enabled=moment_category_ranking,
+        num_clips=num_clips,
+        min_gap=MIN_GAP,
+    )
     shadow_scoring = build_shadow_scoring_report(
         evaluations,
-        selected,
+        learned_selected,
         personalization_snapshot,
         source_stem=stem,
         max_count=num_clips,
@@ -231,6 +317,20 @@ def process(
         "video_crf": VIDEO_CRF,
         "crop_vertical": crop,
         "candidate_multiplier": 5,
+        "moment_category_ranking": bool(moment_category_ranking),
+        "selection_score_source": selection_score_key,
+        "audio_source": {
+            "mode": "auto",
+            "selected_stream": speech_stream,
+            "selected_reason": stream_selection.get("selected_reason"),
+            "selected_confidence": stream_selection.get("confidence"),
+            "runner_up_stream": stream_selection.get("runner_up_stream"),
+            "stream_count": len(source_audio_streams),
+            "streams": source_audio_streams,
+            "render_audio": "all_source_streams_mixed",
+            "alternate_stream_retry": True,
+            "stream_selection": stream_selection,
+        },
     }
     write_debug_report(
         debug_path,
@@ -243,10 +343,12 @@ def process(
         video_duration=vid_duration,
         warnings=run_warnings,
         shadow_scoring=shadow_scoring,
+        moment_category_ranking=moment_category_report,
         run_id=run_id,
     )
     print(f"[+] Candidate debug saved: {debug_path}")
     _print_shadow_summary(shadow_scoring)
+    _print_category_summary(moment_category_report)
 
     if not selected:
         print("[!] No high-quality clips found.")
@@ -307,6 +409,28 @@ def process(
                     m["selection_quality_score"] = keep_selection_quality
                 words = final_eval["words"]
                 start, end = int(m["start"]), int(m["end"])
+        m["audio_source"] = {
+            "mode": "auto",
+            "selected_stream": final_stream,
+            "selected_reason": stream_selection.get("selected_reason"),
+            "selected_confidence": stream_selection.get("confidence"),
+            "runner_up_stream": stream_selection.get("runner_up_stream"),
+            "stream_count": len(source_audio_streams),
+            "render_audio": "all_source_streams_mixed",
+            "alternate_stream_retry": True,
+            "stream_selection": {
+                "schema_version": stream_selection.get("schema_version", 1),
+                "status": stream_selection.get("status"),
+                "mode": stream_selection.get("mode", "diagnostic_v2"),
+                "selected_stream": final_stream,
+                "selected_title": stream_selection.get("selected_title"),
+                "selected_reason": stream_selection.get("selected_reason"),
+                "runner_up_stream": stream_selection.get("runner_up_stream"),
+                "runner_up_title": stream_selection.get("runner_up_title"),
+                "confidence": stream_selection.get("confidence"),
+            },
+        }
+        m["stream_selection"] = m["audio_source"]["stream_selection"]
 
         # 3a. compute crop params for 9:16
         crop_params = None
@@ -361,11 +485,21 @@ def process(
                     "learned_score": item.get("shadow_scoring", {}).get("learned_quality_score"),
                     "learned_quality_score": item.get("shadow_scoring", {}).get("learned_quality_score"),
                     "learned_adjustment": item.get("shadow_scoring", {}).get("learned_adjustment"),
+                    "moment_category_quality_score": item.get("moment_category_scoring", {}).get("moment_category_quality_score"),
+                    "moment_category_ranking_enabled": item.get("moment_category_scoring", {}).get("ranking_enabled"),
+                    "moment_category_adjustment": item.get("moment_category_scoring", {}).get("category_adjustment"),
+                    "moment_category_selection_delta": item.get("moment_category_scoring", {}).get("selection_delta", ""),
+                    "moment_category_rank_delta": item.get("moment_category_scoring", {}).get("rank_delta"),
+                    "moment_category_scoring": item.get("moment_category_scoring") or m.get("moment_category_scoring"),
+                    "primary_category": m.get("primary_category") or item.get("primary_category"),
+                    "moment_categories": m.get("moment_categories") or item.get("moment_categories"),
                     "rank_delta": item.get("shadow_scoring", {}).get("rank_delta"),
                     "selection_delta": item.get("shadow_scoring", {}).get("selection_delta", ""),
                     "quality_rank": m.get("quality_rank"),
                     "word_count": m.get("word_count"),
                     "speech_stream": m.get("speech_stream"),
+                    "audio_source": m.get("audio_source"),
+                    "stream_selection": m.get("stream_selection"),
                     "subtitle_generated": m.get("subtitle_generated"),
                     "subtitles_burned": m.get("subtitles_burned"),
                     "subtitle_placement": m.get("subtitle_placement"),
@@ -392,6 +526,7 @@ def process(
         final_clips=final_clip_debug,
         warnings=run_warnings,
         shadow_scoring=shadow_scoring,
+        moment_category_ranking=moment_category_report,
         run_id=run_id,
     )
     print(f"[+] Run debug saved: {run_debug_path}")
@@ -418,7 +553,8 @@ def process(
 
 
 def _try_alternate_audio_streams(video_path, start, end, wav, model, language,
-                                 preferred_stream=None, return_stream=False):
+                                 preferred_stream=None, return_stream=False,
+                                 subtitle_policy="creator"):
     streams = get_audio_streams(video_path)
     if len(streams) < 2:
         return ([], None) if return_stream else []
@@ -436,6 +572,23 @@ def _try_alternate_audio_streams(video_path, start, end, wav, model, language,
             continue
         words = transcribe_clip(wav, model_size=model, language=language)
         if words:
+            profile = profile_words_for_stream(
+                ordinal,
+                title,
+                words,
+                wav_path=wav,
+                sampled_seconds=max(0.0, float(end) - float(start)),
+            )
+            acceptance = should_accept_alternate_stream(
+                profile,
+                subtitle_policy=subtitle_policy,
+            )
+            if not acceptance.get("accepted"):
+                print(
+                    "[audio] Rejected alternate stream "
+                    f"0:a:{ordinal} ({title}): {acceptance.get('reason')}"
+                )
+                continue
             print(f"[audio] Using 0:a:{ordinal} ({title}) for subtitles")
             return (words, ordinal) if return_stream else words
     return ([], None) if return_stream else []
@@ -461,6 +614,7 @@ def main():
     p.add_argument("--subtitle-x",     type=int, default=SUBTITLE_PLACEMENT["x_pct"], help="caption box horizontal position percent")
     p.add_argument("--subtitle-y",     type=int, default=SUBTITLE_PLACEMENT["y_pct"], help="caption box vertical position percent")
     p.add_argument("--subtitle-width", type=int, default=SUBTITLE_PLACEMENT["width_pct"], help="caption box width percent")
+    p.add_argument("--moment-category-ranking", action="store_true", help="opt in to capped deterministic moment-label ranking")
 
     a = p.parse_args()
     process(
@@ -478,8 +632,10 @@ def main():
             "y_pct": a.subtitle_y,
             "width_pct": a.subtitle_width,
         },
+        moment_category_ranking=a.moment_category_ranking,
     )
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

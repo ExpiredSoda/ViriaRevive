@@ -3,6 +3,7 @@
 For no-console launch, double-click app.pyw instead."""
 
 import sys
+import multiprocessing
 from windows_subprocess import hide_child_console_windows
 
 hide_child_console_windows()
@@ -84,4 +85,5 @@ def _force_quit(window, tray):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

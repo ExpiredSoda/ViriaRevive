@@ -8,6 +8,7 @@ const state = {
     moments: [],
     feedbackByClipId: {},
     personalization: { schema_version: 1, events: [], clips: {} },
+    voiceProfile: { enabled: false, enrolled: false, sample_count: 0 },
     overallPercent: 0,
     ytConnected: false,
     channels: [],
@@ -24,22 +25,55 @@ const state = {
     // Library
     libraryClips: [],
     libraryView: 'grid',
+    resultsMomentFilter: 'all',
+    libraryMomentFilter: 'all',
     // Preview
     previewClipIdx: -1,
+    previewLibraryClip: null,
     // Delete
     pendingDeleteIdx: -1,
     pendingDeleteFilename: null,
     pendingDeleteSource: null, // 'results' | 'library' | 'preview'
+    pendingFeedback: null,
     // Batch queue
-    batchQueue: [],       // [{url, status: 'pending'|'active'|'done'|'error', label}]
+    batchQueue: [],       // [{url, status: 'pending'|'active'|'done'|'error', label, audioSource, subtitleStyle}]
     batchIndex: -1,       // current index being processed (-1 = not running)
     batchSettings: null,  // settings snapshot for the batch run
+    batchProgressContext: null,
+    wizardAudioProbe: null,
+    wizardSavedAudioSource: null,
+    wizardProcessingDepth: 'balanced',
+    progressStartedAt: 0,
 };
 
 const DEFAULT_CATEGORY_ID = '20'; // Gaming
 const DEFAULT_UPLOAD_TAGS = 'shorts, gaming, gameplay, gaming shorts, youtube shorts, viral shorts, stream highlights, streamer moments, live stream clips, funny gaming moments, scary gaming moments, horror gaming, scary game, creepy game, survival horror, horror shorts, jump scare, chase scene, panic moment, gaming reaction, lets play, playthrough, vertical gaming, game clips';
 const SCHEDULE_BUFFER_MINUTES = 10;
+const DETECTION_PREFERENCES = new Set(['auto', 'quality', 'quantity']);
+const PROCESSING_DEPTHS = new Set(['fast', 'balanced', 'deep']);
+const FEEDBACK_REASON_PRESETS = {
+    like: ['Strong hook', 'Funny moment', 'Good pacing', 'Useful explanation', 'Good subtitles'],
+    dislike: ['Weak moment', 'Wrong audio', 'Bad timing', 'Too slow', 'Bad subtitles'],
+    favorite: ['Post this', 'Best moment', 'Creator voice', 'Strong payoff', 'Replayable'],
+};
 let _lastOllamaStatus = null;
+let _subtitlePreviewUrl = '';
+let _settingsPersistTimer = null;
+
+function persistSettingsAsync(settings, { quiet = false } = {}) {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.save_settings) return;
+    clearTimeout(_settingsPersistTimer);
+    const payload = { ...(settings || {}) };
+    _settingsPersistTimer = setTimeout(async () => {
+        try {
+            const result = await pywebview.api.save_settings(payload);
+            if (result && result.error && !quiet) toast('Settings could not be saved', 'error');
+        } catch (e) {
+            if (!quiet) toast('Settings could not be saved', 'error');
+            console.error('Save settings failed:', e);
+        }
+    }, 250);
+}
 
 function scheduledLocalDate(item) {
     const date = String(item?.date || '').trim();
@@ -47,6 +81,47 @@ function scheduledLocalDate(item) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) return null;
     const d = new Date(`${date}T${time}:00`);
     return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function normalizeDetectionPreference(value) {
+    const pref = String(value || 'auto').trim().toLowerCase();
+    return DETECTION_PREFERENCES.has(pref) ? pref : 'auto';
+}
+
+function normalizeProcessingDepth(value) {
+    const depth = String(value || 'balanced').trim().toLowerCase().replace('_', '-');
+    if (depth === 'normal' || depth === 'default') return 'balanced';
+    if (depth === 'deep-analysis' || depth === 'deep analysis') return 'deep';
+    return PROCESSING_DEPTHS.has(depth) ? depth : 'balanced';
+}
+
+function pruneCompletedBatchItemsForNewRun() {
+    if (state.processing) return;
+    const before = state.batchQueue.length;
+    state.batchQueue = state.batchQueue.filter(q => q.status === 'pending');
+    if (state.batchQueue.length !== before) renderBatchQueue();
+}
+
+function currentBatchSourceCount() {
+    return state.batchQueue.filter(q => q.status === 'pending' || q.status === 'active' || q.status === 'done').length;
+}
+
+function sourceDisplayLabel(source) {
+    const text = String(source || '').trim();
+    if (!text) return 'Source';
+    if (/^https?:\/\//i.test(text)) {
+        try {
+            const url = new URL(text);
+            const host = url.hostname.replace(/^www\./i, '');
+            const path = url.pathname && url.pathname !== '/' ? url.pathname.replace(/\/$/, '') : '';
+            return `${host}${path}`.slice(0, 120);
+        } catch (_) {
+            return text.length > 120 ? text.slice(0, 117) + '...' : text;
+        }
+    }
+    const slash = Math.max(text.lastIndexOf('\\'), text.lastIndexOf('/'));
+    const name = slash >= 0 ? text.slice(slash + 1) : text;
+    return name || text;
 }
 
 function scheduledPublishFields(item) {
@@ -318,6 +393,31 @@ function _feedbackActive(clip, eventType) {
     return false;
 }
 
+function _feedbackReasonFor(latest, eventType) {
+    const reasons = latest && typeof latest.reasons === 'object' && latest.reasons ? latest.reasons : null;
+    if (reasons) {
+        const reason = String(reasons[eventType] || '').trim();
+        if (reason) return reason;
+        if (Object.keys(reasons).length) return '';
+    }
+    const latestType = String(latest?.event_type || '').trim().toLowerCase();
+    if (latestType && latestType !== eventType) return '';
+    return String(latest?.reason || '').trim();
+}
+
+function feedbackStatusLabel(latest = {}) {
+    const items = [
+        ['like', 'Liked'],
+        ['dislike', 'Disliked'],
+        ['favorite', 'Favorite'],
+    ].filter(([eventType]) => latest[eventType]);
+    if (!items.length) return 'No feedback yet';
+    return items.map(([eventType, label]) => {
+        const reason = _feedbackReasonFor(latest, eventType);
+        return reason ? `${label} - ${reason}` : label;
+    }).join(' / ');
+}
+
 function renderFeedbackState(container, clip) {
     if (!container || !clip || !clip.clip_id) return;
     container.querySelectorAll('.feedback-btn').forEach(btn => {
@@ -332,17 +432,204 @@ function renderCardFeedbackState(card, clip) {
     renderFeedbackState(card, clip);
 }
 
+function prettyMomentLabel(value) {
+    const map = {
+        high_energy: 'High energy',
+        death_or_failure: 'Death / fail',
+        tutorial_or_explainer: 'Explainer',
+        commentary_or_review: 'Commentary',
+        lore_or_story: 'Lore / story',
+        atmosphere_or_visual: 'Atmosphere',
+        low_value: 'Low value',
+        chase_panic: 'Chase panic',
+        combat_action: 'Combat',
+        funny_failure: 'Funny fail',
+        death_scene: 'Death scene',
+        tutorial_tip: 'Tutorial tip',
+        lore_story: 'Lore',
+        scenic_atmosphere: 'Scenic',
+        creator_reaction: 'Reaction',
+        game_narration: 'Game narration',
+        navigation_setup: 'Setup',
+    };
+    const key = String(value || '').trim().toLowerCase().replace(/[-\s]+/g, '_');
+    if (!key) return '';
+    return map[key] || key.split('_').filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function aiMomentForClip(clip = {}, moment = {}) {
+    const categories = clip.moment_categories || moment.moment_categories || {};
+    const ai = clip.ai_moment_classification || moment.ai_moment_classification || categories.ai || {};
+    const primary = ai.primary_category || clip.primary_category || moment.primary_category || categories.primary || '';
+    if (!primary) return null;
+    const fineLabels = Array.isArray(ai.fine_labels) ? ai.fine_labels.filter(Boolean).slice(0, 2) : [];
+    const isOllama = ai.status === 'ok' && ai.provider === 'ollama';
+    const isCategory = !ai.status;
+    const source = isCategory ? 'Category' : (isOllama ? 'AI' : 'Local');
+    const sourceType = isCategory ? 'category' : (isOllama ? 'ai' : 'local');
+    const confidence = Number(ai.confidence);
+    const confidenceText = Number.isFinite(confidence) ? ` (${Math.round(confidence * 100)}%)` : '';
+    const status = ai.status || 'deterministic';
+    const titleParts = [
+        `${source} moment label: ${prettyMomentLabel(primary)}${confidenceText}`,
+        status ? `status: ${status}` : '',
+        ai.provider ? `provider: ${ai.provider}` : '',
+        ai.fallback_used ? 'using local fallback' : '',
+        ai.reason || '',
+    ].filter(Boolean);
+    return {
+        source,
+        primary,
+        primaryLabel: prettyMomentLabel(primary),
+        fineLabels: fineLabels.map(prettyMomentLabel).filter(Boolean),
+        isOllama,
+        isCategory,
+        sourceType,
+        status,
+        title: titleParts.join(' - '),
+    };
+}
+
+function momentFilterKeyForClip(clip = {}, moment = {}) {
+    const info = aiMomentForClip(clip, moment);
+    return info?.primary || 'unlabeled';
+}
+
+function clipMatchesMomentFilter(clip = {}, moment = {}, filter = 'all') {
+    const key = String(filter || 'all');
+    if (key === 'all') return true;
+    return momentFilterKeyForClip(clip, moment) === key;
+}
+
+function normalizeAvailableMomentFilter(clips, momentForClip, activeFilter) {
+    const filter = String(activeFilter || 'all');
+    if (filter === 'all') return 'all';
+    const hasMatch = (clips || []).some((clip, index) =>
+        clipMatchesMomentFilter(clip, momentForClip ? momentForClip(clip, index) : {}, filter)
+    );
+    return hasMatch ? filter : 'all';
+}
+
+function renderMomentFilterBar(containerId, clips, momentForClip, activeFilter, onSelect) {
+    const el = document.getElementById(containerId);
+    if (!el) return;
+    const rows = (clips || []).map((clip, index) => ({
+        clip,
+        moment: momentForClip ? (momentForClip(clip, index) || {}) : {},
+    }));
+    const counts = new Map();
+    let labeled = 0;
+    let aiCount = 0;
+    let localCount = 0;
+    let categoryCount = 0;
+    rows.forEach(({ clip, moment }) => {
+        const key = momentFilterKeyForClip(clip, moment);
+        counts.set(key, (counts.get(key) || 0) + 1);
+        const info = aiMomentForClip(clip, moment);
+        if (info && key !== 'unlabeled') {
+            labeled += 1;
+            if (info.isOllama) aiCount += 1;
+            else if (info.isCategory) categoryCount += 1;
+            else localCount += 1;
+        }
+    });
+    const active = String(activeFilter || 'all');
+    if (!rows.length || (!labeled && active === 'all')) {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+        return;
+    }
+    const categoryOrder = [
+        'high_energy',
+        'death_or_failure',
+        'tutorial_or_explainer',
+        'commentary_or_review',
+        'lore_or_story',
+        'atmosphere_or_visual',
+        'low_value',
+        'unlabeled',
+    ];
+    const keys = Array.from(counts.keys()).sort((a, b) => {
+        const ai = categoryOrder.indexOf(a);
+        const bi = categoryOrder.indexOf(b);
+        if (ai !== -1 || bi !== -1) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+        return prettyMomentLabel(a).localeCompare(prettyMomentLabel(b));
+    });
+    const buttons = [
+        { key: 'all', label: 'All', count: rows.length },
+        ...keys.map(key => ({
+            key,
+            label: key === 'unlabeled' ? 'Unlabeled' : prettyMomentLabel(key),
+            count: counts.get(key) || 0,
+        })),
+    ];
+    const sourceParts = [];
+    if (aiCount) sourceParts.push(`${aiCount} AI`);
+    if (localCount) sourceParts.push(`${localCount} local`);
+    if (categoryCount) sourceParts.push(`${categoryCount} category`);
+    el.classList.remove('hidden');
+    el.innerHTML = `
+        <div class="moment-filter-buttons">
+            ${buttons.map(btn => `
+                <button type="button" class="moment-filter-btn${active === btn.key ? ' active' : ''}" data-filter="${escHtml(btn.key)}" aria-pressed="${active === btn.key ? 'true' : 'false'}">
+                    <span>${escHtml(btn.label)}</span>
+                    <strong>${btn.count}</strong>
+                </button>
+            `).join('')}
+        </div>
+        <span class="moment-filter-summary">${labeled ? `${labeled} labeled${sourceParts.length ? ` · ${sourceParts.join(' · ')}` : ''}` : 'No labels yet'}</span>
+    `;
+    el.querySelectorAll('.moment-filter-btn').forEach(btn => {
+        btn.addEventListener('click', () => onSelect(String(btn.dataset.filter || 'all')));
+    });
+}
+
+function momentLabelMarkup(clip = {}, moment = {}) {
+    const info = aiMomentForClip(clip, moment);
+    if (!info) return '';
+    const sourceClass = info.sourceType === 'ai' ? 'is-ai' : (info.sourceType === 'category' ? 'is-category' : 'is-local');
+    const fine = info.fineLabels.length
+        ? `<span class="moment-chip is-fine">${escHtml(info.fineLabels[0])}</span>`
+        : '';
+    return `
+        <div class="moment-label-row" title="${escHtml(info.title)}">
+            <span class="moment-chip ${sourceClass}">${escHtml(info.source)}: ${escHtml(info.primaryLabel)}</span>
+            ${fine}
+        </div>`;
+}
+
+function renderPreviewMomentLabel() {
+    const el = document.getElementById('preview-moment-label');
+    if (!el) return;
+    const clip = state.previewClipIdx >= 0 ? state.results[state.previewClipIdx] : state.previewLibraryClip;
+    const moment = state.previewClipIdx >= 0 ? (state.moments[state.previewClipIdx] || {}) : (clip || {});
+    const html = momentLabelMarkup(clip || {}, moment || {});
+    if (!html) {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+        return;
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = html;
+}
+
 function renderAllFeedbackStates() {
     document.querySelectorAll('.result-card').forEach(card => {
         const idx = Number(card.dataset.clipIdx);
         if (Number.isInteger(idx) && idx >= 0) renderCardFeedbackState(card, state.results[idx]);
     });
+    document.querySelectorAll('.library-item').forEach(item => {
+        const clipId = item.dataset.clipId || '';
+        const clip = state.libraryClips.find(c => c && c.clip_id === clipId);
+        if (clip) renderCardFeedbackState(item, clip);
+    });
 }
 
 function renderPreviewFeedbackState() {
     const panel = document.getElementById('preview-feedback');
+    renderPreviewMomentLabel();
     if (!panel) return;
-    const clip = state.previewClipIdx >= 0 ? state.results[state.previewClipIdx] : null;
+    const clip = state.previewClipIdx >= 0 ? state.results[state.previewClipIdx] : state.previewLibraryClip;
     if (!clip || !clip.clip_id) {
         panel.classList.add('hidden');
         return;
@@ -352,46 +639,251 @@ function renderPreviewFeedbackState() {
     const latest = _feedbackLatest(clip);
     const status = document.getElementById('preview-feedback-status');
     if (status) {
-        const flags = [];
-        if (latest.like) flags.push('Liked');
-        if (latest.dislike) flags.push('Disliked');
-        if (latest.favorite) flags.push('Favorite');
-        const reason = latest.reason ? ` - ${latest.reason}` : '';
-        status.textContent = flags.length ? `${flags.join(' / ')}${reason}` : 'No feedback yet';
+        status.textContent = feedbackStatusLabel(latest);
+    }
+}
+
+function renderVoiceProfileStatus(voice = {}) {
+    state.voiceProfile = voice || { enabled: false, enrolled: false, sample_count: 0 };
+    const pill = document.getElementById('voice-profile-enabled');
+    const sampleEl = document.getElementById('voice-profile-samples');
+    const sizeEl = document.getElementById('voice-profile-size');
+    const updatedEl = document.getElementById('voice-profile-updated');
+    const rankingEl = document.getElementById('voice-profile-ranking');
+    const guidanceEl = document.getElementById('voice-profile-guidance');
+    const toggleBtn = document.getElementById('voice-profile-toggle-btn');
+    const rankingBtn = document.getElementById('voice-profile-ranking-toggle-btn');
+    const enabled = Boolean(state.voiceProfile.enabled);
+    const enrolled = Boolean(state.voiceProfile.enrolled);
+    const rankingEnabled = Boolean(state.voiceProfile.ranking_enabled);
+    const rankingActive = Boolean(state.voiceProfile.ranking_active);
+    const influenceState = String(state.voiceProfile.influence_state || '').trim();
+    if (pill) {
+        pill.textContent = state.voiceProfile.status_label || (enabled && enrolled ? 'Ready' : (enabled ? 'Needs samples' : 'Off'));
+        pill.classList.toggle('is-active', enrolled || rankingActive);
+        pill.classList.toggle('is-idle', !(enrolled || rankingActive));
+    }
+    if (sampleEl) sampleEl.textContent = formatNumber(state.voiceProfile.sample_count || 0);
+    if (sizeEl) sizeEl.textContent = formatBytes(state.voiceProfile.size_bytes || 0);
+    if (updatedEl) {
+        updatedEl.textContent = formatLearningTimestamp(state.voiceProfile.updated_at || '');
+        if (state.voiceProfile.updated_at) updatedEl.title = state.voiceProfile.updated_at;
+        else updatedEl.removeAttribute('title');
+    }
+    if (rankingEl) {
+        let rankingLabel = 'Off';
+        if (rankingActive) rankingLabel = 'Active';
+        else if ((influenceState === 'needs_samples' || influenceState === 'needs_more_samples') && rankingEnabled) rankingLabel = 'Needs samples';
+        else if (influenceState === 'ready_waiting_for_run' || rankingEnabled) rankingLabel = 'On';
+        rankingEl.textContent = rankingLabel;
+        rankingEl.title = state.voiceProfile.guidance || (rankingEnabled
+            ? `Max nudge ${state.voiceProfile.ranking_cap_label || '+/-0.025'}`
+            : 'Voice ranking is off');
+    }
+    if (guidanceEl) guidanceEl.textContent = state.voiceProfile.guidance || 'Enable the profile, then build it from clips with clear creator commentary.';
+    if (toggleBtn) toggleBtn.textContent = enabled ? 'Disable Voice Profile' : 'Enable Voice Profile';
+    if (rankingBtn) rankingBtn.textContent = rankingEnabled ? 'Stop Voice Ranking' : 'Use Voice In Ranking';
+}
+
+function formatDurationShort(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value)) return 'Never';
+    if (value <= 0) return '0s';
+    if (value < 60) return `${Math.round(value)}s`;
+    const mins = Math.round(value / 60);
+    if (mins < 90) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    const rem = mins % 60;
+    return rem ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+function analysisStatusLabel(enabled, depthOverride, status = {}) {
+    if (status && status.label) return status.label;
+    if (depthOverride === true) return 'On by depth';
+    if (depthOverride === false) return 'Inactive in Fast';
+    return enabled ? 'On' : 'Off';
+}
+
+function renderLocalAnalysisStatus(analysis = {}, history = {}) {
+    const depth = normalizeProcessingDepth(analysis.processing_depth || state.settings?.processing_depth || 'balanced');
+    const depthEl = document.getElementById('analysis-depth');
+    const depthLabel = depth === 'deep' ? 'Deep' : depth.charAt(0).toUpperCase() + depth.slice(1);
+    if (depthEl) {
+        depthEl.textContent = depthLabel;
+        depthEl.classList.toggle('is-active', depth !== 'fast');
+        depthEl.classList.toggle('is-idle', depth === 'fast');
+    }
+    const controls = analysis.depth_preset_controls || {};
+    const featureStatuses = analysis.feature_statuses || {};
+    const rows = [
+        ['analysis-scene', featureStatuses.scene_detection?.effective, featureStatuses.scene_detection?.depth_override, 'Scene detection is controlled by Processing Depth.', featureStatuses.scene_detection],
+        ['analysis-visual', analysis.visual_analysis_enabled, controls.visual_analysis, 'Visual frame analysis enriches local moment labels.', featureStatuses.visual_analysis],
+        ['analysis-ai-labels', analysis.ai_moment_labels_enabled, controls.ai_moment_labels, 'AI labels explain moments and can improve title/metadata context.', featureStatuses.ai_moment_labels],
+        ['analysis-ranking', analysis.moment_label_ranking_enabled, controls.moment_label_ranking, 'Moment-label ranking can nudge close-call candidate selection.', featureStatuses.moment_label_ranking],
+        ['analysis-voice', analysis.voice_profile_ranking_enabled, controls.voice_profile_ranking, 'Voice ranking is opt-in and needs an enrolled local voice profile plus candidate voice scores.', featureStatuses.voice_profile_ranking],
+    ];
+    rows.forEach(([id, enabled, override, title, status]) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const inactive = status?.inactive_reason || override === false;
+        el.textContent = analysisStatusLabel(Boolean(enabled), override, status);
+        el.title = status?.reason || title;
+        el.classList.toggle('is-idle', Boolean(inactive) || el.textContent === 'Off');
+        el.classList.toggle('is-active', !inactive && !['Off', 'Inactive in Fast', 'Needs samples'].includes(el.textContent));
+    });
+    const capEl = document.getElementById('analysis-ranking-cap');
+    const caps = analysis.selection_caps || {};
+    if (capEl) capEl.textContent = formatLearningCap(caps.moment_label_ranking ?? 0.02);
+
+    const runsEl = document.getElementById('processing-history-runs');
+    const lastEl = document.getElementById('processing-history-last');
+    const errorEl = document.getElementById('processing-history-error');
+    const last = history.last_run || null;
+    if (runsEl) runsEl.textContent = formatNumber(history.run_count || 0);
+    if (lastEl) {
+        lastEl.textContent = last ? formatDurationShort(last.elapsed_seconds) : 'Never';
+        if (last?.finished_at_utc) lastEl.title = last.finished_at_utc;
+        else lastEl.removeAttribute('title');
+    }
+    if (errorEl) {
+        if (last && last.estimate_error_seconds !== null && last.estimate_error_seconds !== undefined) {
+            const error = Number(last.estimate_error_seconds || 0);
+            errorEl.textContent = `${error >= 0 ? '+' : ''}${formatDurationShort(Math.abs(error))}`;
+            errorEl.title = error >= 0 ? 'Actual run took longer than estimated' : 'Actual run was faster than estimated';
+        } else {
+            errorEl.textContent = history.run_count ? 'Learning' : 'No data';
+            errorEl.removeAttribute('title');
+        }
     }
 }
 
 function recordPreviewFeedback(eventType) {
-    if (state.previewClipIdx < 0) return;
-    recordClipFeedback(state.previewClipIdx, eventType);
+    if (state.previewClipIdx >= 0) {
+        recordClipFeedback(state.previewClipIdx, eventType);
+        return;
+    }
+    if (state.previewLibraryClip) recordLibraryFeedback(state.previewLibraryClip, eventType);
 }
 
 async function recordClipFeedback(clipIdx, eventType) {
     const clip = state.results[clipIdx];
+    return recordFeedbackForClip(clip, clipIdx, eventType);
+}
+
+async function recordLibraryFeedback(clip, eventType) {
+    return recordFeedbackForClip(clip, -1, eventType);
+}
+
+async function recordFeedbackForClip(clip, clipIdx, eventType) {
     if (!clip || !clip.clip_id) return toast('Clip identity is not ready yet', 'warning');
     const active = !_feedbackActive(clip, eventType);
-    const label = active ? eventType : `remove ${eventType}`;
-    let reason = window.prompt(`Reason for ${label}?`, '');
-    if (reason === null) reason = '';
+    const payload = {
+        ...clipIdentityFields(clip, clipIdx),
+        index: clipIdx,
+        event_type: eventType,
+        active,
+        reason: '',
+    };
+    if (active) {
+        openFeedbackModal(payload, eventType);
+        return;
+    }
+    return submitFeedbackPayload(payload, eventType, active);
+}
 
+async function submitFeedbackPayload(payload, eventType, active) {
     try {
-        const payload = {
-            ...clipIdentityFields(clip, clipIdx),
-            index: clipIdx,
-            event_type: eventType,
-            active,
-            reason,
-        };
         const r = await pywebview.api.record_feedback(payload);
         if (r.error) return toast(r.error, 'error');
-        state.feedbackByClipId[clip.clip_id] = r.clip;
+        if (payload.clip_id) state.feedbackByClipId[payload.clip_id] = r.clip;
         renderAllFeedbackStates();
         renderPreviewFeedbackState();
         refreshDataPrivacyCard(false);
         toast(active ? `Marked ${eventType}` : `Removed ${eventType}`, 'success');
+        maybeShowVoiceProfileNudge(r.voice_profile_nudge);
     } catch (e) {
         toast('Could not save feedback', 'error');
     }
+}
+
+function maybeShowVoiceProfileNudge(nudge) {
+    if (!nudge || !nudge.show) return;
+    toast(nudge.message || 'This clip can help build your local Creator Voice Profile.', 'info');
+}
+
+function feedbackEventLabel(eventType) {
+    const labels = {
+        like: 'Like',
+        dislike: 'Dislike',
+        favorite: 'Favorite',
+    };
+    return labels[eventType] || 'Feedback';
+}
+
+function openFeedbackModal(payload, eventType) {
+    state.pendingFeedback = { payload, eventType };
+    const title = document.getElementById('feedback-modal-title');
+    const copy = document.getElementById('feedback-modal-copy');
+    const note = document.getElementById('feedback-reason-note');
+    const chips = document.getElementById('feedback-reason-chips');
+    const label = feedbackEventLabel(eventType);
+    if (title) title.textContent = `${label} Feedback`;
+    if (copy) copy.textContent = eventType === 'dislike'
+        ? 'Pick what was off so future clips can avoid the same pattern.'
+        : 'Pick what worked so future clips can learn from this moment.';
+    if (note) note.value = '';
+    if (chips) {
+        chips.innerHTML = '';
+        (FEEDBACK_REASON_PRESETS[eventType] || FEEDBACK_REASON_PRESETS.like).forEach(reason => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'feedback-reason-chip';
+            btn.textContent = reason;
+            btn.addEventListener('click', () => btn.classList.toggle('active'));
+            chips.appendChild(btn);
+        });
+    }
+    showModal('feedback-modal');
+    setTimeout(() => chips?.querySelector('.feedback-reason-chip')?.focus(), 30);
+}
+
+function closeFeedbackModal() {
+    state.pendingFeedback = null;
+    closeModal('feedback-modal');
+}
+
+async function submitFeedbackModal() {
+    const pending = state.pendingFeedback;
+    if (!pending || !pending.payload) {
+        closeModal('feedback-modal');
+        return;
+    }
+    const selected = Array.from(document.querySelectorAll('#feedback-reason-chips .feedback-reason-chip.active'))
+        .map(btn => btn.textContent.trim())
+        .filter(Boolean);
+    const note = String(document.getElementById('feedback-reason-note')?.value || '').trim();
+    pending.payload.reason = [...selected, note].filter(Boolean).join('; ');
+    state.pendingFeedback = null;
+    closeModal('feedback-modal');
+    await submitFeedbackPayload(pending.payload, pending.eventType, true);
+}
+
+function setDataPrivacyTab(tabName = 'overview') {
+    const selected = String(tabName || 'overview');
+    document.querySelectorAll('[data-privacy-tab]').forEach(btn => {
+        const active = btn.dataset.privacyTab === selected;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    document.querySelectorAll('[data-privacy-panel]').forEach(panel => {
+        panel.classList.toggle('active', panel.dataset.privacyPanel === selected);
+    });
+}
+
+async function openDataPrivacyModal() {
+    setDataPrivacyTab('overview');
+    await refreshDataPrivacyCard(false);
+    showModal('data-privacy-modal');
 }
 
 async function refreshDataPrivacyCard(showToast = true) {
@@ -400,6 +892,9 @@ async function refreshDataPrivacyCard(showToast = true) {
         const r = await pywebview.api.get_data_privacy_summary();
         const p = r.personalization || {};
         const learning = r.learning || p.learning || {};
+        const voice = r.voice_profile || {};
+        const analysis = r.local_analysis || {};
+        const processingHistory = r.processing_history || {};
         const eventEl = document.getElementById('privacy-event-count');
         const clipEl = document.getElementById('privacy-clip-count');
         const sizeEl = document.getElementById('privacy-data-size');
@@ -423,9 +918,69 @@ async function refreshDataPrivacyCard(showToast = true) {
             if (learning.last_feedback_time || p.latest_timestamp) lastFeedbackEl.title = learning.last_feedback_time || p.latest_timestamp;
             else lastFeedbackEl.removeAttribute('title');
         }
+        renderVoiceProfileStatus(voice);
+        renderLocalAnalysisStatus(analysis, processingHistory);
         if (showToast) toast('Data summary refreshed', 'success');
     } catch (_) {
         if (showToast) toast('Could not refresh data summary', 'error');
+    }
+}
+
+async function toggleVoiceProfileEnabled() {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.set_voice_profile_enabled) return;
+    const nextEnabled = !Boolean(state.voiceProfile?.enabled);
+    try {
+        const r = await pywebview.api.set_voice_profile_enabled(nextEnabled);
+        if (r.error) return toast(r.error, 'error');
+        renderVoiceProfileStatus(r.voice_profile || {});
+        toast(nextEnabled ? 'Voice profile enabled' : 'Voice profile disabled', 'success');
+    } catch (_) {
+        toast('Could not update voice profile', 'error');
+    }
+}
+
+async function toggleVoiceProfileRanking() {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.set_voice_profile_ranking_enabled) return;
+    const nextEnabled = !Boolean(state.voiceProfile?.ranking_enabled);
+    try {
+        const r = await pywebview.api.set_voice_profile_ranking_enabled(nextEnabled);
+        if (r.error) return toast(r.error, 'error');
+        state.settings = { ...(state.settings || {}), voice_profile_ranking: nextEnabled };
+        const voice = r.voice_profile || {};
+        renderVoiceProfileStatus(voice);
+        if (nextEnabled && !voice.enrolled) {
+            toast('Voice ranking saved. Build the profile before it can score eligible runs.', 'info');
+        } else {
+            toast(nextEnabled ? 'Voice ranking enabled' : 'Voice ranking disabled', 'success');
+        }
+    } catch (_) {
+        toast('Could not update voice ranking', 'error');
+    }
+}
+
+async function enrollVoiceProfile() {
+    if (!window.pywebview || !pywebview.api || !pywebview.api.enroll_voice_profile_from_current_clips) return;
+    try {
+        toast('Building and enabling local voice profile...', 'info');
+        const r = await pywebview.api.enroll_voice_profile_from_current_clips();
+        renderVoiceProfileStatus(r.voice_profile || {});
+        if (r.error) return toast(r.error, 'error');
+        const count = r.enrolled_samples || 0;
+        toast(`Voice profile updated from ${count} clip${count === 1 ? '' : 's'}`, 'success');
+    } catch (_) {
+        toast('Could not build voice profile', 'error');
+    }
+}
+
+async function resetVoiceProfile() {
+    if (!confirm('Reset the local creator voice profile? This removes the numeric profile and future voice-confidence scoring until you build it again.')) return;
+    try {
+        const r = await pywebview.api.reset_voice_profile();
+        if (r.error) return toast(r.error, 'error');
+        renderVoiceProfileStatus(r.voice_profile || {});
+        toast(r.backup ? 'Voice profile reset and backup created' : 'Voice profile reset', 'success');
+    } catch (_) {
+        toast('Could not reset voice profile', 'error');
     }
 }
 
@@ -610,12 +1165,12 @@ function updateOllamaActionButtons(status) {
 
     if (modelBtn) {
         modelBtn.disabled = !running;
-        modelBtn.textContent = modelReady ? 'Title Model Ready' : running ? 'Download Title Model' : 'Start Ollama First';
+        modelBtn.textContent = modelReady ? 'AI Model Ready' : running ? 'Download AI Model' : 'Start Ollama First';
         modelBtn.title = modelReady
             ? `${model} is installed; click to re-check`
             : running
-                ? `Download ${model} for AI titles`
-                : 'Start or install Ollama before downloading the title model';
+                ? `Download ${model} for AI titles, AI moment labels, and Deep Analysis AI ranking`
+                : 'Start or install Ollama before downloading the local AI model';
     }
 }
 
@@ -641,7 +1196,7 @@ async function refreshOllamaStatus() {
             pill.classList.add('ready');
             if (label) label.textContent = 'Ollama on';
             const version = status.version ? ` ${status.version}` : '';
-            pill.title = `Ollama${version} is running and ${status.model} is ready for AI titles`;
+            pill.title = `Ollama${version} is running and ${status.model} is ready for local AI features`;
             if (settingsState) settingsState.textContent = 'Ready';
             if (settingsDetail) settingsDetail.textContent = `${status.model}${version ? ` • ${version}` : ''}`;
             if (settingsDot) settingsDot.className = 'ollama-settings-dot ready';
@@ -656,7 +1211,7 @@ async function refreshOllamaStatus() {
         } else {
             pill.classList.add('offline');
             if (label) label.textContent = 'Ollama off';
-            pill.title = 'Ollama is not running; title generation will use the fallback';
+            pill.title = 'Ollama is not running; local AI labels and titles will use fallback paths';
             if (settingsState) settingsState.textContent = 'Not Running';
             if (settingsDetail) settingsDetail.textContent = `${status.model || 'qwen2.5:3b'} fallback active`;
             if (settingsDot) settingsDot.className = 'ollama-settings-dot offline';
@@ -723,23 +1278,23 @@ async function installOllamaWithPowerShell() {
 async function downloadOllamaModel() {
     try {
         if (_lastOllamaStatus && _lastOllamaStatus.model_ready) {
-            toast(`${_lastOllamaStatus.model} is already ready for AI titles`, 'success');
+            toast(`${_lastOllamaStatus.model} is already ready for local AI features`, 'success');
             return refreshOllamaStatus();
         }
         if (_lastOllamaStatus && !_lastOllamaStatus.running) {
-            toast('Start Ollama before downloading the title model', 'warning');
+            toast('Start Ollama before downloading the local AI model', 'warning');
             return refreshOllamaStatus();
         }
-        toast('Downloading title model with Ollama...', 'info');
+        toast('Downloading local AI model with Ollama...', 'info');
         const r = await pywebview.api.ensure_ollama_model();
         if (r.ready) {
-            toast(`${r.model} is ready for AI titles`, 'success');
+            toast(`${r.model} is ready for local AI features`, 'success');
         } else {
             toast('Ollama is not running yet', 'warning');
         }
         refreshOllamaStatus();
     } catch (_) {
-        toast('Could not download Ollama title model', 'error');
+        toast('Could not download Ollama AI model', 'error');
     }
 }
 
@@ -747,6 +1302,7 @@ async function downloadOllamaModel() {
 
 const _thumbCache = {};   // url → dataURL cache
 const _thumbQueue = [];   // pending thumbnail tasks
+const _thumbFailures = new Set();
 let _thumbActive = 0;
 const _THUMB_CONCURRENCY = 2;  // max simultaneous video decodes
 
@@ -755,6 +1311,10 @@ function generateThumbnail(videoUrl, targetEl, seekTime = 1.0) {
     // Check cache first — instant
     if (_thumbCache[videoUrl]) {
         _applyThumb(targetEl, _thumbCache[videoUrl]);
+        return;
+    }
+    if (_thumbFailures.has(videoUrl)) {
+        targetEl.classList.add('thumb-failed');
         return;
     }
     // Queue instead of firing immediately
@@ -780,14 +1340,30 @@ function _decodeThumbnail(videoUrl, targetEl, seekTime) {
     vid.muted = true;
     vid.preload = 'metadata';
     vid.playsInline = true;
+    let cleaned = false;
+    let seekPoints = [];
+    let seekIndex = 0;
+    let bestFrame = null;
+    let seekTimer = null;
 
-    const cleanup = () => { vid.src = ''; vid.load(); _thumbActive--; _processThumbQueue(); };
+    const clearSeekTimer = () => {
+        if (seekTimer) {
+            clearTimeout(seekTimer);
+            seekTimer = null;
+        }
+    };
 
-    vid.addEventListener('loadeddata', () => {
-        vid.currentTime = Math.min(seekTime, vid.duration * 0.5 || seekTime);
-    });
+    const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        clearSeekTimer();
+        vid.src = '';
+        vid.load();
+        _thumbActive = Math.max(0, _thumbActive - 1);
+        _processThumbQueue();
+    };
 
-    vid.addEventListener('seeked', () => {
+    const captureFrame = () => {
         try {
             const canvas = document.createElement('canvas');
             // Use smaller size for thumbnails — saves memory
@@ -797,15 +1373,105 @@ function _decodeThumbnail(videoUrl, targetEl, seekTime) {
             const ctx = canvas.getContext('2d');
             ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
             const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
-            _thumbCache[videoUrl] = dataUrl;
-            if (targetEl.isConnected) _applyThumb(targetEl, dataUrl);
-        } catch (e) { /* CORS or other error */ }
+            const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            let total = 0;
+            let totalSq = 0;
+            let samples = 0;
+            const stride = Math.max(4, Math.floor((canvas.width * canvas.height) / 1800)) * 4;
+            for (let i = 0; i < data.length; i += stride) {
+                const luma = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+                total += luma;
+                totalSq += luma * luma;
+                samples++;
+            }
+            const mean = samples ? total / samples : 0;
+            const variance = samples ? Math.max(0, totalSq / samples - mean * mean) : 0;
+            const contrast = Math.sqrt(variance);
+            return {
+                dataUrl,
+                score: mean + contrast * 0.55,
+                black: mean < 18 && contrast < 18,
+            };
+        } catch (e) {
+            return null;
+        }
+    };
+
+    const applyFrame = (frame) => {
+        _thumbCache[videoUrl] = frame.dataUrl;
+        if (targetEl.isConnected) _applyThumb(targetEl, frame.dataUrl);
         cleanup();
+    };
+
+    const seekNext = () => {
+        if (cleaned) return;
+        if (seekIndex >= seekPoints.length) {
+            if (bestFrame) applyFrame(bestFrame);
+            else {
+                _thumbFailures.add(videoUrl);
+                if (targetEl.isConnected) targetEl.classList.add('thumb-failed');
+                cleanup();
+            }
+            return;
+        }
+        const next = seekPoints[seekIndex++];
+        try {
+            vid.currentTime = next;
+            clearSeekTimer();
+            seekTimer = setTimeout(() => {
+                if (!cleaned) seekNext();
+            }, 2500);
+        } catch (_) {
+            seekNext();
+        }
+    };
+
+    vid.addEventListener('loadedmetadata', () => {
+        const duration = Number.isFinite(vid.duration) ? Math.max(0, vid.duration) : 0;
+        const rawPoints = [
+            seekTime,
+            duration * 0.12,
+            duration * 0.28,
+            duration * 0.5,
+            duration * 0.72,
+            Math.max(0, duration - 1.5),
+        ];
+        seekPoints = rawPoints
+            .filter(value => Number.isFinite(value) && value >= 0)
+            .map(value => Math.min(Math.max(0, value), Math.max(0, duration - 0.05)))
+            .filter((value, index, arr) => arr.findIndex(other => Math.abs(other - value) < 0.25) === index)
+            .slice(0, 6);
+        if (!seekPoints.length) seekPoints = [0];
+        seekNext();
     });
 
-    vid.addEventListener('error', cleanup);
+    vid.addEventListener('seeked', () => {
+        clearSeekTimer();
+        const frame = captureFrame();
+        if (frame) {
+            if (!bestFrame || frame.score > bestFrame.score) bestFrame = frame;
+            if (!frame.black || seekIndex >= seekPoints.length) {
+                applyFrame(frame.black && bestFrame ? bestFrame : frame);
+                return;
+            }
+        }
+        seekNext();
+    });
+
+    vid.addEventListener('error', () => {
+        clearSeekTimer();
+        _thumbFailures.add(videoUrl);
+        if (targetEl.isConnected) targetEl.classList.add('thumb-failed');
+        cleanup();
+    });
     // Timeout safety — don't block queue forever
-    setTimeout(() => { if (_thumbActive > 0 && vid.readyState < 2) cleanup(); }, 8000);
+    setTimeout(() => {
+        if (!cleaned && vid.readyState < 2) {
+            _thumbFailures.add(videoUrl);
+            if (targetEl.isConnected) targetEl.classList.add('thumb-failed');
+            cleanup();
+        }
+    }, 8000);
 
     vid.src = videoUrl;
 }
@@ -815,6 +1481,8 @@ function _applyThumb(el, dataUrl) {
     el.style.backgroundImage = `url(${dataUrl})`;
     el.style.backgroundSize = 'cover';
     el.style.backgroundPosition = 'center';
+    el.classList.remove('thumb-failed');
+    el.classList.add('thumb-ready');
     const placeholder = el.querySelector('.thumb-placeholder');
     if (placeholder) placeholder.style.opacity = '0';
 }
@@ -908,6 +1576,7 @@ window.addEventListener('pywebviewready', async () => {
             state.scheduled = normalizeScheduledMetadata(persisted.scheduled);
             persistSchedule();
         }
+        refreshSubtitlePreviewSnapshot(false);
         await loadPersonalization();
 
         const yt = await pywebview.api.youtube_status();
@@ -1009,6 +1678,14 @@ document.querySelectorAll('.style-pick-card').forEach(card => {
     });
 });
 
+document.querySelectorAll('input[name="wizard-audio-mode"]').forEach(input => {
+    input.addEventListener('change', updateWizardAudioModeState);
+});
+document.getElementById('wizard-audio-stream-select')?.addEventListener('change', updateWizardAudioModeState);
+document.getElementById('wizard-mixed-audio-subtitle-policy')?.addEventListener('change', () => {
+    state.wizardSavedAudioSource = wizardAudioSourceSettings();
+});
+
 document.querySelectorAll('#preview-feedback .feedback-btn').forEach(btn => {
     btn.addEventListener('click', event => {
         event.stopPropagation();
@@ -1036,6 +1713,7 @@ async function startProcessing() {
     if (state.processing) return;
 
     const urlInput = document.getElementById('url-input').value.trim();
+    pruneCompletedBatchItemsForNewRun();
 
     // Build queue from: existing batch queue items + url input
     if (!state.batchQueue.length && !urlInput) {
@@ -1067,12 +1745,29 @@ function openStylePicker() {
         card.classList.toggle('active', isActive);
         card.querySelector('input[type="radio"]').checked = isActive;
     });
+    const saved = loadLocal('wizard', {});
+    const savedDepth = normalizeProcessingDepth(saved.processingDepth || state.settings.processing_depth);
+    selectProcessingDepth(savedDepth);
+    setSelect(
+        'wizard-detection-preference',
+        normalizeDetectionPreference(getVal('set-detection-preference') || state.settings.detection_preference)
+    );
+    const autoClips = document.getElementById('set-auto-clips')?.checked || state.settings.num_clips === 'auto';
+    setWizardClipCount(autoClips ? 'auto' : String(getVal('set-num-clips') || state.settings.num_clips || 'auto'));
+    const clipDuration = getVal('set-clip-duration') || state.settings.clip_duration || 30;
+    const minGap = getVal('set-min-gap') || state.settings.min_gap || 15;
+    setVal('wizard-clip-duration', clipDuration);
+    setVal('wizard-min-gap', minGap);
+    const clipDurationLabel = document.getElementById('val-wizard-clip-duration');
+    const minGapLabel = document.getElementById('val-wizard-min-gap');
+    if (clipDurationLabel) clipDurationLabel.textContent = `${clipDuration}s`;
+    if (minGapLabel) minGapLabel.textContent = `${minGap}s`;
+    syncWizardEstimate();
     wizardNext(1);
     loadEffectsGrid();
     loadMusicList();
 
     // Restore previous wizard settings
-    const saved = loadLocal('wizard', {});
     if (saved.effect) {
         document.querySelectorAll('.effect-card').forEach(c => {
             c.classList.toggle('active', c.dataset.effect === saved.effect);
@@ -1086,11 +1781,77 @@ function openStylePicker() {
         const vol = document.getElementById('wizard-music-volume');
         if (vol) { vol.value = saved.musicVolume; document.getElementById('val-music-vol').textContent = saved.musicVolume + '%'; }
     }
+    restoreWizardAudioSettings(saved.audioSource || state.settings.audio_source || {});
+    loadWizardAudioSources();
 
     showModal('style-picker-modal');
 }
 
 /* ── Wizard Navigation ────────────────────────────────────────────────── */
+
+function selectProcessingDepth(depth) {
+    const normalized = normalizeProcessingDepth(depth);
+    state.wizardProcessingDepth = normalized;
+    document.querySelectorAll('.depth-preset').forEach(card => {
+        card.classList.toggle('active', card.dataset.depth === normalized);
+    });
+    syncWizardEstimate();
+}
+
+function syncWizardEstimate() {
+    const el = document.getElementById('wizard-estimate');
+    if (!el) return;
+    syncWizardDetectionPreferenceMode();
+    const depth = normalizeProcessingDepth(state.wizardProcessingDepth);
+    const duration = parseInt(getVal('wizard-clip-duration') || '30', 10);
+    const clips = getVal('wizard-num-clips') || 'auto';
+    const preference = effectiveWizardDetectionPreference();
+    const label = clips === 'auto'
+        ? `auto clip count, ${preference === 'quantity' ? 'quantity' : preference === 'quality' ? 'quality' : 'auto'} preference`
+        : `${clips} clips, quality selection`;
+    const base = {
+        fast: 'Fast skips or samples heavier checks so long recordings finish sooner.',
+        balanced: 'Balanced is the default: good ranking with sampled scene checks on long videos.',
+        deep: 'Deep Analysis inspects more moments and may take a while on 2-3 hour recordings.',
+    }[depth] || '';
+    el.textContent = `${base} Current target: ${label}, about ${duration}s each.`;
+}
+
+function effectiveWizardDetectionPreference() {
+    const clips = getVal('wizard-num-clips') || 'auto';
+    if (clips !== 'auto') return 'quality';
+    return normalizeDetectionPreference(getVal('wizard-detection-preference'));
+}
+
+function syncWizardDetectionPreferenceMode() {
+    const clips = getVal('wizard-num-clips') || 'auto';
+    const fixed = clips !== 'auto';
+    const select = document.getElementById('wizard-detection-preference');
+    const fixedValue = document.getElementById('wizard-detection-preference-fixed');
+    if (select) {
+        select.classList.toggle('hidden', fixed);
+        select.disabled = fixed;
+        if (fixed) select.value = 'quality';
+    }
+    if (fixedValue) {
+        fixedValue.classList.toggle('hidden', !fixed);
+        fixedValue.textContent = 'Quality';
+    }
+}
+
+function setWizardClipCount(value) {
+    const select = document.getElementById('wizard-num-clips');
+    if (!select) return;
+    const normalized = String(value || 'auto');
+    if (![...select.options].some(opt => opt.value === normalized)) {
+        const opt = document.createElement('option');
+        opt.value = normalized;
+        opt.textContent = normalized === 'auto' ? 'Auto' : normalized;
+        select.appendChild(opt);
+    }
+    select.value = normalized;
+    syncWizardDetectionPreferenceMode();
+}
 
 function wizardNext(step) {
     // Hide all wizard pages
@@ -1106,6 +1867,150 @@ function wizardNext(step) {
     // Update step lines
     const lines = document.querySelectorAll('.wizard-step-line');
     lines.forEach((l, i) => l.classList.toggle('completed', i < step - 1));
+}
+
+function firstQueuedSourceForAudioProbe() {
+    const active = state.batchQueue.find(q => q.status === 'pending' || q.status === 'active') || state.batchQueue[0];
+    return active?.url || document.getElementById('url-input')?.value.trim().split('\n').find(Boolean) || '';
+}
+
+function restoreWizardAudioSettings(audioSource = {}) {
+    state.wizardSavedAudioSource = audioSource || {};
+    const mode = audioSource.mode === 'stream' ? 'stream' : 'auto';
+    const stream = audioSource.stream ?? '';
+    const guard = audioSource.commentary_guard !== false;
+    const policy = ['creator', 'all', 'game'].includes(audioSource.subtitle_policy)
+        ? audioSource.subtitle_policy
+        : 'creator';
+    document.querySelectorAll('input[name="wizard-audio-mode"]').forEach(input => {
+        input.checked = input.value === mode;
+    });
+    const select = document.getElementById('wizard-audio-stream-select');
+    if (select && stream !== '') select.value = String(stream);
+    const guardEl = document.getElementById('wizard-mixed-audio-guard');
+    if (guardEl) guardEl.checked = guard;
+    const policyEl = document.getElementById('wizard-mixed-audio-subtitle-policy');
+    if (policyEl) policyEl.value = policy;
+    updateWizardAudioModeState();
+}
+
+function updateWizardAudioModeState() {
+    const mode = document.querySelector('input[name="wizard-audio-mode"]:checked')?.value || 'auto';
+    const select = document.getElementById('wizard-audio-stream-select');
+    const streamOption = document.getElementById('wizard-audio-stream-option');
+    const hasStreams = !!select && select.options.length > 0 && !!select.value;
+    if (select) select.disabled = mode !== 'stream' || !hasStreams;
+    if (streamOption) streamOption.classList.toggle('disabled', !hasStreams);
+    if (mode === 'stream' && !hasStreams) {
+        document.querySelector('input[name="wizard-audio-mode"][value="auto"]').checked = true;
+        if (select) select.disabled = true;
+    }
+}
+
+function renderWizardAudioSources(probe) {
+    state.wizardAudioProbe = probe || null;
+    const status = document.getElementById('wizard-audio-source-status');
+    const select = document.getElementById('wizard-audio-stream-select');
+    const streamOption = document.getElementById('wizard-audio-stream-option');
+    if (!status || !select) return;
+
+    const streams = probe?.streams || [];
+    select.innerHTML = '';
+    const multiSourceBatch = currentBatchSourceCount() > 1;
+    if (streams.length) {
+        streams.forEach(stream => {
+            const opt = document.createElement('option');
+            opt.value = String(stream.ordinal);
+            const role = stream.likely_role && stream.likely_role !== 'unknown' ? ` - ${stream.likely_role}` : '';
+            const details = [stream.codec, stream.layout || (stream.channels ? `${stream.channels}ch` : '')]
+                .filter(Boolean).join(', ');
+            const title = stream.title || `Track ${stream.ordinal + 1}`;
+            const roleLabel = stream.likely_role && stream.likely_role !== 'unknown'
+                ? stream.likely_role
+                : 'audio';
+            const shortTitle = title.length > 26 ? `${title.slice(0, 23)}...` : title;
+            opt.textContent = `Track ${stream.ordinal + 1} - ${roleLabel} - ${shortTitle}`;
+            opt.title = `Track ${stream.ordinal + 1}: ${title}${role}${details ? ` (${details})` : ''}`;
+            select.appendChild(opt);
+        });
+        const recommended = probe.recommended_stream;
+        const savedStream = state.wizardSavedAudioSource?.stream;
+        if (savedStream !== null && savedStream !== undefined && [...select.options].some(opt => opt.value === String(savedStream))) {
+            select.value = String(savedStream);
+        } else if (recommended !== null && recommended !== undefined) {
+            select.value = String(recommended);
+        }
+    } else {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = probe?.mode === 'deferred'
+            ? 'Tracks will appear after download'
+            : 'No separate tracks detected';
+        select.appendChild(opt);
+    }
+
+    const mode = probe?.mode || 'empty';
+    if (multiSourceBatch) {
+        status.textContent = 'Multiple sources are queued. Auto will inspect each video separately during processing.';
+    } else if (mode === 'multi') {
+        status.textContent = `${probe.message}. Auto will sample tracks, or choose the mic/commentary track here.`;
+    } else if (mode === 'single') {
+        status.textContent = 'One mixed audio track found. Auto will transcribe it and use your mixed-track subtitle preference below.';
+    } else if (mode === 'deferred') {
+        status.textContent = 'Online videos are checked after download. Auto is recommended unless you know the track layout will match your local recordings.';
+    } else {
+        status.textContent = probe?.message || 'Audio source details are not available yet.';
+        if (mode === 'error' && probe?.diagnostics?.status === 'timeout') {
+            status.textContent = 'Audio inspection timed out. Auto can still try again during processing.';
+        }
+    }
+
+    const canSelectStream = streams.length > 1 && !multiSourceBatch;
+    if (streamOption) streamOption.classList.toggle('disabled', !canSelectStream);
+    if (!canSelectStream) {
+        document.querySelector('input[name="wizard-audio-mode"][value="auto"]').checked = true;
+    }
+    updateWizardAudioModeState();
+}
+
+async function loadWizardAudioSources() {
+    const status = document.getElementById('wizard-audio-source-status');
+    if (status) status.textContent = 'Checking audio sources...';
+    const source = firstQueuedSourceForAudioProbe();
+    if (!window.pywebview || !pywebview.api || !pywebview.api.probe_audio_sources) {
+        renderWizardAudioSources({ mode: 'deferred', streams: [], message: 'Audio tracks will be checked during generation' });
+        return;
+    }
+    try {
+        const probe = await pywebview.api.probe_audio_sources(source);
+        renderWizardAudioSources(probe);
+    } catch (_) {
+        renderWizardAudioSources({ mode: 'error', streams: [], message: 'Could not inspect audio sources' });
+    }
+}
+
+function wizardAudioSourceSettings() {
+    const policyValue = document.getElementById('wizard-mixed-audio-subtitle-policy')?.value || 'creator';
+    const subtitlePolicy = ['creator', 'all', 'game'].includes(policyValue) ? policyValue : 'creator';
+    if (currentBatchSourceCount() > 1) {
+        return {
+            mode: 'auto',
+            stream: null,
+            commentary_guard: document.getElementById('wizard-mixed-audio-guard')?.checked !== false,
+            subtitle_policy: subtitlePolicy,
+        };
+    }
+    const mode = document.querySelector('input[name="wizard-audio-mode"]:checked')?.value || 'auto';
+    const select = document.getElementById('wizard-audio-stream-select');
+    const streamValue = select && select.value !== '' ? parseInt(select.value, 10) : null;
+    const stream = Number.isInteger(streamValue) ? streamValue : null;
+    const finalMode = mode === 'stream' && stream !== null ? 'stream' : 'auto';
+    return {
+        mode: finalMode,
+        stream: finalMode === 'stream' ? stream : null,
+        commentary_guard: document.getElementById('wizard-mixed-audio-guard')?.checked !== false,
+        subtitle_policy: subtitlePolicy,
+    };
 }
 
 async function loadEffectsGrid() {
@@ -1177,6 +2082,8 @@ document.getElementById('wizard-music-enabled')?.addEventListener('change', e =>
     document.getElementById('music-options').classList.toggle('hidden', !e.target.checked);
     if (e.target.checked) loadMusicList();
 });
+document.getElementById('wizard-num-clips')?.addEventListener('change', syncWizardEstimate);
+document.getElementById('wizard-detection-preference')?.addEventListener('change', syncWizardEstimate);
 
 async function openMusicFolder() {
     try { await pywebview.api.open_music_folder(); } catch (_) {}
@@ -1465,6 +2372,13 @@ function getMusicTrimValues() {
 
 function confirmStyleAndGenerate() {
     const pickedStyle = document.querySelector('input[name="picker-style"]:checked')?.value || 'tiktok';
+    const pickedProcessingDepth = normalizeProcessingDepth(state.wizardProcessingDepth);
+    const pickedNumClips = getVal('wizard-num-clips') || 'auto';
+    const pickedDetectionPreference = pickedNumClips === 'auto'
+        ? normalizeDetectionPreference(getVal('wizard-detection-preference'))
+        : 'quality';
+    const pickedClipDuration = parseInt(getVal('wizard-clip-duration') || '30', 10);
+    const pickedMinGap = parseInt(getVal('wizard-min-gap') || '15', 10);
 
     // Sync subtitle style back to settings
     document.querySelectorAll('.style-option').forEach(opt => {
@@ -1472,6 +2386,12 @@ function confirmStyleAndGenerate() {
         const radio = opt.querySelector('input[type="radio"]');
         if (radio) radio.checked = opt.dataset.style === pickedStyle;
     });
+    const autoClipsEl = document.getElementById('set-auto-clips');
+    if (autoClipsEl) autoClipsEl.checked = pickedNumClips === 'auto';
+    if (pickedNumClips !== 'auto') setSlider('set-num-clips', pickedNumClips);
+    setSlider('set-clip-duration', pickedClipDuration);
+    setSlider('set-min-gap', pickedMinGap);
+    setSelect('set-detection-preference', pickedDetectionPreference);
     updateSubtitlePlacementPreview();
 
     // Save wizard choices for next time
@@ -1479,6 +2399,7 @@ function confirmStyleAndGenerate() {
     const musicEnabled = document.getElementById('wizard-music-enabled')?.checked || false;
     const selectedTrack = document.querySelector('.music-track.active')?.dataset.filename || null;
     const musicVolume = parseInt(document.getElementById('wizard-music-volume')?.value || '12');
+    const audioSource = wizardAudioSourceSettings();
 
     const trimValues = getMusicTrimValues();
     saveLocal('wizard', {
@@ -1488,18 +2409,48 @@ function confirmStyleAndGenerate() {
         musicVolume: musicVolume,
         musicTrimStart: trimValues ? trimValues.start : null,
         musicTrimEnd: trimValues ? trimValues.end : null,
+        audioSource: audioSource,
+        processingDepth: pickedProcessingDepth,
     });
 
     closeModal('style-picker-modal');
 
     // Snapshot settings for the entire batch
     const settings = gatherSettings();
+    settings.processing_depth = pickedProcessingDepth;
+    settings.detection_preference = pickedDetectionPreference;
+    settings.num_clips = pickedNumClips === 'auto' ? 'auto' : parseInt(pickedNumClips, 10);
+    settings.clip_duration = pickedClipDuration;
+    settings.min_gap = pickedMinGap;
     settings.video_effect = selectedEffect;
     settings.music_file = musicEnabled && selectedTrack ? selectedTrack : null;
     settings.music_volume = musicVolume / 100;
     settings.music_start = trimValues ? trimValues.start : 0;
     settings.music_end = trimValues ? trimValues.end : 0;
+    settings.audio_source = {
+        mode: 'auto',
+        stream: null,
+        commentary_guard: audioSource.commentary_guard,
+        subtitle_policy: audioSource.subtitle_policy || 'creator',
+    };
     state.batchSettings = settings;
+    const perItemAudioSource = currentBatchSourceCount() === 1
+        ? audioSource
+        : {
+            mode: 'auto',
+            stream: null,
+            commentary_guard: audioSource.commentary_guard,
+            subtitle_policy: audioSource.subtitle_policy || 'creator',
+    };
+    state.batchQueue.forEach(item => {
+        item.audioSource = { ...(item.audioSource || perItemAudioSource) };
+        item.subtitleStyle = settings.subtitle_style || 'tiktok';
+        item.settings = {
+            ...(item.settings || {}),
+            audio_source: item.audioSource,
+            subtitle_style: item.subtitleStyle,
+        };
+    });
 
     state.processing = true;
     state.batchIndex = -1;
@@ -1518,8 +2469,8 @@ async function cancelProcessing() {
     try { await pywebview.api.cancel_processing(); } catch (_) {}
     // Cancel stops the current item; clear the rest of the queue
     state.batchQueue.forEach(q => { if (q.status === 'pending') q.status = 'cancelled'; });
-    state.batchIndex = -1;
     renderBatchQueue();
+    renderBatchProgress();
 }
 
 /* ── Batch Queue ──────────────────────────────────────────────────────── */
@@ -1538,8 +2489,9 @@ function addToBatchQueue(url) {
     if (!url) return;
     // Avoid duplicates
     if (state.batchQueue.some(q => q.url === url)) return;
-    const label = url.length > 60 ? url.slice(0, 57) + '...' : url;
-    state.batchQueue.push({ url, label, status: 'pending' });
+    const display = sourceDisplayLabel(url);
+    const label = display.length > 60 ? display.slice(0, 57) + '...' : display;
+    state.batchQueue.push({ url, label, status: 'pending', subtitleStyle: null });
     renderBatchQueue();
 }
 
@@ -1574,18 +2526,127 @@ function renderBatchQueue() {
 
     const pending = state.batchQueue.filter(q => q.status === 'pending').length;
     const done = state.batchQueue.filter(q => q.status === 'done').length;
-    label.innerHTML = `Queue: <strong>${state.batchQueue.length}</strong> items (${done} done, ${pending} pending)`;
+    const empty = state.batchQueue.filter(q => q.status === 'empty').length;
+    const emptyText = empty ? `, ${empty} no clips` : '';
+    label.innerHTML = `Queue: <strong>${state.batchQueue.length}</strong> items (${done} done${emptyText}, ${pending} pending)`;
 
     list.innerHTML = '';
     state.batchQueue.forEach((q, i) => {
         const li = document.createElement('li');
         li.className = `batch-queue-item ${q.status}`;
+        const statusText = q.status === 'empty' ? 'no clips' : q.status;
         li.innerHTML = `
             <span class="batch-queue-item-label" title="${escHtml(q.url)}">${escHtml(q.label)}</span>
-            <span class="batch-queue-item-status ${q.status}">${q.status}</span>
+            <span class="batch-queue-item-status ${q.status}">${escHtml(statusText)}</span>
             ${q.status === 'pending' ? `<button class="batch-queue-item-remove" onclick="removeBatchItem(${i})">&times;</button>` : ''}`;
         list.appendChild(li);
     });
+}
+
+function batchStatusCounts() {
+    const done = state.batchQueue.filter(q => q.status === 'done').length;
+    const empty = state.batchQueue.filter(q => q.status === 'empty').length;
+    const errors = state.batchQueue.filter(q => q.status === 'error').length;
+    const cancelled = state.batchQueue.filter(q => q.status === 'cancelled').length;
+    const active = state.batchQueue.filter(q => q.status === 'active').length;
+    const pending = state.batchQueue.filter(q => q.status === 'pending').length;
+    return { done, empty, errors, cancelled, active, pending, total: state.batchQueue.length };
+}
+
+function batchItemLabel(item) {
+    if (!item) return 'Source';
+    return item.resolvedLabel || item.label || sourceDisplayLabel(item.url);
+}
+
+function batchProgressItemsWindow(focusIndex = null) {
+    const total = state.batchQueue.length;
+    if (total <= 7) return state.batchQueue.map((item, index) => ({ item, index }));
+    const current = Math.max(0, Math.min(total - 1, Number.isInteger(focusIndex) ? focusIndex : state.batchIndex));
+    let start = Math.max(0, current - 2);
+    let end = Math.min(total, start + 5);
+    start = Math.max(0, end - 5);
+    const items = [];
+    if (start > 0) items.push({ omitted: start });
+    for (let index = start; index < end; index++) {
+        items.push({ item: state.batchQueue[index], index });
+    }
+    if (end < total) items.push({ omitted: total - end });
+    return items;
+}
+
+function renderBatchProgress(context = {}) {
+    const card = document.getElementById('batch-progress-card');
+    if (!card) return;
+    const counts = batchStatusCounts();
+    if (!counts.total) {
+        card.classList.add('hidden');
+        return;
+    }
+
+    const activeIndex = state.batchIndex >= 0 ? state.batchIndex : Math.min(counts.total - 1, Math.max(0, counts.done + counts.empty + counts.errors - 1));
+    const item = state.batchQueue[activeIndex] || state.batchQueue[0];
+    const sourceName = context?.sourceName || context?.source_name || context?.sourceLabel || context?.source_label;
+    if (sourceName && item) item.resolvedLabel = sourceDisplayLabel(sourceName);
+
+    const complete = Boolean(context?.complete);
+    const index = Number.isFinite(Number(context?.batchIndex || context?.batch_index))
+        ? Number(context?.batchIndex || context?.batch_index)
+        : Math.max(1, activeIndex + 1);
+    const total = Number.isFinite(Number(context?.batchTotal || context?.batch_total))
+        ? Number(context?.batchTotal || context?.batch_total)
+        : counts.total;
+    const completed = counts.done + counts.empty + counts.errors;
+    const sourcePct = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+
+    const kicker = document.getElementById('batch-progress-kicker');
+    const source = document.getElementById('batch-progress-source');
+    const countEl = document.getElementById('batch-progress-counts');
+    const fill = document.getElementById('batch-progress-fill');
+    const queue = document.getElementById('batch-progress-queue');
+
+    if (kicker) kicker.textContent = complete ? 'Batch complete' : `Processing ${index}/${total}`;
+    if (source) {
+        const label = complete
+            ? `${counts.done} done${counts.empty ? `, ${counts.empty} no clips` : ''}${counts.errors ? `, ${counts.errors} failed` : ''}`
+            : batchItemLabel(item);
+        source.textContent = label;
+        source.title = item?.url || label;
+    }
+    if (countEl) {
+        countEl.textContent = `Done ${counts.done} · No clips ${counts.empty} · Failed ${counts.errors} · Remaining ${counts.pending}`;
+    }
+    if (fill) fill.style.width = `${complete ? 100 : sourcePct}%`;
+    if (queue) {
+        queue.innerHTML = '';
+        batchProgressItemsWindow(activeIndex).forEach(entry => {
+            const chip = document.createElement('span');
+            if (entry.omitted) {
+                chip.className = 'batch-progress-chip omitted';
+                chip.textContent = `+${entry.omitted} more`;
+                queue.appendChild(chip);
+                return;
+            }
+            const q = entry.item || {};
+            const status = q.status || 'pending';
+            chip.className = `batch-progress-chip ${status}`;
+            chip.title = q.url || batchItemLabel(q);
+            chip.textContent = `${entry.index + 1}. ${batchItemLabel(q)}`;
+            queue.appendChild(chip);
+        });
+    }
+    card.classList.remove('hidden');
+}
+
+function applyPipelineProgressContext(context) {
+    if (!context || typeof context !== 'object') {
+        renderBatchProgress();
+        return;
+    }
+    state.batchProgressContext = { ...(state.batchProgressContext || {}), ...context };
+    const item = state.batchIndex >= 0 ? state.batchQueue[state.batchIndex] : null;
+    const beforeLabel = item?.resolvedLabel || '';
+    renderBatchProgress(state.batchProgressContext);
+    if (item && beforeLabel !== (item.resolvedLabel || '')) renderBatchQueue();
 }
 
 async function processNextInQueue() {
@@ -1604,26 +2665,51 @@ async function processNextInQueue() {
     const item = state.batchQueue[state.batchIndex];
     item.status = 'active';
     renderBatchQueue();
+    state.batchProgressContext = {
+        sourceName: batchItemLabel(item),
+        batchIndex: state.batchIndex + 1,
+        batchTotal: state.batchQueue.length,
+    };
+    renderBatchProgress(state.batchProgressContext);
 
     // Update progress UI
-    const queueLabel = state.batchQueue.length > 1
+    const queueLabel = currentBatchSourceCount() > 1
         ? ` (${state.batchIndex + 1}/${state.batchQueue.length})`
         : '';
     resetStages();
-    setProgress(0, `Starting${queueLabel}...`);
+    state.progressStartedAt = Date.now();
+    setProgress(0, `Starting${queueLabel}...`, true);
     document.getElementById('clip-cards').innerHTML = '';
 
     try {
-        let r = await pywebview.api.start_processing(item.url, state.batchSettings);
+        const itemSettings = {
+            ...(state.batchSettings || {}),
+            ...(item.settings || {}),
+            audio_source: item.audioSource || state.batchSettings?.audio_source || {
+                mode: 'auto',
+                stream: null,
+                commentary_guard: true,
+                subtitle_policy: 'creator',
+            },
+            subtitle_style: item.subtitleStyle || item.settings?.subtitle_style || state.batchSettings?.subtitle_style || 'tiktok',
+        };
+        itemSettings.progress_context = {
+            sourceName: batchItemLabel(item),
+            sourceUrl: item.url,
+            batchIndex: state.batchIndex + 1,
+            batchTotal: state.batchQueue.length,
+        };
+        let r = await pywebview.api.start_processing(item.url, itemSettings);
         // Retry once if "Already processing" (race with previous pipeline's finally block)
         if (r.error && r.error.includes('Already processing')) {
             await new Promise(ok => setTimeout(ok, 1500));
-            r = await pywebview.api.start_processing(item.url, state.batchSettings);
+            r = await pywebview.api.start_processing(item.url, itemSettings);
         }
         if (r.error) {
             item.status = 'error';
             toast(`Failed: ${item.label} — ${r.error}`, 'error');
             renderBatchQueue();
+            renderBatchProgress();
             // Continue to next
             processNextInQueue();
         }
@@ -1632,6 +2718,7 @@ async function processNextInQueue() {
         item.status = 'error';
         toast(`Failed: ${item.label}`, 'error');
         renderBatchQueue();
+        renderBatchProgress();
         processNextInQueue();
     }
 }
@@ -1639,19 +2726,36 @@ async function processNextInQueue() {
 function _onBatchComplete() {
     state.processing = false;
     state.batchIndex = -1;
-    document.getElementById('btn-cancel').classList.add('hidden');
+    state.batchProgressContext = null;
+    document.getElementById('btn-cancel')?.classList.add('hidden');
 
     const done = state.batchQueue.filter(q => q.status === 'done').length;
+    const empty = state.batchQueue.filter(q => q.status === 'empty').length;
     const errors = state.batchQueue.filter(q => q.status === 'error').length;
     const total = state.batchQueue.length;
+    const completed = done + empty;
+    renderBatchProgress({ complete: true });
 
-    document.getElementById('completion-title').textContent =
-        errors ? `${done}/${total} Videos Done` : 'All Done!';
-    document.getElementById('completion-message').textContent =
-        `Processed ${done} video${done !== 1 ? 's' : ''}${errors ? `, ${errors} failed` : ''}.`;
-    document.getElementById('completion-banner').classList.remove('hidden');
+    const title = document.getElementById('completion-title');
+    const message = document.getElementById('completion-message');
+    const banner = document.getElementById('completion-banner');
+    if (title) {
+        title.textContent = errors
+            ? `${completed}/${total} Videos Done`
+            : done ? 'All Done!' : 'No Clips Created';
+    }
+    if (message) {
+        const parts = [`Processed ${completed} video${completed !== 1 ? 's' : ''}`];
+        if (empty) parts.push(`${empty} with no clips`);
+        if (errors) parts.push(`${errors} failed`);
+        message.textContent = `${parts.join(', ')}.`;
+    }
+    banner?.classList.remove('hidden');
 
-    toast(`Batch complete: ${done} done${errors ? `, ${errors} failed` : ''}`, done ? 'success' : 'error');
+    safeToast(
+        `Batch complete: ${done} done${empty ? `, ${empty} no clips` : ''}${errors ? `, ${errors} failed` : ''}`,
+        errors ? (completed ? 'warning' : 'error') : (done ? 'success' : 'warning')
+    );
 
     // Refresh results to include all clips from all processed videos
     pywebview.api.get_results().then(r => {
@@ -1673,6 +2777,9 @@ async function browseFilesMulti() {
 
 function resetGenerate() {
     state.processing = false;
+    state.overallPercent = 0;
+    state.progressStartedAt = 0;
+    state.batchProgressContext = null;
     document.getElementById('generate-idle').classList.remove('hidden');
     document.getElementById('progress-area').classList.add('hidden');
     document.getElementById('btn-cancel').classList.add('hidden');
@@ -1758,7 +2865,7 @@ window.onConsoleLog = function (text) {
 
 /* ── Progress Callbacks ───────────────────────────────────────────────── */
 
-window.onPipelineProgress = function (stage, percent, message) {
+window.onPipelineProgress = function (stage, percent, message, detail, context = null) {
     if (stage === 'upload') {
         const pct = Math.min(100, Math.max(0, Math.round(percent)));
         const uploadCard = document.getElementById('upload-progress-card');
@@ -1768,19 +2875,35 @@ window.onPipelineProgress = function (stage, percent, message) {
         document.getElementById('upload-fill').style.width = `${pct}%`;
         return;
     }
-    const ranges = { download: [0, 15], detect: [15, 30], clips: [30, 95], upload: [0, 100] };
+    if (!state.processing) return;
+    applyPipelineProgressContext(context);
+    const ranges = {
+        download: [0, 12],
+        detect: [12, 24],
+        candidates: [24, 68],
+        clips: [68, 98],
+        upload: [0, 100],
+    };
     const r = ranges[stage] || [0, 100];
     setProgress(r[0] + (percent / 100) * (r[1] - r[0]), message);
+    if (detail) {
+        setProgressDetail(detail);
+    } else {
+        setProgressDetail('');
+    }
     activateStage(stage);
     if (stage === 'download' && percent >= 100) completeStage('download');
     if (stage === 'detect' && percent >= 100) completeStage('detect');
+    if (stage === 'candidates' && percent >= 100) completeStage('candidates');
 };
 
 window.onClipProgress = function (clipNum, totalClips, substep, percent, message) {
+    if (!state.processing) return;
     const sw = { audio: [0, 0.10], transcribe: [0.10, 0.40], subtitle: [0.40, 0.60], render: [0.60, 1.0] }[substep] || [0, 1];
     const clipFrac = sw[0] + (percent / 100) * (sw[1] - sw[0]);
-    const perClip = 65 / totalClips;
-    setProgress(30 + (clipNum - 1) * perClip + clipFrac * perClip, message);
+    const perClip = 30 / Math.max(1, totalClips || 1);
+    setProgress(68 + (clipNum - 1) * perClip + clipFrac * perClip, message);
+    completeStage('candidates');
     activateStage('clips');
     updateClipCard(clipNum, totalClips, substep, percent, message);
 };
@@ -1806,7 +2929,7 @@ async function refreshScheduleFromBackend(render = false) {
     }
 }
 
-window.onPipelineComplete = async function (success, doneCount, totalCount, errorMsg) {
+window.onPipelineComplete = async function (success, doneCount, totalCount, errorMsg, details = null) {
     const uploadCard = document.getElementById('upload-progress-card');
     const uploadVisible = uploadCard && !uploadCard.classList.contains('hidden');
     if (uploadVisible && document.getElementById('btn-upload')?.disabled) {
@@ -1830,40 +2953,60 @@ window.onPipelineComplete = async function (success, doneCount, totalCount, erro
         return;
     }
 
-    // Mark current batch item
-    if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
-        state.batchQueue[state.batchIndex].status = success ? 'done' : 'error';
-        renderBatchQueue();
-    }
+    let hasMore = false;
+    const completionDetails = details && typeof details === 'object' ? details : {};
+    const noQualityClips = success && completionDetails.completion_state === 'no_quality_clips';
+    try {
+        // Mark current batch item
+        if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
+            state.batchQueue[state.batchIndex].status = success
+                ? (noQualityClips ? 'empty' : 'done')
+                : 'error';
+            if (noQualityClips) {
+                state.batchQueue[state.batchIndex].message = completionDetails.message || 'No clips met the quality bar.';
+            }
+            renderBatchQueue();
+            renderBatchProgress();
+        }
 
-    if (success) {
-        setProgress(100, `${doneCount} clips created`);
-        completeStage('clips'); completeStage('done');
-        toast(`${doneCount} clips created successfully`, 'success');
-        addNotification(
-            'Clips Ready',
-            `${doneCount} viral clip${doneCount > 1 ? 's' : ''} generated and ready to upload`,
-            'success'
-        );
+        hasMore = state.batchQueue.some((q, i) => i > state.batchIndex && q.status === 'pending');
 
-        // Accumulate results (don't overwrite — append from all batch items)
-        pywebview.api.get_results().then(r => {
-            state.results = visibleClipList(r.clips);
-            state.moments = r.moments || state.moments;
-        }).catch(() => {});
-    } else {
-        toast(errorMsg || 'Processing failed', 'error');
-        addNotification('Processing Failed', errorMsg || 'An error occurred during clip generation', 'error');
-    }
+        if (success) {
+            setProgress(100, noQualityClips ? (completionDetails.message || 'No clips met the quality bar') : `${doneCount} clips created`);
+            completeStageThrough('done');
+            if (noQualityClips) {
+                const guidance = completionDetails.guidance || 'Try Auto or Quantity, a longer source, a shorter minimum gap, or Deep Analysis.';
+                safeToast(completionDetails.message || 'No clips met the quality bar', 'warning');
+                safeAddNotification('No Clips Created', guidance, 'info');
+            } else {
+                safeToast(`${doneCount} clips created successfully`, 'success');
+                safeAddNotification(
+                    'Clips Ready',
+                    `${doneCount} viral clip${doneCount > 1 ? 's' : ''} generated and ready to upload`,
+                    'success'
+                );
+            }
 
-    // Check if there are more items in the queue
-    const hasMore = state.batchQueue.some((q, i) => i > state.batchIndex && q.status === 'pending');
-    if (hasMore) {
-        // Short delay before starting next to let UI update
-        setTimeout(() => processNextInQueue(), 500);
-    } else {
-        // All done (or single video)
-        _onBatchComplete();
+            // Accumulate results (don't overwrite — append from all batch items)
+            pywebview.api.get_results().then(r => {
+                state.results = visibleClipList(r.clips);
+                state.moments = r.moments || state.moments;
+                if (!noQualityClips) refreshSubtitlePreviewSnapshot(true);
+            }).catch(() => {});
+        } else {
+            safeToast(errorMsg || 'Processing failed', 'error');
+            safeAddNotification('Processing Failed', errorMsg || 'An error occurred during clip generation', 'error');
+        }
+    } catch (e) {
+        console.warn('Pipeline completion UI update failed; finishing queue cleanup anyway', e);
+    } finally {
+        if (hasMore) {
+            // Short delay before starting next to let UI update
+            setTimeout(() => processNextInQueue(), 500);
+        } else {
+            // All done (or single video)
+            _onBatchComplete();
+        }
     }
 };
 
@@ -1889,7 +3032,9 @@ window.onPipelineCancelled = async function () {
         state.batchQueue[state.batchIndex].status = 'error';
     }
     state.batchIndex = -1;
+    state.batchProgressContext = null;
     renderBatchQueue();
+    renderBatchProgress({ complete: true });
     toast('Processing cancelled', 'warning');
     resetGenerate();
 };
@@ -1967,27 +3112,107 @@ window.onScheduleUpdated = function () {
 
 /* ── Progress Helpers ──────────────────────────────────────────────────── */
 
-function setProgress(pct, msg) {
+function setProgress(pct, msg, allowDecrease = false) {
     pct = Math.min(100, Math.max(0, pct));
+    if (!allowDecrease) pct = Math.max(pct, state.overallPercent || 0);
+    if (pct > 0 && !state.progressStartedAt) state.progressStartedAt = Date.now();
+    state.overallPercent = pct;
     document.getElementById('progress-fill').style.width = pct + '%';
     document.getElementById('progress-percent').textContent = Math.round(pct) + '%';
     if (msg) document.getElementById('progress-status').textContent = msg;
+    const etaEl = document.getElementById('progress-eta');
+    if (etaEl) {
+        if (pct >= 100) {
+            etaEl.textContent = 'Complete.';
+        } else {
+            const backendEta = backendHistoryEtaRemaining();
+            if (backendEta) {
+                etaEl.textContent = `Rough ETA: ${fmtEta(backendEta.remaining)} remaining (${backendEta.source})`;
+            } else if (pct >= 3 && state.progressStartedAt) {
+                const elapsed = Math.max(0, (Date.now() - state.progressStartedAt) / 1000);
+                if (elapsed >= 8) {
+                    const remaining = (elapsed / Math.max(pct, 1)) * (100 - pct);
+                    etaEl.textContent = `Rough ETA: ${fmtEta(remaining)} remaining`;
+                } else {
+                    etaEl.textContent = 'Estimating from current progress...';
+                }
+            } else {
+                etaEl.textContent = 'Estimating from current progress...';
+            }
+        }
+    }
+}
+
+function setProgressDetail(detail) {
+    const el = document.getElementById('progress-detail');
+    if (!el) return;
+    const text = String(detail || '').trim();
+    if (!text) {
+        el.textContent = '';
+        el.classList.add('hidden');
+        return;
+    }
+    el.textContent = text;
+    el.classList.remove('hidden');
 }
 
 function resetStages() {
     document.querySelectorAll('.stage').forEach(s => s.classList.remove('active', 'completed'));
     document.querySelectorAll('.stage-line').forEach(l => l.classList.remove('active', 'completed'));
+    const etaEl = document.getElementById('progress-eta');
+    if (etaEl) etaEl.textContent = 'ETA will appear after progress starts.';
+    setProgressDetail('');
 }
 function activateStage(name) {
+    const stages = ['download', 'detect', 'candidates', 'clips', 'done'];
+    const idx = stages.indexOf(name);
+    if (idx > 0) {
+        stages.slice(0, idx).forEach(stageName => completeStage(stageName));
+    }
     const el = document.querySelector(`.stage[data-stage="${name}"]`);
     if (el && !el.classList.contains('completed')) el.classList.add('active');
 }
 function completeStage(name) {
     const el = document.querySelector(`.stage[data-stage="${name}"]`);
     if (el) { el.classList.remove('active'); el.classList.add('completed'); }
-    const stages = ['download', 'detect', 'clips', 'done'];
+    const stages = ['download', 'detect', 'candidates', 'clips', 'done'];
     const idx = stages.indexOf(name);
     if (idx > 0) { const lines = document.querySelectorAll('.stage-line'); if (lines[idx - 1]) lines[idx - 1].classList.add('completed'); }
+}
+
+function completeStageThrough(name) {
+    const stages = ['download', 'detect', 'candidates', 'clips', 'done'];
+    const idx = stages.indexOf(name);
+    if (idx < 0) return;
+    stages.slice(0, idx + 1).forEach(stageName => completeStage(stageName));
+}
+
+function fmtEta(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return 'estimating';
+    if (seconds < 60) return '<1 min';
+    const mins = Math.round(seconds / 60);
+    if (mins < 90) return `${mins} min`;
+    const hours = Math.floor(mins / 60);
+    const rem = mins % 60;
+    return rem ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+function backendHistoryEtaRemaining() {
+    const context = state.batchProgressContext || {};
+    const total = Number(context.estimatedTotalSeconds ?? context.estimated_total_seconds);
+    if (!Number.isFinite(total) || total <= 0 || !state.progressStartedAt) return null;
+    const elapsed = Math.max(0, (Date.now() - state.progressStartedAt) / 1000);
+    const remaining = Math.max(0, total - elapsed);
+    const rawSource = String(context.estimateSource || context.estimate_source || '').trim();
+    let source = 'local history';
+    if (rawSource === 'duration_baseline') source = 'baseline';
+    else if (rawSource && rawSource !== 'not_estimated') source = rawSource.replace(/_/g, ' ');
+    return { remaining, source };
+}
+
+function finiteNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
 }
 
 /* ── Clip Progress Cards ───────────────────────────────────────────────── */
@@ -1997,7 +3222,7 @@ function createClipCard(num, total, moment) {
     card.className = 'clip-progress-card';
     card.id = `clip-card-${num}`;
     card.style.animationDelay = `${(num - 1) * 0.06}s`;
-    const score = moment.score || 0;
+    const score = finiteNumber(moment.score, 0);
     const sc = score >= 0.7 ? 'high' : score >= 0.4 ? 'mid' : 'low';
     card.innerHTML = `
         <div class="clip-card-header">
@@ -2015,7 +3240,9 @@ function updateClipCard(num, total, substep, percent, message) {
     if (!card) { const grid = document.getElementById('clip-cards'); card = createClipCard(num, total, state.moments[num-1] || {start:0,end:0,score:0}); grid.appendChild(card); }
     const labels = { audio: 'Extracting audio', transcribe: 'Transcribing', subtitle: 'Generating subtitles', render: 'Rendering clip' };
     card.querySelector('.clip-substep').textContent = (percent >= 100 && substep === 'render') ? 'Complete' : (labels[substep] || substep) + '...';
-    card.querySelector('.clip-bar-fill').style.width = (['audio','transcribe','subtitle','render'].indexOf(substep) * 25 + (percent/100) * 25) + '%';
+    const steps = ['audio','transcribe','subtitle','render'];
+    const stepIndex = Math.max(0, steps.indexOf(substep));
+    card.querySelector('.clip-bar-fill').style.width = (stepIndex * 25 + (percent/100) * 25) + '%';
     card.classList.remove('processing', 'done');
     if (percent >= 100 && substep === 'render') { card.classList.add('done'); card.querySelector('.clip-bar-fill').style.width = '100%'; }
     else card.classList.add('processing');
@@ -2026,11 +3253,12 @@ function updateClipCard(num, total, substep, percent, message) {
 function _groupResultsByStem(clips) {
     const groups = {};
     clips.forEach((clip, i) => {
+        const originalIdx = Number.isInteger(clip._idx) ? clip._idx : i;
         // Use source_stem from moments (persists through renames),
         // then try filename pattern, then fall back to 'Other'
         let stem = clip.source_stem;
         if (!stem) {
-            const m = state.moments[i];
+            const m = state.moments[originalIdx];
             if (m && m.source_stem) stem = m.source_stem;
         }
         if (!stem) {
@@ -2038,15 +3266,29 @@ function _groupResultsByStem(clips) {
             stem = match ? match[1] : clip.filename.replace(/\.[^.]+$/, '');
         }
         if (!groups[stem]) groups[stem] = { stem, clips: [] };
-        groups[stem].clips.push({ ...clip, _idx: i });
+        groups[stem].clips.push({ ...clip, _idx: originalIdx });
     });
     return Object.values(groups);
 }
 
+function feedbackButtonsMarkup() {
+    return `
+        <button type="button" class="feedback-btn" data-feedback="like" title="Like this clip and nudge future picks" aria-label="Like this clip and nudge future picks">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10v11"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2h0a3.13 3.13 0 0 1 3 3.88Z"/></svg>
+        </button>
+        <button type="button" class="feedback-btn" data-feedback="dislike" title="Dislike this clip and reduce similar future picks" aria-label="Dislike this clip and reduce similar future picks">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 14V3"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22h0a3.13 3.13 0 0 1-3-3.88Z"/></svg>
+        </button>
+        <button type="button" class="feedback-btn" data-feedback="favorite" title="Favorite this clip and boost similar future picks" aria-label="Favorite this clip and boost similar future picks">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+        </button>`;
+}
+
 function _buildResultCard(clip, i) {
     const m = state.moments[i] || {};
-    const score = m.score || 0;
+    const score = finiteNumber(m.score, 0);
     const sc = score >= 0.7 ? 'high' : score >= 0.4 ? 'mid' : 'low';
+    const momentLabel = momentLabelMarkup(clip, m);
     const card = document.createElement('div');
     card.className = 'result-card';
     card.dataset.clipIdx = i;
@@ -2070,20 +3312,13 @@ function _buildResultCard(clip, i) {
                 <span class="clip-score ${sc}">${score.toFixed(2)}</span>
             </div>
             <div class="result-filename">${escHtml(clip.filename)}</div>
+            ${momentLabel}
             <div class="result-meta">
                 ${m.start !== undefined ? `<span>${fmtTime(m.start)} - ${fmtTime(m.end)}</span>` : ''}
                 <span>${clip.size_mb} MB</span>
             </div>
             <div class="result-feedback" aria-label="Clip feedback">
-                <button type="button" class="feedback-btn" data-feedback="like" title="Like this clip and nudge future picks" aria-label="Like this clip and nudge future picks">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10v11"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2h0a3.13 3.13 0 0 1 3 3.88Z"/></svg>
-                </button>
-                <button type="button" class="feedback-btn" data-feedback="dislike" title="Dislike this clip and reduce similar future picks" aria-label="Dislike this clip and reduce similar future picks">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 14V3"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22h0a3.13 3.13 0 0 1-3-3.88Z"/></svg>
-                </button>
-                <button type="button" class="feedback-btn" data-feedback="favorite" title="Favorite this clip and boost similar future picks" aria-label="Favorite this clip and boost similar future picks">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-                </button>
+                ${feedbackButtonsMarkup()}
             </div>
         </div>`;
     card.querySelectorAll('.feedback-btn').forEach(btn => {
@@ -2106,20 +3341,44 @@ async function loadResults() {
         const r = await pywebview.api.get_results();
         state.results = visibleClipList(r.clips);
         state.moments = r.moments || state.moments;
+        refreshSubtitlePreviewSnapshot(false);
         await loadPersonalization();
     } catch (_) {}
+    renderResultsGrid();
+}
+
+function renderResultsGrid() {
     const grid = document.getElementById('results-grid');
     const empty = document.getElementById('results-empty');
     const countEl = document.getElementById('results-count');
     if (countEl) countEl.textContent = state.results.length ? state.results.length + ' clip' + (state.results.length !== 1 ? 's' : '') : '';
-    if (!state.results.length) { grid.innerHTML = ''; grid.appendChild(empty); empty.style.display = ''; return; }
-
-    // Batch all video URLs in one pass before building DOM
-    const urlPromises = state.results.map((_, i) =>
-        pywebview.api.get_video_url(i).catch(() => null)
+    if (!state.results.length) {
+        renderMomentFilterBar('results-moment-filters', [], () => ({}), 'all', setResultsMomentFilter);
+        grid.innerHTML = '';
+        grid.appendChild(empty);
+        empty.style.display = '';
+        return;
+    }
+    state.resultsMomentFilter = normalizeAvailableMomentFilter(
+        state.results,
+        (_, i) => state.moments[i] || {},
+        state.resultsMomentFilter,
     );
+    renderMomentFilterBar(
+        'results-moment-filters',
+        state.results,
+        (_, i) => state.moments[i] || {},
+        state.resultsMomentFilter,
+        setResultsMomentFilter,
+    );
+    const visibleResults = state.results
+        .map((clip, index) => ({ ...clip, _idx: index }))
+        .filter(clip => clipMatchesMomentFilter(clip, state.moments[clip._idx] || {}, state.resultsMomentFilter));
+    if (countEl && visibleResults.length !== state.results.length) {
+        countEl.textContent = `${visibleResults.length}/${state.results.length} clips`;
+    }
 
-    const groups = _groupResultsByStem(state.results);
+    const groups = _groupResultsByStem(visibleResults);
     const frag = document.createDocumentFragment();
 
     // If only 1 group, render it open; otherwise start collapsed
@@ -2160,15 +3419,18 @@ async function loadResults() {
     grid.innerHTML = '';
     grid.appendChild(frag);
 
-    // Lazy-load thumbnails — only decode when visible, max 2 at a time
-    const urls = await Promise.all(urlPromises);
-    state.results.forEach((_, i) => {
-        const r = urls[i];
-        if (r && r.url) {
-            const thumbEl = document.querySelector(`.result-card-thumb[data-clip-idx="${i}"]`);
-            if (thumbEl) lazyThumb(thumbEl, r.url);
+    // Lazy-load thumbnails — only decode filtered visible cards.
+    visibleResults.forEach(clip => {
+        if (clip && clip.url) {
+            const thumbEl = document.querySelector(`.result-card-thumb[data-clip-idx="${clip._idx}"]`);
+            if (thumbEl) lazyThumb(thumbEl, clip.url);
         }
     });
+}
+
+function setResultsMomentFilter(filter) {
+    state.resultsMomentFilter = String(filter || 'all');
+    renderResultsGrid();
 }
 async function openFolder() { try { await pywebview.api.open_output_folder(); } catch (_) {} }
 
@@ -2179,9 +3441,11 @@ async function previewClip(idx) {
         const r = await pywebview.api.get_video_url(idx);
         if (r.url) {
             state.previewClipIdx = idx;
+            state.previewLibraryClip = null;
             const video = document.getElementById('preview-video');
             video.src = r.url;
             document.getElementById('preview-modal-title').textContent = `Clip ${idx + 1}`;
+            document.getElementById('preview-delete-btn').style.display = '';
             renderPreviewFeedbackState();
             showModal('preview-modal');
             video.play().catch(() => {});
@@ -2198,6 +3462,7 @@ function closePreview() {
     video.pause();
     video.src = '';
     state.previewClipIdx = -1;
+    state.previewLibraryClip = null;
     renderPreviewFeedbackState();
     closeModal('preview-modal');
 }
@@ -2250,6 +3515,9 @@ async function confirmDelete() {
             const r = await pywebview.api.delete_library_file(state.pendingDeleteFilename);
             if (r.ok) {
                 toast('Video deleted', 'success');
+                if (state.previewLibraryClip?.filename === state.pendingDeleteFilename) {
+                    closePreview();
+                }
                 loadLibrary();
             } else {
                 toast(r.error || 'Delete failed', 'error');
@@ -2284,14 +3552,16 @@ async function loadLibrary() {
         }
 
         renderLibraryGrid();
+        return true;
     } catch (e) {
         console.error('Load library error:', e);
+        return false;
     }
 }
 
-function refreshLibrary() {
-    loadLibrary();
-    toast('Library refreshed', 'success');
+async function refreshLibrary() {
+    const ok = await loadLibrary();
+    toast(ok ? 'Library refreshed' : 'Could not refresh library', ok ? 'success' : 'error');
 }
 
 function _groupLibraryByStem(clips) {
@@ -2308,8 +3578,10 @@ function _groupLibraryByStem(clips) {
 function _buildLibraryCard(clip) {
     const item = document.createElement('div');
     item.className = 'library-item';
+    item.dataset.clipId = clip.clip_id || '';
     const d = new Date(clip.modified * 1000);
     const dateStr = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+    const momentLabel = momentLabelMarkup(clip, clip);
     item.innerHTML = `
         <div class="library-item-thumb" data-lib-url="${escHtml(clip.url)}">
             <div class="thumb-placeholder">
@@ -2326,16 +3598,26 @@ function _buildLibraryCard(clip) {
         </div>
         <div class="library-item-info">
             <div class="library-item-name" title="${escHtml(clip.filename)}">${escHtml(clip.filename)}</div>
+            ${momentLabel}
             <div class="library-item-meta">
                 <span>${clip.size_mb} MB</span>
                 <span>${dateStr}</span>
+            </div>
+            <div class="result-feedback library-feedback" aria-label="Clip feedback">
+                ${feedbackButtonsMarkup()}
             </div>
         </div>`;
     // Lazy-load thumbnail
     const thumbEl = item.querySelector('.library-item-thumb');
     if (thumbEl) {
-        thumbEl.addEventListener('click', () => previewLibraryClip(clip.filename, clip.url));
+        thumbEl.addEventListener('click', () => previewLibraryClip(clip.filename, clip.url, clip));
     }
+    item.querySelectorAll('.feedback-btn').forEach(btn => {
+        btn.addEventListener('click', event => {
+            event.stopPropagation();
+            recordLibraryFeedback(clip, btn.dataset.feedback);
+        });
+    });
     const deleteBtn = item.querySelector('.library-item-delete');
     if (deleteBtn) {
         deleteBtn.addEventListener('click', (event) => {
@@ -2344,6 +3626,7 @@ function _buildLibraryCard(clip) {
         });
     }
     if (clip.url && thumbEl) lazyThumb(thumbEl, clip.url);
+    renderCardFeedbackState(item, clip);
     return item;
 }
 
@@ -2352,9 +3635,30 @@ function renderLibraryGrid() {
     const empty = document.getElementById('library-empty');
     const searchTerm = (document.getElementById('library-search-input')?.value || '').toLowerCase();
 
-    const filtered = searchTerm
+    const searchFiltered = searchTerm
         ? state.libraryClips.filter(c => c.filename.toLowerCase().includes(searchTerm))
         : state.libraryClips;
+    state.libraryMomentFilter = normalizeAvailableMomentFilter(
+        searchFiltered,
+        clip => clip,
+        state.libraryMomentFilter,
+    );
+    renderMomentFilterBar(
+        'library-moment-filters',
+        searchFiltered,
+        clip => clip,
+        state.libraryMomentFilter,
+        setLibraryMomentFilter,
+    );
+    const filtered = searchFiltered.filter(clip =>
+        clipMatchesMomentFilter(clip, clip, state.libraryMomentFilter)
+    );
+    const libCountEl = document.getElementById('library-count');
+    if (libCountEl) {
+        libCountEl.textContent = filtered.length !== state.libraryClips.length
+            ? `${filtered.length}/${state.libraryClips.length} videos`
+            : (state.libraryClips.length ? state.libraryClips.length + ' video' + (state.libraryClips.length !== 1 ? 's' : '') : '');
+    }
 
     if (!filtered.length) {
         grid.innerHTML = '';
@@ -2399,6 +3703,12 @@ function renderLibraryGrid() {
 const filterLibrary = _debounce(() => {
     renderLibraryGrid();
 }, 200);
+window.filterLibrary = filterLibrary;
+
+function setLibraryMomentFilter(filter) {
+    state.libraryMomentFilter = String(filter || 'all');
+    renderLibraryGrid();
+}
 
 function setLibraryView(view) {
     state.libraryView = view;
@@ -2408,8 +3718,9 @@ function setLibraryView(view) {
     document.getElementById('lib-view-list').classList.toggle('active', view === 'list');
 }
 
-function previewLibraryClip(filename, url) {
+function previewLibraryClip(filename, url, clip = null) {
     state.previewClipIdx = -1; // not from results
+    state.previewLibraryClip = clip || { filename, url };
     renderPreviewFeedbackState();
     const video = document.getElementById('preview-video');
     video.src = url;
@@ -2633,7 +3944,10 @@ async function loadUploadSection() {
             const r = await pywebview.api.get_results();
             state.results = visibleClipList(r.clips || []);
             state.moments = r.moments || [];
-        } catch (_) {}
+        } catch (e) {
+            console.error('Upload section refresh failed:', e);
+            toast('Could not refresh clips for upload', 'error');
+        }
     }
 
     await refreshScheduleFromBackend(false);
@@ -2957,7 +4271,7 @@ function renderCalendar() {
                 const chip = document.createElement('div');
                 const isMissed = isScheduleMissed(s);
                 chip.className = 'cal-chip' + (s.uploaded ? ' uploaded' : isMissed ? ' missed' : '');
-                chip.innerHTML = `<span>C${s.clipIdx + 1}</span><span class="cal-chip-time">${s.time || ''}</span>`;
+                chip.innerHTML = `<span>C${s.clipIdx + 1}</span><span class="cal-chip-time">${escHtml(s.time || '')}</span>`;
                 chip.title = `${s.title || 'Clip ' + (s.clipIdx + 1)} — ${s.time}${s.uploaded ? ' (uploaded)' : isMissed ? ' (missed)' : ''}`;
                 chip.onclick = (e) => { e.stopPropagation(); openMetaModal(s._origIdx); };
                 cell.appendChild(chip);
@@ -3097,9 +4411,9 @@ function openDayDetailView(dateStr, dayItems) {
             <div class="day-detail-info">
                 <div class="day-detail-item-title">${escHtml(s.title || 'Untitled')}</div>
                 <div class="day-detail-meta">
-                    <span class="day-detail-time">${s.time || '—'}</span>
-                    <span class="day-detail-status ${statusClass}">${statusLabel}</span>
-                    <span class="day-detail-privacy">${s.privacy || 'public'}</span>
+                    <span class="day-detail-time">${escHtml(s.time || '—')}</span>
+                    <span class="day-detail-status ${statusClass}">${escHtml(statusLabel)}</span>
+                    <span class="day-detail-privacy">${escHtml(s.privacy || 'public')}</span>
                 </div>
             </div>
             <div class="day-detail-actions-row">
@@ -3596,12 +4910,12 @@ function renderTimeline() {
             <div class="timeline-info">
                 <span class="timeline-title">${escHtml(s.title)}</span>
                 <div class="timeline-date">
-                    <span class="timeline-date-val">${dateFmt}</span>
-                    <span class="timeline-time-val">${s.time}</span>
+                    <span class="timeline-date-val">${escHtml(dateFmt)}</span>
+                    <span class="timeline-time-val">${escHtml(s.time || '')}</span>
                     ${chName ? `<span class="timeline-ch-name">${escHtml(chName)}</span>` : ''}
                 </div>
             </div>
-            <span class="timeline-status ${statusClass}">${statusLabel}</span>
+            <span class="timeline-status ${statusClass}">${escHtml(statusLabel)}</span>
             <button class="timeline-edit" onclick="event.stopPropagation(); removeScheduleAt(${s._idx})" title="Remove">&times;</button>`;
         frag.appendChild(item);
     });
@@ -4013,6 +5327,14 @@ function populateSettings(s) {
     setSlider('set-clip-duration', s.clip_duration);
     setSlider('set-min-gap', s.min_gap);
     setSlider('set-crf', s.video_crf);
+    state.wizardProcessingDepth = normalizeProcessingDepth(s.processing_depth);
+    setSelect('set-detection-preference', normalizeDetectionPreference(s.detection_preference));
+    const visualDiagnostics = document.getElementById('set-visual-diagnostics');
+    if (visualDiagnostics) visualDiagnostics.checked = s.visual_diagnostics !== false;
+    const aiMomentClassification = document.getElementById('set-ai-moment-classification');
+    if (aiMomentClassification) aiMomentClassification.checked = s.ai_moment_classification === true;
+    const momentCategoryRanking = document.getElementById('set-moment-category-ranking');
+    if (momentCategoryRanking) momentCategoryRanking.checked = s.moment_category_ranking === true;
     setSelect('set-model', s.whisper_model);
     setSelect('set-preset', s.ffmpeg_preset);
     setVal('set-language', s.whisper_language || '');
@@ -4034,6 +5356,8 @@ function gatherSettings() {
     const autoClips = document.getElementById('set-auto-clips')?.checked;
     const s = {
         num_clips: autoClips ? 'auto' : parseInt(getVal('set-num-clips')),
+        processing_depth: normalizeProcessingDepth(state.wizardProcessingDepth || state.settings?.processing_depth),
+        detection_preference: normalizeDetectionPreference(getVal('set-detection-preference')),
         clip_duration: parseInt(getVal('set-clip-duration')),
         min_gap: parseInt(getVal('set-min-gap')),
         whisper_model: getVal('set-model'),
@@ -4048,11 +5372,14 @@ function gatherSettings() {
         video_crf: getVal('set-crf'),
         crop_vertical: document.getElementById('set-crop-vertical')?.checked ?? true,
         description_profile: descriptionProfile(),
+        visual_diagnostics: document.getElementById('set-visual-diagnostics')?.checked ?? true,
+        ai_moment_classification: document.getElementById('set-ai-moment-classification')?.checked ?? false,
+        moment_category_ranking: document.getElementById('set-moment-category-ranking')?.checked ?? false,
+        voice_profile_ranking: Boolean(state.settings?.voice_profile_ranking),
     };
     state.settings = { ...state.settings, ...s };
     saveLocal('settings', s);
-    // Also persist to Python backend (survives localStorage clears)
-    try { pywebview.api.save_settings(s); } catch (_) {}
+    persistSettingsAsync(s);
     return s;
 }
 
@@ -4070,9 +5397,64 @@ function resetSettings() {
         .catch(() => toast('Could not reset settings', 'error'));
 }
 
+async function refreshSubtitlePreviewSnapshot(force = false) {
+    const preview = document.getElementById('subtitle-placement-preview');
+    const empty = document.getElementById('subtitle-placement-snapshot-empty');
+    if (!preview || !window.pywebview || !pywebview.api) return;
+    try {
+        const r = await pywebview.api.get_subtitle_preview_url();
+        const url = r && r.url ? String(r.url) : '';
+        if (!url) {
+            resetSubtitlePreviewSnapshot(false);
+            return;
+        }
+        if (!force && _subtitlePreviewUrl === url && preview.classList.contains('has-snapshot')) {
+            return;
+        }
+        _subtitlePreviewUrl = url;
+        preview.classList.remove('snapshot-empty');
+        preview.classList.add('has-snapshot');
+        if (empty) empty.textContent = r.filename ? `Preview: ${r.filename}` : '';
+        generateThumbnail(url, preview, 1.5);
+        const largePreview = document.getElementById('subtitle-placement-preview-large');
+        if (largePreview && !largePreview.closest('.modal')?.classList.contains('hidden')) {
+            largePreview.classList.remove('snapshot-empty');
+            largePreview.classList.add('has-snapshot');
+            const largeEmpty = document.getElementById('subtitle-placement-large-empty');
+            if (largeEmpty) largeEmpty.textContent = r.filename ? `Preview: ${r.filename}` : '';
+            generateThumbnail(url, largePreview, 1.5);
+        }
+    } catch (_) {
+        if (!preview.classList.contains('has-snapshot')) resetSubtitlePreviewSnapshot(false);
+    }
+}
+
+function resetSubtitlePreviewSnapshot(showToast = true) {
+    const preview = document.getElementById('subtitle-placement-preview');
+    const largePreview = document.getElementById('subtitle-placement-preview-large');
+    const empty = document.getElementById('subtitle-placement-snapshot-empty');
+    const largeEmpty = document.getElementById('subtitle-placement-large-empty');
+    _subtitlePreviewUrl = '';
+    if (preview) {
+        preview.classList.remove('has-snapshot');
+        preview.classList.add('snapshot-empty');
+        preview.style.backgroundImage = '';
+        preview.style.backgroundSize = '';
+        preview.style.backgroundPosition = '';
+    }
+    if (largePreview) {
+        largePreview.classList.remove('has-snapshot');
+        largePreview.classList.add('snapshot-empty');
+        largePreview.style.backgroundImage = '';
+        largePreview.style.backgroundSize = '';
+        largePreview.style.backgroundPosition = '';
+    }
+    if (empty) empty.textContent = 'Preview uses your latest clip when available';
+    if (largeEmpty) largeEmpty.textContent = 'Preview uses your latest clip when available';
+    if (showToast) toast('Subtitle preview reset', 'info');
+}
+
 function updateSubtitlePlacementPreview() {
-    const box = document.getElementById('subtitle-placement-box');
-    if (!box) return;
     const panel = document.querySelector('.subtitle-placement-panel');
     const x = Math.max(10, Math.min(90, parseInt(getVal('set-subtitle-x') || '50')));
     const y = Math.max(12, Math.min(92, parseInt(getVal('set-subtitle-y') || '82')));
@@ -4089,11 +5471,35 @@ function updateSubtitlePlacementPreview() {
         panel.querySelectorAll('input[type="range"]').forEach(input => { input.disabled = captionsOff; });
     }
 
-    box.style.left = adjustedX + '%';
-    box.style.top = y + '%';
-    box.style.width = width + '%';
-    box.className = `subtitle-placement-box subtitle-placement-${style}`;
-    box.textContent = captionsOff ? 'NO CAPTIONS' : 'TRANSCRIPT TEXT';
+    ['subtitle-placement-box', 'subtitle-placement-box-large'].forEach(id => {
+        const box = document.getElementById(id);
+        if (!box) return;
+        box.style.left = adjustedX + '%';
+        box.style.top = y + '%';
+        box.style.width = width + '%';
+        box.className = `subtitle-placement-box subtitle-placement-${style}`;
+        box.textContent = captionsOff ? 'NO CAPTIONS' : 'TRANSCRIPT TEXT';
+    });
+}
+
+async function openSubtitlePreviewModal() {
+    const largePreview = document.getElementById('subtitle-placement-preview-large');
+    const largeEmpty = document.getElementById('subtitle-placement-large-empty');
+    if (!largePreview) return;
+    updateSubtitlePlacementPreview();
+    if (!_subtitlePreviewUrl) await refreshSubtitlePreviewSnapshot(false);
+    if (_subtitlePreviewUrl) {
+        largePreview.classList.remove('snapshot-empty');
+        largePreview.classList.add('has-snapshot');
+        if (largeEmpty) largeEmpty.textContent = '';
+        generateThumbnail(_subtitlePreviewUrl, largePreview, 1.5);
+    } else {
+        largePreview.classList.remove('has-snapshot');
+        largePreview.classList.add('snapshot-empty');
+        largePreview.style.backgroundImage = '';
+        if (largeEmpty) largeEmpty.textContent = 'Generate a clip first, then open this preview again.';
+    }
+    showModal('subtitle-preview-modal');
 }
 
 function updateSliderLabel(el) {
@@ -4151,10 +5557,31 @@ function loadLocal(k, fb) { try { const d = localStorage.getItem('viria_'+k); re
 
 function toast(msg, type = 'info') {
     const c = document.getElementById('toast-container');
+    if (!c) {
+        console.log(`[toast:${type}] ${msg}`);
+        return;
+    }
     const el = document.createElement('div');
     el.className = `toast ${type}`; el.textContent = msg;
     c.appendChild(el);
     setTimeout(() => { el.classList.add('removing'); setTimeout(() => el.remove(), 300); }, 4000);
+}
+
+function safeToast(msg, type = 'info') {
+    try {
+        toast(msg, type);
+    } catch (e) {
+        console.warn('Toast failed', e);
+    }
+}
+
+function safeAddNotification(title, desc, type = 'info', options = {}) {
+    try {
+        return addNotification(title, desc, type, options);
+    } catch (e) {
+        console.warn('Notification failed', e);
+        return null;
+    }
 }
 
 /* ── Notification Center ──────────────────────────────────────────────── */
@@ -4226,11 +5653,13 @@ function _renderNotifList() {
 
     if (!_notifications.length) {
         list.innerHTML = '';
-        list.appendChild(empty);
-        empty.style.display = '';
+        if (empty) {
+            list.appendChild(empty);
+            empty.style.display = '';
+        }
         return;
     }
-    empty.style.display = 'none';
+    if (empty) empty.style.display = 'none';
 
     // Build items — reuse existing DOM where possible
     const frag = document.createDocumentFragment();
