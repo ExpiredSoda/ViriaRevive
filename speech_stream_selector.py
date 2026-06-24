@@ -15,7 +15,7 @@ from pathlib import Path
 
 from audio_streams import get_audio_streams
 from clipper import extract_audio_clip
-from transcriber import transcribe_clip
+from transcriber import transcribe_clips
 
 
 VOICE_HINTS = ("microphone", "mic", "voice", "commentary", "narration")
@@ -208,6 +208,7 @@ def select_speech_stream(
         sampled_seconds = 0.0
         transcript_parts: list[str] = []
         acoustic_profiles: list[dict] = []
+        extracted_samples: list[tuple[Path, float]] = []
 
         for sample_idx, moment in enumerate(samples):
             start = moment["_sample_start"]
@@ -218,14 +219,24 @@ def select_speech_stream(
             try:
                 if not extract_audio_clip(video_path, start, end, wav, audio_stream=ordinal):
                     continue
-                words = transcribe_clip(wav, model_size=model_size, language=language)
+                extracted_samples.append((wav, end - start))
+            except Exception:
+                try:
+                    wav.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        probe_wavs = [wav for wav, _duration in extracted_samples]
+        transcribed_samples = transcribe_clips(probe_wavs, model_size=model_size, language=language) if probe_wavs else []
+        for (wav, duration), words in zip(extracted_samples, transcribed_samples):
+            try:
                 if words:
                     sample_hits += 1
                     words_total += len(words)
                     transcript = " ".join(str(w.get("text", "")).strip() for w in words).strip()
                     transcript_parts.append(transcript)
                     chars_total += sum(len(w.get("text", "")) for w in words)
-                    acoustic_profiles.append(analyze_audio_bed(wav, words, duration=end - start))
+                    acoustic_profiles.append(analyze_audio_bed(wav, words, duration=duration))
             finally:
                 try:
                     wav.unlink(missing_ok=True)

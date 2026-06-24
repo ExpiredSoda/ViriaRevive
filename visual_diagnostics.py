@@ -39,6 +39,7 @@ def analyze_candidate_visuals(
         "sampled_candidate_count": 0,
         "max_candidates": int(max_candidates),
         "frames_read": 0,
+        "frame_cache_hits": 0,
         "elapsed_seconds": 0.0,
         "warnings": [],
     }
@@ -68,12 +69,19 @@ def analyze_candidate_visuals(
 
         limit = max(0, min(len(candidates), int(max_candidates or 0)))
         read_timeouts = 0
+        frame_cache: dict[float, tuple[bool, object, str]] = {}
         for idx, candidate in enumerate(candidates[:limit]):
             sample_times = _candidate_sample_times(candidate, duration)
             frames = []
             actual_times = []
             for sample_time in sample_times:
-                ok, frame, read_status = _read_frame_at(cv2, path, sample_time)
+                cache_key = round(float(sample_time), 2)
+                if cache_key in frame_cache:
+                    ok, frame, read_status = frame_cache[cache_key]
+                    report["frame_cache_hits"] = int(report.get("frame_cache_hits") or 0) + 1
+                else:
+                    ok, frame, read_status = _read_frame_at(cv2, path, sample_time)
+                    frame_cache[cache_key] = (ok, frame, read_status)
                 if read_status == "timeout":
                     read_timeouts += 1
                     if "frame_read_timeout" not in report["warnings"]:

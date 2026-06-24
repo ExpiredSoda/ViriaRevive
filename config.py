@@ -20,7 +20,7 @@ else:
 BASE_DIR = APP_DIR
 BIN_DIR = APP_DIR / "bin"
 INTERNAL_BIN_DIR = INTERNAL_DIR / "bin"
-for _bin_dir in (BIN_DIR, INTERNAL_BIN_DIR):
+for _bin_dir in (INTERNAL_BIN_DIR, BIN_DIR):
     if _bin_dir.exists():
         os.environ["PATH"] = str(_bin_dir) + os.pathsep + os.environ.get("PATH", "")
 

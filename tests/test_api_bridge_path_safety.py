@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from api_bridge import (  # noqa: E402
     ApiBridge,
+    _allowed_media_origin,
     _candidate_model_for_depth,
     _normalize_audio_source_settings,
     _normalize_processing_depth,
@@ -148,6 +149,85 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
     def test_safe_child_path_rejects_parent_traversal(self):
         self.assertIsNone(ApiBridge._safe_child_path(CLIPS_DIR, "..\\outside.mp4"))
 
+    def test_bulk_library_delete_rejects_traversal_without_unlinking_outside_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir) / "clips"
+            temp_clips.mkdir()
+            outside = Path(temp_dir) / "outside.mp4"
+            outside.write_text("do not delete", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = []
+            bridge._moments = []
+            bridge._scheduled = []
+            bridge._state_lock = threading.RLock()
+            bridge._personalization = {"schema_version": 1, "events": [], "clips": {}}
+            bridge._personalization_lock = threading.RLock()
+            bridge._save_personalization = lambda: None
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                result = bridge.delete_library_files(["..\\outside.mp4"])
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["deleted"], [])
+            self.assertEqual(result["failed"][0]["error"], "Invalid filename")
+            self.assertTrue(outside.exists())
+            self.assertEqual(saves, [])
+
+    def test_bulk_library_delete_prunes_state_and_keeps_partial_failures(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            clip_a = temp_clips / "alpha.mp4"
+            clip_b = temp_clips / "bravo.mp4"
+            clip_c = temp_clips / "charlie.mp4"
+            for path in (clip_a, clip_b, clip_c):
+                path.write_text("video", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_a, clip_b, clip_c]
+            bridge._moments = [
+                {"clip_id": "clip-a", "source_id": "source-a"},
+                {"clip_id": "clip-b", "source_id": "source-b"},
+                {"clip_id": "clip-c", "source_id": "source-c"},
+            ]
+            bridge._scheduled = [
+                {"clip_id": "clip-b", "clip_filename": "bravo.mp4", "title": "Bravo", "description": "Done"},
+                {"clip_id": "clip-c", "clip_filename": "charlie.mp4", "title": "Charlie", "description": "Keep"},
+            ]
+            bridge._state_lock = threading.RLock()
+            bridge._personalization = {
+                "schema_version": 1,
+                "events": [],
+                "clips": {
+                    "clip-a": {"clip_id": "clip-a", "clip_filename": "alpha.mp4"},
+                    "clip-b": {"clip_id": "clip-b", "clip_filename": "bravo.mp4"},
+                    "clip-c": {"clip_id": "clip-c", "clip_filename": "charlie.mp4"},
+                },
+            }
+            bridge._personalization_lock = threading.RLock()
+            bridge._save_personalization = lambda: None
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                result = bridge.delete_library_files(["alpha.mp4", "bravo.mp4", "missing.mp4"])
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["deleted"], ["alpha.mp4", "bravo.mp4"])
+            self.assertEqual(result["failed"], [{"filename": "missing.mp4", "error": "File not found"}])
+            self.assertFalse(clip_a.exists())
+            self.assertFalse(clip_b.exists())
+            self.assertTrue(clip_c.exists())
+            self.assertEqual([path.name for path in bridge._results], ["charlie.mp4"])
+            self.assertEqual([moment["clip_id"] for moment in bridge._moments], ["clip-c"])
+            self.assertEqual([item["clip_id"] for item in bridge._scheduled], ["clip-c"])
+            self.assertTrue(bridge._personalization["clips"]["clip-a"]["rendered_file_deleted"])
+            self.assertTrue(bridge._personalization["clips"]["clip-b"]["rendered_file_deleted"])
+            self.assertNotIn("rendered_file_deleted", bridge._personalization["clips"]["clip-c"])
+            self.assertEqual(saves, [True])
+
     def test_unique_clip_output_path_does_not_reuse_existing_render(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_clips = Path(temp_dir)
@@ -203,7 +283,12 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
                 "clip_id": "clip-library",
                 "source_id": "source-library",
                 "primary_category": "commentary_or_review",
-                "moment_categories": {"primary": "commentary_or_review"},
+                "moment_categories": {
+                    "primary": "commentary_or_review",
+                    "confidence": 0.77,
+                    "scores": {"commentary_or_review": 0.9, "low_value": 0.1},
+                    "signals": {"transcript": ["private raw phrase"]},
+                },
                 "ai_moment_classification": {
                     "status": "model_not_ready",
                     "provider": "heuristic",
@@ -222,6 +307,10 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertTrue(result["clips"][0]["clip_id"])
             self.assertTrue(result["clips"][0]["source_id"])
             self.assertEqual(result["clips"][0]["primary_category"], "commentary_or_review")
+            self.assertEqual(result["clips"][0]["moment_categories"]["primary"], "commentary_or_review")
+            self.assertEqual(result["clips"][0]["moment_categories"]["confidence"], 0.77)
+            self.assertNotIn("scores", result["clips"][0]["moment_categories"])
+            self.assertNotIn("signals", result["clips"][0]["moment_categories"])
             self.assertEqual(result["clips"][0]["ai_moment_classification"]["provider"], "heuristic")
             self.assertEqual(result["clips"][0]["ai_moment_classification"]["selection_impact"], "none")
             for bulky_key in (
@@ -232,9 +321,53 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
                 "voice_profile",
                 "quality_score",
                 "selection_rank_score",
-                "moment_categories",
             ):
                 self.assertNotIn(bulky_key, result["clips"][0])
+
+    def test_source_title_context_is_sanitized_and_reaches_metadata_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "clip_id": "clip-1",
+                "source_id": "source-1",
+                "source_stem": "source-stem",
+                "transcript": "oh no run",
+            }]
+            bridge._scheduled = [{
+                "clipIdx": 0,
+                "clip_id": "clip-1",
+                "source_id": "source-1",
+                "source_stem": "source-stem",
+                "title": "Old",
+                "description_generated": "stale",
+                "generated_description": "stale",
+            }]
+            bridge._state_lock = threading.RLock()
+            bridge._save_state = lambda: None
+            bridge._game_title_for_clip = lambda _idx: "Alan Wake"
+
+            result = bridge.save_source_title_context(
+                "source-1",
+                "source-stem",
+                r"Blind nursing home chapter C:\Users\ExpiredSoda\client_secrets.json api_key=secret123",
+            )
+            payload = bridge._clip_payload(0, clip_path, include_url=False)
+            context = bridge._title_context_for_clip(0)
+            sidecar = bridge._write_metadata_sidecar(0, "Title", "Alan Wake", "Description", "tags", context)
+            sidecar_text = Path(sidecar).read_text(encoding="utf-8")
+
+            self.assertTrue(result["ok"])
+            self.assertIn("Blind nursing home chapter", result["creator_title_context"])
+            self.assertIn("[local-path]", result["creator_title_context"])
+            self.assertIn("api_key=[redacted]", result["creator_title_context"])
+            self.assertNotIn("client_secrets.json", result["creator_title_context"])
+            self.assertEqual(payload["creator_title_context"], result["creator_title_context"])
+            self.assertEqual(context["creator_title_context"], result["creator_title_context"])
+            self.assertEqual(bridge._scheduled[0]["description_generated"], "")
+            self.assertIn("Creator Context: Blind nursing home chapter", sidecar_text)
 
     def test_classify_selected_moments_does_not_fake_ollama_when_skipped(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -270,9 +403,18 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
     def test_local_video_server_sends_thumbnail_safe_headers(self):
         source = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
 
-        self.assertIn('self.send_header("Access-Control-Allow-Origin", "*")', source)
+        self.assertNotIn('self.send_header("Access-Control-Allow-Origin", "*")', source)
+        self.assertIn('self.send_header("Access-Control-Allow-Origin", allowed_origin)', source)
         self.assertIn('self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")', source)
         self.assertIn("http.server.ThreadingHTTPServer", source)
+
+    def test_local_video_server_origin_allowlist_is_loopback_only(self):
+        self.assertEqual(_allowed_media_origin("null"), "null")
+        self.assertEqual(_allowed_media_origin("http://localhost:3000"), "http://localhost:3000")
+        self.assertEqual(_allowed_media_origin("http://127.0.0.1:3000"), "http://127.0.0.1:3000")
+        self.assertEqual(_allowed_media_origin("http://[::1]:3000"), "http://[::1]:3000")
+        self.assertIsNone(_allowed_media_origin("https://example.com"))
+        self.assertIsNone(_allowed_media_origin("http://192.168.1.10:3000"))
 
     def test_delete_after_upload_toggle_persists_immediately(self):
         bridge = ApiBridge.__new__(ApiBridge)

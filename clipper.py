@@ -543,11 +543,12 @@ def extract_clip(
                               warning="Subtitle filter failed — check ffmpeg libass support")
 
     # ── CASE D: no filters → stream copy ─────────────────────────────────
-    if len(get_audio_streams(video_path)) > 1:
+    streams = get_audio_streams(video_path)
+    if len(streams) > 1:
         cmd = [
             "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
             "-t", str(duration), "-c:v", "copy",
-            *audio_output_args(video_path, bitrate="192k"),
+            *audio_output_args(video_path, bitrate="192k", streams=streams),
             str(output_path),
         ]
     else:
@@ -607,22 +608,17 @@ def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path
 
 
 def _rename_safe(src: Path, dst: Path):
-    import shutil
-    try:
-        if dst.exists():
-            dst.unlink()
-        src.rename(dst)
-    except Exception:
-        shutil.move(str(src), str(dst))
+    os.replace(src, dst)
 
 
 def _fallback_stream_copy(video_path, start, duration, output_path):
     print("[!] Falling back to stream copy...")
-    if len(get_audio_streams(video_path)) > 1:
+    streams = get_audio_streams(video_path)
+    if len(streams) > 1:
         cmd = [
             "ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
             "-t", str(duration), "-c:v", "copy",
-            *audio_output_args(video_path, bitrate="192k"),
+            *audio_output_args(video_path, bitrate="192k", streams=streams),
             str(output_path),
         ]
     else:

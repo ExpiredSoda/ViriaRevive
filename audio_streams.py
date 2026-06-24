@@ -123,8 +123,8 @@ def pick_voice_stream_ordinal(video_path: str | Path) -> int | None:
     return int(streams[0]["ordinal"])
 
 
-def describe_audio_streams(video_path: str | Path) -> str:
-    streams = get_audio_streams(video_path)
+def describe_audio_streams(video_path: str | Path, streams: list[dict] | None = None) -> str:
+    streams = streams if streams is not None else get_audio_streams(video_path)
     if not streams:
         return "no audio streams"
     return ", ".join(
@@ -133,9 +133,10 @@ def describe_audio_streams(video_path: str | Path) -> str:
     )
 
 
-def build_audio_mix_filter(video_path: str | Path, mono: bool = False) -> tuple[str, str] | None:
+def build_audio_mix_filter(video_path: str | Path, mono: bool = False,
+                           streams: list[dict] | None = None) -> tuple[str, str] | None:
     """Build a filter_complex graph that mixes all source audio streams."""
-    streams = get_audio_streams(video_path)
+    streams = streams if streams is not None else get_audio_streams(video_path)
     if len(streams) < 2:
         return None
 
@@ -163,9 +164,10 @@ def build_audio_mix_filter(video_path: str | Path, mono: bool = False) -> tuple[
 
 
 def audio_output_args(video_path: str | Path, bitrate: str = "192k",
-                      copy_single: bool = False) -> list[str]:
+                      copy_single: bool = False,
+                      streams: list[dict] | None = None) -> list[str]:
     """Return ffmpeg output args that keep video plus the intended audio mix."""
-    streams = get_audio_streams(video_path)
+    streams = streams if streams is not None else get_audio_streams(video_path)
     if not streams:
         return ["-map", "0:v:0", "-an"]
 
@@ -175,12 +177,12 @@ def audio_output_args(video_path: str | Path, bitrate: str = "192k",
             return [*args, "-c:a", "copy"]
         return [*args, "-c:a", "aac", "-strict", "-2", "-b:a", bitrate]
 
-    mix = build_audio_mix_filter(video_path, mono=False)
+    mix = build_audio_mix_filter(video_path, mono=False, streams=streams)
     if not mix:
         return ["-map", "0:v:0", "-map", "0:a:0", "-c:a", "aac", "-strict", "-2", "-b:a", bitrate]
 
     filter_graph, out_label = mix
-    print(f"[audio] Mixing source audio streams: {describe_audio_streams(video_path)}")
+    print(f"[audio] Mixing source audio streams: {describe_audio_streams(video_path, streams=streams)}")
     return [
         "-filter_complex", filter_graph,
         "-map", "0:v:0", "-map", f"[{out_label}]",

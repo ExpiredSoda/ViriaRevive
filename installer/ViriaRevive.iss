@@ -28,11 +28,11 @@ VersionInfoCompany=Expired Soda
 VersionInfoDescription=AI-assisted gameplay Shorts clipper and scheduler
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
+LicenseFile=..\LICENSE
+InfoAfterFile=..\dist\ViriaRevive\THIRD_PARTY_NOTICES.md
 
 [Files]
 Source: "..\dist\ViriaRevive\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

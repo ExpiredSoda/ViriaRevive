@@ -36,11 +36,139 @@ class GuiStaticGuardTests(unittest.TestCase):
 
     def test_upload_completion_refreshes_schedule_from_backend(self):
         self.assertIn("await refreshScheduleFromBackend(false);", self.app_js)
+        self.assertIn("await refreshScheduleFromBackend(true);", self.app_js)
+        self.assertIn("clearStaleScheduleUi();", self.app_js)
+        self.assertIn("removeNotificationsByType('uploading');", self.app_js)
         self.assertIn("window.onPipelineComplete = async function", self.app_js)
         self.assertIn("window.onPipelineCancelled = async function", self.app_js)
 
+    def test_upload_readiness_strip_is_wired(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="upload-readiness-strip"', html)
+        self.assertIn("focusUploadReadiness", self.app_js)
+        self.assertIn('onclick="focusUploadReadiness', self.app_js)
+        self.assertIn("function scheduleItemStatus", self.app_js)
+        self.assertIn("schedulerStatus === 'upload_outcome_unknown'", self.app_js)
+        self.assertIn("label: 'Check YouTube'", self.app_js)
+        self.assertIn("function uploadReadinessState", self.app_js)
+        self.assertIn("function renderUploadReadinessStrip", self.app_js)
+        self.assertIn("renderUploadReadinessStrip();", self.app_js)
+        self.assertIn(".upload-readiness-step.is-ready", css)
+        self.assertIn(".upload-readiness-step.is-warning", css)
+        self.assertIn(".upload-readiness-step.is-blocked", css)
+
+    def test_upload_layout_has_review_panel_summary_and_sticky_action_bar(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("upload-top-grid", html)
+        self.assertIn("upload-layout", html)
+        self.assertIn("upload-main", html)
+        self.assertIn('id="upload-review-panel"', html)
+        self.assertIn("upload-prep-panel", html)
+        self.assertIn("upload-action-bar", html)
+        self.assertIn('id="upload-summary-clips"', html)
+        self.assertIn('id="upload-summary-channel"', html)
+        self.assertIn('id="upload-summary-visibility"', html)
+        self.assertIn('id="upload-summary-start"', html)
+        self.assertIn('id="upload-summary-span"', html)
+        self.assertIn('id="upload-action-title"', html)
+        self.assertIn('id="btn-upload"', html)
+        self.assertIn("function uploadSummaryState", self.app_js)
+        self.assertIn("function renderUploadSummary", self.app_js)
+        self.assertIn("renderUploadSummary();", self.app_js)
+        self.assertIn(".upload-prep-panel", css)
+        self.assertIn(".upload-summary-row", css)
+        self.assertIn(".upload-action-bar", css)
+        self.assertIn(".upload-action-controls .btn-upload-go", css)
+
+    def test_upload_calendar_uses_history_markers_without_fake_status(self):
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("function uploadHistoryDateKey", self.app_js)
+        self.assertIn("function uploadHistoryByDate", self.app_js)
+        self.assertIn("const historyByDate = uploadHistoryByDate(filter);", self.app_js)
+        self.assertIn("const representedSent = new Set();", self.app_js)
+        self.assertIn("cal-history-marker", self.app_js)
+        self.assertIn("marker.onclick = (e) => { e.stopPropagation(); openDayDetailView(dateStr, dayItems || [], historyItems); };", self.app_js)
+        self.assertIn("function historyRowStatus", self.app_js)
+        self.assertIn("function historyRowTimeLabel", self.app_js)
+        self.assertIn("Upload history", self.app_js)
+        self.assertIn(".cal-history-marker", css)
+        self.assertIn(".day-detail-section-title", css)
+        self.assertIn(".day-detail-history-icon", css)
+        self.assertIn(".day-detail-history-note", css)
+        self.assertIn("state.uploadHistory", self.app_js)
+
+    def test_upload_wording_separates_local_queue_from_youtube_send(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn("Send Scheduled Clips to YouTube", html)
+        self.assertIn("Local Upload Watcher active", html)
+        self.assertIn("Pending locally", html)
+        self.assertNotIn("Upload Scheduled Posts to YouTube", html)
+        self.assertIn("next send to YouTube", self.app_js)
+
+    def test_schedule_status_classes_are_shared_across_calendar_timeline_and_detail(self):
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("scheduleItemStatus(s", self.app_js)
+        self.assertIn("cal-chip ${status.className}", self.app_js)
+        self.assertIn("timeline-status ${statusClass}", self.app_js)
+        self.assertIn("day-detail-status ${statusClass}", self.app_js)
+        self.assertIn(".cal-chip.sending", css)
+        self.assertIn(".timeline-status.failed", css)
+        self.assertIn(".day-detail-status.youtube-scheduled", css)
+        self.assertIn("scheduleItemStatus(s).key === 'unknown'", self.app_js)
+        self.assertIn("Check YouTube Studio", self.app_js)
+        self.assertIn("['missed', 'failed', 'unknown', 'disconnected', 'invalid']", self.app_js)
+
+    def test_empty_schedule_clears_stale_upload_ui(self):
+        self.assertIn("if (!state.scheduled.length) {", self.app_js)
+        self.assertIn("if (summaryEl) summaryEl.textContent = '';", self.app_js)
+        self.assertIn("if (schedulerBar) schedulerBar.classList.add('hidden');", self.app_js)
+        self.assertIn("_cachedNextUpload = null;", self.app_js)
+        self.assertIn("function removeNotificationsByType(type)", self.app_js)
+
     def test_tags_are_not_overwritten_when_present(self):
         self.assertIn("if (!String(item.tags || '').trim()) item.tags = DEFAULT_UPLOAD_TAGS;", self.app_js)
+
+    def test_creator_title_context_is_wired_for_upload_metadata(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("Optional AI Notes", html)
+        self.assertIn('id="source-context-modal"', html)
+        self.assertIn('id="source-context-text"', html)
+        self.assertIn('id="modal-meta-creator-context"', html)
+        self.assertIn("function creatorTitleContextForClip", self.app_js)
+        self.assertIn("function openSourceTitleContextModal", self.app_js)
+        self.assertIn("function saveSourceTitleContextModal", self.app_js)
+        self.assertIn("pywebview.api.save_source_title_context", self.app_js)
+        self.assertIn("creator_title_context: creatorTitleContextForClip(idx)", self.app_js)
+        self.assertIn("creator_title_context: s.creator_title_context || ''", self.app_js)
+        self.assertIn("const hasGeneratedDescription = Object.prototype.hasOwnProperty.call(item, 'description_generated')", self.app_js)
+        self.assertIn("await pywebview.api.save_scheduled(state.scheduled);", self.app_js)
+        self.assertIn(".tray-folder-context-btn", css)
+        self.assertIn(".tray-folder-context-btn.has-context", css)
+        self.assertIn(".source-context-copy", css)
+
+    def test_upload_clip_tray_has_local_search_filter(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="clip-tray-search"', html)
+        self.assertIn('oninput="filterClipTray()"', html)
+        self.assertIn('id="clip-tray-summary"', html)
+        self.assertIn("state.clipTraySearch = searchTerm;", self.app_js)
+        self.assertIn("sourceMatches", self.app_js)
+        self.assertIn("clip.filename", self.app_js)
+        self.assertIn("const filterClipTray = _debounce", self.app_js)
+        self.assertIn("window.filterClipTray = filterClipTray;", self.app_js)
+        self.assertIn(".clip-tray-tools", css)
+        self.assertIn(".clip-tray-empty", css)
 
     def test_today_scheduling_skips_past_peak_slots(self):
         self.assertIn("const SCHEDULE_BUFFER_MINUTES = 10;", self.app_js)
@@ -60,6 +188,15 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("delete s.scheduler_status;", self.app_js)
         self.assertIn("delete s.missed_at;", self.app_js)
         self.assertIn("ensureSchedulerForPending();", self.app_js)
+
+    def test_upload_ui_loose_ends_are_guarded(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn("const selectedChannelId = first ? (first.channel_id || '')", self.app_js)
+        self.assertIn("const channelId = _getScheduleChannelId() || state.selectedChannel || null;", self.app_js)
+        self.assertIn('id="smart-sched-custom-perday"', html)
+        self.assertIn('oninput="_renderPeakTimesLegend(); renderUploadSummary()"', html)
+        self.assertIn("await refreshScheduleFromBackend(false);\n                await loadResults();", self.app_js)
 
     def test_schedule_rendering_escapes_persisted_text_fields(self):
         self.assertIn('class="cal-chip-time">${escHtml(s.time || \'\')}</span>', self.app_js)
@@ -148,6 +285,46 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("const filterLibrary = _debounce", self.app_js)
         self.assertIn("window.filterLibrary = filterLibrary;", self.app_js)
 
+    def test_all_videos_preserves_folder_state_and_supports_bulk_delete(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+        api = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
+
+        self.assertIn("libraryOpenFolders", self.app_js)
+        self.assertIn("state.libraryOpenFolders[folder.dataset.stem] = isOpen;", self.app_js)
+        self.assertIn("Object.prototype.hasOwnProperty.call(state.libraryOpenFolders", self.app_js)
+        self.assertIn("clip.source_stem", self.app_js)
+        self.assertIn("librarySelectedFilenames", self.app_js)
+        self.assertIn("libraryVisibleFilenames", self.app_js)
+        self.assertIn("function requestDeleteSelectedLibrary", self.app_js)
+        self.assertIn("delete_library_files(filenames)", self.app_js)
+        self.assertIn('id="library-select-visible"', html)
+        self.assertIn('id="library-clear-selected"', html)
+        self.assertIn('id="library-delete-selected"', html)
+        self.assertIn("library-select-input", self.app_js)
+        self.assertIn(".library-item.selected", css)
+        self.assertIn(".library-select-check", css)
+        self.assertIn("def delete_library_files", api)
+
+    def test_results_preserves_folder_state_and_supports_bulk_delete(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("resultsOpenFolders", self.app_js)
+        self.assertIn("state.resultsOpenFolders[folder.dataset.stem] = isOpen;", self.app_js)
+        self.assertIn("Object.prototype.hasOwnProperty.call(state.resultsOpenFolders", self.app_js)
+        self.assertIn("resultsSelectedFilenames", self.app_js)
+        self.assertIn("resultsVisibleFilenames", self.app_js)
+        self.assertIn("function requestDeleteSelectedResults", self.app_js)
+        self.assertIn("state.pendingDeleteSource = 'results-bulk';", self.app_js)
+        self.assertIn("delete_library_files(filenames)", self.app_js)
+        self.assertIn('id="results-select-visible"', html)
+        self.assertIn('id="results-clear-selected"', html)
+        self.assertIn('id="results-delete-selected"', html)
+        self.assertIn("result-select-input", self.app_js)
+        self.assertIn(".result-card.selected", css)
+        self.assertIn(".result-select-check", css)
+
     def test_settings_and_refresh_failures_are_user_visible(self):
         self.assertIn("function persistSettingsAsync", self.app_js)
         self.assertIn("await pywebview.api.save_settings(payload)", self.app_js)
@@ -176,6 +353,10 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("function momentLabelMarkup", self.app_js)
         self.assertIn("function aiMomentForClip", self.app_js)
         self.assertIn("function renderPreviewMomentLabel", self.app_js)
+        self.assertIn("source: 'Detected'", self.app_js)
+        self.assertIn("source = isOllama ? 'Ollama' : 'Fallback'", self.app_js)
+        self.assertIn("const chips = [];", self.app_js)
+        self.assertIn("if (detectedChip && (!aiChip || disagrees)) chips.push(detectedChip);", self.app_js)
         self.assertIn("renderPreviewMomentLabel();", self.app_js)
         self.assertIn("const momentLabel = momentLabelMarkup(clip, m);", self.app_js)
         self.assertIn("momentLabelMarkup(clip, m)", self.app_js)
@@ -197,7 +378,9 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("function clipMatchesMomentFilter", self.app_js)
         self.assertIn("function normalizeAvailableMomentFilter", self.app_js)
         self.assertIn("let categoryCount = 0;", self.app_js)
-        self.assertIn("sourceParts.push(`${categoryCount} category`)", self.app_js)
+        self.assertIn("sourceParts.push(`${aiCount} Ollama`)", self.app_js)
+        self.assertIn("sourceParts.push(`${localCount} fallback`)", self.app_js)
+        self.assertIn("sourceParts.push(`${categoryCount} detected`)", self.app_js)
         self.assertIn("(!labeled && active === 'all')", self.app_js)
         self.assertIn("key === 'unlabeled' ? 'Unlabeled'", self.app_js)
         self.assertIn("renderMomentFilterBar(\n        'results-moment-filters'", self.app_js)
@@ -215,7 +398,7 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn(".moment-filter-summary", css)
 
     def test_moment_labels_hide_when_metadata_is_absent(self):
-        self.assertIn("if (!primary) return null;", self.app_js)
+        self.assertIn("if (!primary && !detectedPrimary) return null;", self.app_js)
         self.assertIn("if (!info) return '';", self.app_js)
         self.assertIn("el.classList.add('hidden');", self.app_js)
         self.assertIn("el.innerHTML = '';", self.app_js)
@@ -230,8 +413,8 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertLess(on_idx, running_idx)
         self.assertLess(running_idx, missing_idx)
         self.assertIn("const isOllama = ai.status === 'ok' && ai.provider === 'ollama';", self.app_js)
-        self.assertIn("const isCategory = !ai.status;", self.app_js)
-        self.assertIn("const source = isCategory ? 'Category' : (isOllama ? 'AI' : 'Local');", self.app_js)
+        self.assertIn("const source = isOllama ? 'Ollama' : 'Fallback';", self.app_js)
+        self.assertIn("source: 'Detected'", self.app_js)
 
     def test_progress_callbacks_are_monotonic_for_active_processing(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")

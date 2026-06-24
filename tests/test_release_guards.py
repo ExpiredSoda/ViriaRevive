@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts import check_release_safety, write_release_hashes  # noqa: E402
+from scripts import check_release_compliance, check_release_safety, write_release_hashes  # noqa: E402
 
 
 class ReleaseGuardTests(unittest.TestCase):
@@ -32,8 +32,18 @@ class ReleaseGuardTests(unittest.TestCase):
     def test_installer_build_clears_stale_setup_artifacts_before_compile(self):
         script = (ROOT / "build_installer.bat").read_text(encoding="utf-8")
 
-        self.assertIn('del /Q "release\\ViriaReviveSetup-v%APP_VERSION%.exe"', script)
-        self.assertIn('del /Q "release\\ViriaReviveSetup-v%APP_VERSION%.exe.sha256"', script)
+        self.assertIn("release\\ViriaReviveSetup-v*.exe", script)
+        self.assertIn("release\\ViriaReviveSetup-v*.exe.sha256", script)
+        self.assertIn('del /Q "%%~F"', script)
+
+    def test_build_clears_stale_zip_artifacts_before_package(self):
+        script = (ROOT / "build.bat").read_text(encoding="utf-8")
+
+        self.assertIn("release\\ViriaRevive-v*-Windows-x64.zip", script)
+        self.assertIn("release\\ViriaRevive-v*-Windows-x64.zip.sha256", script)
+        self.assertIn("release\\ViriaRevive-Windows-x64.zip", script)
+        self.assertIn("release\\ViriaRevive-Windows-x64.zip.sha256", script)
+        self.assertIn('del /q "%%~F"', script)
 
     def test_release_safety_scans_app_owned_internal_dirs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -268,6 +278,83 @@ class ReleaseGuardTests(unittest.TestCase):
 
             self.assertEqual(code, 1)
             self.assertFalse((release / "ViriaRevive-Windows-x64.zip.sha256").exists())
+
+    def _write_minimum_release_files(self, root: Path, *, manifest_extra=None, notices_extra="") -> None:
+        (root / "README.md").write_text("README", encoding="utf-8")
+        (root / "LICENSE").write_text("MIT", encoding="utf-8")
+        notices = (
+            "FFmpeg PyAV OpenCV Ultralytics AGPL PyInstaller pystray\n"
+            "Third-party release notices.\n"
+            f"{notices_extra}"
+        )
+        (root / "THIRD_PARTY_NOTICES.md").write_text(notices, encoding="utf-8")
+        manifest = {
+            "python_packages": [
+                {"name": "ultralytics", "version": "1", "license": "AGPL-3.0"},
+                {"name": "pyinstaller", "version": "1", "license": "GPL exception"},
+                {"name": "pystray", "version": "1", "license": "LGPLv3"},
+            ]
+        }
+        if manifest_extra:
+            manifest.update(manifest_extra)
+        (root / "BUILD-MANIFEST.json").write_text(json_dumps(manifest), encoding="utf-8")
+
+    def test_release_compliance_requires_notice_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            with redirect_stdout(StringIO()):
+                code = check_release_compliance.main([str(root)])
+
+            self.assertEqual(code, 1)
+
+    def test_release_compliance_requires_paired_ffmpeg_binaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_minimum_release_files(root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "ffmpeg.exe").write_bytes(b"not-real")
+
+            with redirect_stdout(StringIO()) as output:
+                code = check_release_compliance.main([str(root)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("both bin/ffmpeg.exe and bin/ffprobe.exe", output.getvalue())
+
+    def test_release_compliance_blocks_hidden_internal_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_minimum_release_files(root)
+            hidden = root / "_internal" / "bin"
+            hidden.mkdir(parents=True)
+            (hidden / "ffmpeg.exe").write_bytes(b"hidden")
+
+            with redirect_stdout(StringIO()) as output:
+                code = check_release_compliance.main([str(root)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("hidden FFmpeg", output.getvalue())
+
+    def test_release_compliance_requires_native_media_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_minimum_release_files(root)
+            av_libs = root / "_internal" / "av.libs"
+            av_libs.mkdir(parents=True)
+            (av_libs / "avcodec-62-test.dll").write_bytes(b"dll")
+
+            with redirect_stdout(StringIO()) as output:
+                code = check_release_compliance.main([str(root)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("native_media_libraries", output.getvalue())
+
+
+def json_dumps(value):
+    import json
+
+    return json.dumps(value, indent=2)
 
 
 if __name__ == "__main__":

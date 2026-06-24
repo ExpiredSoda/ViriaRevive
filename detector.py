@@ -372,10 +372,10 @@ def _load_analysis_audio(video_path: Path) -> tuple[AudioSegment, Path | None]:
 
     duration = _probe_media_duration(video_path)
     timeout = _analysis_audio_timeout_seconds(duration)
-    mix = build_audio_mix_filter(video_path, mono=True) if len(streams) >= 2 else None
+    mix = build_audio_mix_filter(video_path, mono=True, streams=streams) if len(streams) >= 2 else None
     if mix:
         filter_graph, out_label = mix
-        print(f"[audio] Detection mix uses: {describe_audio_streams(video_path)}")
+        print(f"[audio] Detection mix uses: {describe_audio_streams(video_path, streams=streams)}")
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-nostdin",
             "-i", str(video_path),

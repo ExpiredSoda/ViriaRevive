@@ -1,6 +1,6 @@
 # Pending UX Todo
 
-Captured on 2026-06-22 while testing the fresh v2.2.0 release candidate. This file is now status-based: completed items are listed first, and remaining items should be tackled in small follow-up passes.
+Captured on 2026-06-22 while testing the v2.3.0 release candidate. This file is now status-based: completed items are listed first, and remaining items should be tackled in small follow-up passes.
 
 ## Completed This Run
 
@@ -81,7 +81,7 @@ Captured on 2026-06-22 while testing the fresh v2.2.0 release candidate. This fi
 - Release privacy guard:
   - `carryover_backups/` is ignored and treated as a private directory by the release safety scan.
 - UI/UX clarity:
-  - Results/Preview moment labels now separate deterministic **Category** labels from local fallback and Ollama AI labels in counts and chip styling.
+  - Results/Preview moment labels now separate deterministic **Detected** labels from **Fallback** and **Ollama** context labels in counts and chip styling.
   - Data & Privacy Local Analysis copy now says Fast keeps label ranking off while Balanced/Deep can enable deterministic label ranking by depth.
   - Data & Privacy Local Analysis now shows scene detection and voice ranking status, and labels Fast-suppressed heavy features as **Inactive in Fast** instead of implying a failure.
   - Run debug settings now include `local_analysis_feature_statuses` plus Fast disabled/skip reasons for scene, visual, AI labels, moment-label ranking, and voice ranking.
@@ -175,7 +175,7 @@ Status: added from read-only subagent sweeps on 2026-06-23.
 
 UI/UX polish findings:
 
-- Completed: separate Results/Preview moment label source handling so `Category`, local fallback, and Ollama AI labels have distinct counts, tooltips, and styles; do not count category-only labels as local classifier output.
+- Completed: separate Results/Preview moment label source handling so `Detected`, `Fallback`, and `Ollama` labels have distinct counts, tooltips, and styles; do not count detected-only labels as fallback classifier output.
   - Why: README distinguishes deterministic categories from local/AI classifier labels, but the UI can count every non-Ollama label as local.
   - Where: `gui/app.js` label/filter summary helpers around moment label source counts and chip classes; README moment-label wording.
 - Completed: update Data & Privacy Local Analysis copy to say Fast keeps label ranking off, Balanced/Deep can enable deterministic label ranking by depth, and manual opt-in applies only where depth does not override.
@@ -594,3 +594,481 @@ Implementation map:
 - `candidate_ranker.py`: `write_debug_report()` and final run-debug row composition.
 - `api_bridge.py`: final clip metadata assembly before writing `*_run_debug.json`.
 - Likely approach: keep `*_candidate_debug.json` as pre-render truth, but copy compact final-facing metadata into `final_clips[]`: `primary_category`, `moment_categories`, `music_lyrics_guard`, `audio_source.selected_stream`, `word_count`, `subtitle_generated`, `subtitles_burned`, and any AI/visual summaries that exist.
+
+## All Videos Label Clarity And Bulk Delete
+
+Status: completed for the first pass. Folder open-state persistence, All Videos multi-select delete, AI chip source clarity, deterministic-first label ordering, compact `moment_categories` in All Videos, and visual-only failure fine-label hardening are complete with focused tests.
+
+Observed issues:
+
+- Teal **AI** labels feel less accurate than the orange category labels in some runs.
+- Some clips can show a fine label such as **Death scene** even when no death actually happened.
+- Completed: in **All Videos**, deleting a clip no longer collapses the source folder that was open.
+- Completed: **All Videos** supports multi-select deletion so users can remove several clips at once.
+
+Label source findings:
+
+- Orange `Detected` chips are deterministic base labels from `primary_category` / compact `moment_categories.primary`.
+- Teal `Ollama` chips are local Ollama labels from `ai_moment_classification` when `status == "ok"` and `provider == "ollama"`.
+- Purple `Fallback` chips are fallback/heuristic labels when Ollama is unavailable, skipped, or not ready.
+- When Ollama/fallback primary differs from deterministic category primary, the deterministic **Detected** chip appears first and the Ollama/Fallback label is secondary context.
+- All Videos now gets compact `moment_categories` for known clips, so it can make the same deterministic-vs-AI distinction as Results.
+
+Label implementation map:
+
+- `gui/app.js`: `aiMomentForClip()` chooses `Ollama`, `Fallback`, or `Detected`.
+- `gui/app.js`: `momentLabelMarkup()` renders the visible chip row.
+- `gui/app.js`: `_buildResultCard()` renders Results labels.
+- `gui/app.js`: `_buildLibraryCard()` renders All Videos labels.
+- `gui/style.css`: `.moment-chip.is-ai`, `.moment-chip.is-local`, `.moment-chip.is-category` define chip colors.
+- `api_bridge.py`: `_clip_payload()` feeds Results with `primary_category`, `moment_categories`, and `ai_moment_classification`.
+- `api_bridge.py`: `list_all_clips()` feeds All Videos with known clip metadata.
+- `candidate_ranker.py`: `score_moment_categories()` computes deterministic category scores.
+- `title_generator.py`: `classify_moment_ai()` and `_heuristic_moment_classification()` create Ollama/fallback labels.
+- `visual_diagnostics.py`: `possible_failure_score` can contribute broad failure/death-looking evidence.
+
+Recommended label fix:
+
+- Completed: rename chip prefixes for clarity:
+  - `AI` -> `Ollama`
+  - `Local` -> `Fallback`
+  - `Category` -> `Detected`
+- Completed: if Ollama/fallback primary differs from deterministic category primary, show the deterministic **Detected** chip first and the Ollama/fallback label as secondary context.
+- Completed: include compact `moment_categories` for known clips in `list_all_clips()` so All Videos can make the same deterministic-vs-AI distinction as Results.
+- Completed: visual-only failure diagnostics now use `possible_failure` instead of `death_scene` unless transcript, category, or aftermath evidence confirms a failure/death moment.
+- Keep watching real runs for false positive `death_or_failure` primary labels; this pass softens the fine label without removing broad failure-category evidence from the ranking/debug pipeline.
+
+Folder collapse findings:
+
+- All Videos folder open state is only the DOM class `.open`.
+- After delete, `loadLibrary()` calls `renderLibraryGrid()`, which rebuilds the folder DOM from scratch.
+- `renderLibraryGrid()` only auto-opens when there is one group, so multi-folder views come back collapsed after delete/refresh/filter changes.
+
+Folder state implementation map:
+
+- `gui/app.js`: `state` has `libraryClips`, `libraryView`, and `libraryMomentFilter`, but no folder open-state field.
+- `gui/app.js`: `toggleFolder(headerEl)` toggles `.open` only.
+- `gui/app.js`: `_groupLibraryByStem()` defines folder keys from clip filename stems.
+- `gui/app.js`: `renderLibraryGrid()` rebuilds folders and applies `autoOpen = groups.length === 1`.
+- `gui/style.css`: `.result-folder.open .result-folder-body` controls expanded display.
+
+Recommended folder-state fix:
+
+- Completed: added `state.libraryOpenFolders`, keyed by folder stem.
+- Completed: updated `toggleFolder()` to record open/closed state when the folder is inside `#library-grid`.
+- Completed: `renderLibraryGrid()` uses stored open state when present and falls back to `autoOpen` only when there is no user preference.
+- Completed: state is preserved across delete, refresh, search, and moment-filter rerenders.
+
+Multi-select delete implementation map:
+
+- `gui/index.html`: All Videos toolbar is the best insertion point for bulk controls.
+- `gui/app.js`: `_buildLibraryCard()` renders each All Videos card and single delete button.
+- `gui/app.js`: `requestDeleteLibrary()`, `confirmDelete()`, and `loadLibrary()` are the current single-delete flow.
+- `api_bridge.py`: `delete_library_file(filename)` deletes one safe child path under `CLIPS_DIR`.
+- `api_bridge.py`: `_safe_child_path()`, `_safe_path_under()`, and `_safe_clip_path()` are the path-safety helpers.
+- `gui/app.js`: `refreshScheduleFromBackend(false)` should run after bulk deletion so scheduled/upload views stay in sync.
+
+Recommended multi-select delete fix:
+
+- Completed: implemented multi-select in **All Videos**, keyed by exact `filename`.
+- Completed: added `state.librarySelectedFilenames`.
+- Completed: added card checkboxes with click propagation stopped so selection does not open preview.
+- Completed: added toolbar controls: selected count, **Select visible**, **Clear**, and **Delete selected**.
+- Completed: added backend `delete_library_files(filenames)` instead of looping single deletes in JavaScript.
+- Completed: backend bulk delete validates every filename with clips-folder safe path helpers, deletes files under `CLIPS_DIR`, prunes `_results`, `_moments`, `_scheduled`, marks personalization entries as deleted, and saves once.
+- Completed: returns `deleted` and `failed` lists so partial failures can be reported without corrupting state.
+
+Test map:
+
+- Completed: `tests/test_gui_static_guards.py` asserts library folder open state exists and `renderLibraryGrid()` consults it.
+- Completed: `tests/test_gui_static_guards.py` asserts selection state, checkbox markup, selected count, select-visible/clear/delete-selected controls, and `delete_library_files(...)` call are wired.
+- Completed: `tests/test_api_bridge_path_safety.py` bulk delete rejects path traversal such as `..\outside.mp4`.
+- Completed: `tests/test_api_bridge_path_safety.py` bulk delete removes multiple files, prunes results/moments/scheduled entries, marks personalization deleted, and saves state once.
+- Completed: `tests/test_api_bridge_path_safety.py` partial failures return `deleted` and `failed` without breaking remaining valid deletes.
+
+## Results Folder State And Multi-Delete Follow-Up
+
+Status: completed this run. The earlier folder-state and multi-select delete pass covered **All Videos**; this pass brought the same core behavior to **Results**.
+
+Observed issue:
+
+- Completed: deleting a clip from **Results**, changing the Results moment filter, refreshing/re-entering Results, or auto-delete updates now preserve the user's expanded/collapsed folder choice during the session.
+- Completed: **Results** now supports multi-select delete, reusing the same safe bulk delete backend used by **All Videos**.
+
+Code findings:
+
+- `gui/app.js`: added `resultsOpenFolders`, `resultsSelectedFilenames`, and `resultsVisibleFilenames`.
+- `gui/app.js`: `toggleFolder(headerEl)` now persists folder open state for both `#results-grid` and `#library-grid`.
+- `gui/app.js`: `renderResultsGrid()` now reads stored Results folder preferences before falling back to `autoOpen = groups.length === 1`.
+- `gui/app.js`: `requestDeleteSelectedResults()` and the `results-bulk` branch in `confirmDelete()` call `delete_library_files(filenames)` so path safety, schedule pruning, and deleted-file learning markers stay centralized.
+- `gui/app.js`: `renderLibraryGrid()` is the reference implementation because it reads `state.libraryOpenFolders[group.stem]` and falls back to auto-open only when no user preference exists.
+
+Test map:
+
+- Completed: `tests/test_gui_static_guards.py` asserts Results folder state exists, `toggleFolder()` records it, `renderResultsGrid()` consults it, and Results bulk-delete controls/call path are wired.
+- Existing path-safety coverage in `tests/test_api_bridge_path_safety.py` still covers the shared `delete_library_files(filenames)` backend path.
+
+## Upload Layout Redesign Pass
+
+Status: mostly implemented for the first redesign pass. The readiness strip, safer upload wording, compact schedule status classes, local upload history persistence, shared scheduler/manual success recording, stale schedule-save protection, top account/schedule row, right-side Upload Prep review panel, sticky action bar, derived upload summary, subtle calendar history markers, day-level history drill-down, source-level Optional AI Notes, and regression/static guards are now in place.
+
+Observed current app:
+
+- Full-width YouTube Accounts and Smart Schedule bands waste horizontal space at desktop widths.
+- Your Clips is narrow while the calendar receives a lot of empty horizontal space.
+- Upload prep, description, and action controls feel disconnected when they live in the bottom options strip.
+- The current installed app can still show older upload layout/state behavior until the latest source fixes are rebuilt.
+
+Best ideas to borrow from the generated mockup:
+
+- Add a lightweight workflow health strip, not a separate-screen wizard. It should highlight/check off the area the user is currently working in and show readiness at a glance.
+- Use this status model:
+  - **1. Connect your accounts**: account exists, OAuth token is valid, selected channel is known. Show a green ready state when connected.
+  - **2. Select videos and metadata**: all available clips live here; no separate **Add more clips** affordance is needed for normal use. This is where source/folder rows expose **AI Titles**, **Optional AI Notes**, and per-clip title/description editing.
+  - **3. Schedule clips**: Smart Schedule is an action/mode that auto-places selected clips into good slots, while manual drag/drop and adding clips to individual days stays available.
+  - **4. Review and upload**: final queue, visibility, description/hashtag behavior, delete-after-upload, and upload start.
+- Readiness behavior should not treat every section as binary:
+  - **Accounts** can be binary enough: `Connected` / `Needs account`.
+  - **Videos and metadata** should reflect real blockers and optional polish: `No clips`, `Needs titles`, `Ready`, `AI context optional`, or `Context added`.
+  - **Schedule** should stay simple: `Nothing scheduled`, `Scheduled`, or `Schedule needs attention` when an item is missed, failed, disconnected, missing a channel/account, or has an invalid time.
+  - **Review and upload** should reflect final blockers: `Ready to send to YouTube`, `Missing visibility/channel`, `Upload running`, `Upload failed`, or `Uploaded`.
+- Do not mark missing AI context as a warning. Use neutral styling for `AI context optional`, and a positive/quiet indicator for `Context added`.
+- Clicking a readiness item should focus the related area on the same screen, not navigate away. Example: clicking `Needs titles` focuses the clip/source list; clicking `Nothing scheduled` focuses the calendar.
+- Use green for ready, amber for attention, red only for blocking/error states, and neutral for optional improvements.
+- Current scheduling behavior is overloaded and needs clearer UX:
+  - Dropping/adding clips to the calendar persists them to the backend. If YouTube is connected and the app stays open, the local background scheduler can upload those clips at their local calendar time.
+  - Pressing **Send Scheduled Clips to YouTube** uploads all pending clips to YouTube immediately. For public clips, YouTube receives a future `publishAt` time and publishes later; for private/unlisted clips, the clip uploads immediately at that privacy setting.
+  - Redesign labels should separate these two meanings. Suggested wording: **Queue on Calendar** for local schedule placement, **Send Scheduled Clips to YouTube** for uploading now with YouTube publish times, and **Local Upload Watcher active** for the background scheduler.
+  - The upload review panel should explain the chosen mode in one plain line, such as `Send now to YouTube; public posts publish at their calendar time.` or `Keep app open to auto-upload at calendar times.`
+- Preferred beginner-safe upload wording:
+  - Completed: renamed the main CTA to **Send Scheduled Clips to YouTube**.
+  - Completed: renamed scheduler bar language to **Local Upload Watcher** / `Next send to YouTube`.
+  - Completed: optional source context is now surfaced as **Optional AI Notes**.
+  - Completed: timeline/readiness labels distinguish `Pending locally`, `Sent to YouTube`, `YouTube scheduled`, `Missed time`, `Upload failed`, and interrupted-upload **Check YouTube** states when known.
+- Account for app close/reopen behavior:
+  - If the app closes while local calendar items are pending, the local watcher cannot upload while closed.
+  - On next app launch, pending schedule state should be restored and explained clearly: `Local Upload Watcher paused while ViriaRevive was closed.`
+  - If a public item is now past its calendar time, show `Missed time` and offer `Reschedule` or `Send now`.
+  - If a private/unlisted item would upload late, confirm the intended behavior before silently sending old queued items, or mark it `Needs attention` until the user chooses `Send now`.
+- Calendar visual states should separate active queue from upload history:
+  - Pending local calendar items get the most visible chip/card treatment.
+  - Items currently being sent should show a small spinner/progress ring on the calendar chip and in the right-side review panel.
+  - Items sent to YouTube should switch to a quieter `sent`/check style, not remain visually identical to pending schedule items.
+  - Public clips with a YouTube `publishAt` should read `Sent to YouTube - publishes later`, not just `Uploaded`, because upload and public release are different.
+  - Upload failures should show a clear error chip and keep the clip actionable with retry/reschedule/remove.
+  - Completed: interrupted/uncertain upload attempts are treated as attention states in upload readiness, Upload Prep summary, day detail, timeline, and upload preflight.
+- Add persistent upload memory/history separate from the active schedule:
+  - Store compact `upload_history` records with date, clip/source identity, title, channel/account, privacy, YouTube id/url when available, local send time, intended publish time, and final status.
+  - Calendar days with historical uploads should show a subtle history marker/count, visually different from pending scheduled clips so users do not think old uploads are still queued.
+  - Completed: clicking a historical marker opens an `Upload history` section in the day-detail view, while the default calendar surface stays focused on current pending work.
+  - When pressing **Send Scheduled Clips to YouTube**, successful items should move out of the active pending queue state and into history/`sent` state so the local watcher cannot duplicate-upload them.
+- Completed implementation/code map from subagent sweep:
+  - Completed: backend active schedule state remains `ApiBridge._scheduled`; `upload_history` is now persisted beside `scheduled` in `viria_state.json`.
+  - Completed: `load_persisted_state()` and `get_all_scheduled()` return upload history for frontend use.
+  - Completed: `_mark_scheduled_uploaded()` records sent/uploaded history for manual **Send Scheduled Clips to YouTube** flows because it has clip identity plus `youtube_id`/`youtube_url`.
+  - Completed: `_scheduler_loop()` captures the `upload_to_youtube()` result and calls the same shared uploaded/history path.
+  - `_scheduled_upload_active()` already treats uploaded items as inactive; keep that as duplicate prevention, but do not rely on it as the only persistent protection.
+  - Completed: `save_scheduled()` merges/preserves backend-owned fields like `uploaded`, `uploaded_at`, `youtube_id`, `youtube_url`, `scheduler_status`, `failure_count`, `last_error`, `missed_at`, upload attempt ids/timestamps, and status fields so stale frontend saves do not resurrect sent or in-progress clips.
+  - Completed: overdue public items become `Missed time` during schedule reads instead of waiting for a scheduler tick.
+  - Completed initial status field support: `upload_state` / `send_status` can distinguish `sent_to_youtube` and `youtube_scheduled`, while preserving `uploaded` for migration/backward compatibility.
+  - Completed: before manual or local-watcher YouTube sends, backend now writes a durable `upload_attempt_id` / `uploading` marker. Success clears the marker into sent/upload history; known failures clear it into `upload_failed`; reopen after an unfinished attempt marks the row `upload_outcome_unknown` so the UI says **Check YouTube** and does not retry blindly.
+  - Completed: single Results delete now refreshes backend schedule state and rerenders upload surfaces, matching bulk delete behavior.
+  - Pending schedule rows for deleted clip files are pruned by existing state cleanup, so upload history must not live only inside `scheduled`.
+- Frontend edit map from subagent sweep:
+  - Completed: added readiness strip DOM near the top of `#section-upload`, after the YouTube connection/setup area and before Smart Schedule.
+  - Suggested ids/classes: `#upload-readiness-strip`, `.upload-readiness-step`, `.is-ready`, `.is-warning`, `.is-blocked`, plus a neutral class for optional AI notes/context.
+  - Completed: readiness is computed in pure helpers near existing schedule helpers in `gui/app.js`, reusing `scheduledLocalDate()`, `isScheduleMissed()`, and `hasPendingSchedule()`.
+  - Completed: readiness inputs include `state.results`, `state.scheduled`, `state.ytConnected`, channels/account state, pending/missed/sent counts, and `state.uploadHistory`.
+  - Completed: readiness refreshes from upload load, schedule refresh, scheduler/upload callbacks, and YouTube connection/UI updates.
+  - Completed: calendar chip, day detail, and timeline status labels use centralized label/class derivation.
+  - Completed: fixed scheduler bar is reworded to **Local Upload Watcher** and `Next send to YouTube`.
+  - Completed: manual calendar-day clip picking now uses the same Smart Schedule channel/account selection as drag/drop scheduling.
+  - Completed: custom **Clips per day** changes immediately refresh the peak-slot legend and upload summary.
+  - Calendar chips have tight space, so do not add long labels inside chips. Use icon/ring/check/error styling and put detailed text in tooltips/day detail.
+  - Active UI uses `#schedule-timeline`; avoid legacy `.scheduled-list*` styles when implementing.
+- Test map for this run:
+  - Completed: `tests/test_upload_scheduling.py` covers upload history recording, scheduler success YouTube id/url/history, stale frontend save preservation, and overdue public missed marking.
+  - Completed: `tests/test_upload_scheduling.py` covers durable upload-attempt markers, stale frontend-save preservation of attempt fields, success/failure cleanup, and crash/reopen conversion to `upload_outcome_unknown`.
+  - Completed: `tests/test_gui_static_guards.py` asserts readiness strip DOM, helper/render functions, wording, shared status classes, and CSS states.
+  - Release guards: if upload history becomes a separate file instead of part of `viria_state.json`, add it to private local-data release exclusions.
+- Completed: make the top row a two-column layout: compact YouTube Accounts plus a schedule control area that explains auto-schedule and current channel/start settings.
+- Completed: treat the middle of the screen as three work zones: **Your Clips/source queue**, **Scheduled Calendar**, and **Upload Prep/Review**.
+- Completed: keep the Upload Prep area in the right-side review/prep position from the mockup instead of as a disconnected bottom strip.
+- Completed: put an **Upload Summary** in that same panel: clips selected/scheduled, channel, visibility, start date, and estimated upload span.
+- Completed: keep a sticky bottom action bar with concise summary plus **Preview Queue** and **Send Scheduled Clips to YouTube**.
+- Completed: readiness items focus the matching account, clip, calendar, or review area on the same screen.
+- Completed: calendar days can show subtle upload-history markers for previous successful sends that are not already visible as sent schedule chips.
+- Completed: added a day-level upload-history detail section for historical markers.
+- Completed: improved **Your Clips** with local search/filter, clearer source rows, and source-level actions like **Schedule**, **AI Titles**, and **Optional AI Notes**.
+- Completed: source-level **Optional AI Notes** now sit near folder AI Titles; per-clip overrides live in the metadata modal.
+
+Avoid copying:
+
+- Do not fake account/channel status, subscriber counts, or connection details; only display real connected data.
+- Do not turn the upload page into locked wizard gating or separate screens. Users should still see clips, calendar, and upload prep together.
+- Do not add every mockup field before backend truth exists.
+- Avoid a huge card-heavy marketing feel. This screen should remain a dense operational dashboard.
+
+Implementation map:
+
+- `gui/index.html`: upload section layout; split `#upload-content` into top grid, work grid, and sticky summary/action bar.
+- `gui/style.css`: add responsive upload grid classes, avoid inline styles, use desktop two/three-column layout and mobile stacking.
+- `gui/app.js`: reuse `renderClipTray()`, `renderCalendar()`, `renderTimeline()`, `updateDescriptionOptionsStatus()`, `refreshScheduleFromBackend()`, and `startUpload()`.
+- Add a derived upload summary renderer from existing `state.scheduled`, `state.channels`, selected visibility, and start date.
+- Avoid new backend APIs for layout-only work, but the upload history/readiness pass does require backend state support via `upload_history`, merged schedule saves, and `load_persisted_state()` returning enough history/status data for the calendar.
+- Tests: static guard for layout classes, summary uses real state, upload button still calls `startUpload()`, and Optional AI Notes remain source-scoped.
+
+## Game Knowledge For Metadata
+
+Status: provider-backed Game Knowledge remains queued. The local creator-provided context slice below is completed; online/provider-backed game facts still need a separate privacy, licensing, attribution, and UX pass.
+
+### Creator-Provided Video Context
+
+Status: completed for the first local-only slice. Source-level Optional AI Notes and per-clip metadata overrides now save sanitized `creator_title_context`, feed the compact title prompt/sidecar pipeline, and avoid copying those notes into final descriptions.
+
+Concept:
+
+- Give the user a small way to tell AI title/description generation what the source video/session is.
+- Example: `This is my blind Alan Wake run in the nursing home chapter, mostly exploring and getting jumped by Taken.`
+- This is not upload description text and should not be copied verbatim into the final description by default.
+- It should guide titles, generated summaries, and tags through the same compact title context pipeline that already uses transcript/detector/ranker data.
+- Keep it optional and local. Do not add another Generate wizard step.
+
+Recommended UI placement:
+
+1. **Primary home: Upload > clip source/folder rows**
+   - Completed: added an **Optional AI Notes** control beside each source folder's `AI Titles` button.
+   - Best match for the user's wording: they can say what the video/session is before generating titles for that source.
+   - Completed: scope is source/session, keyed by `source_id` or `source_stem`, then copied to matching moments/scheduled rows.
+   - This prevents one global hint from accidentally applying to unrelated batches.
+2. **Companion home: scheduled Edit Clip modal**
+   - Completed: added a compact **Optional AI Notes** field under the title area near the `AI Title` button.
+   - This lets the user override the source/session hint for one clip.
+   - Completed: regenerating a title from that modal saves the override before title generation.
+3. **Avoid as primary: global Upload card**
+   - A single textarea near **Generate AI Titles** is fast to build, but risky with mixed-source batches.
+   - If added later, label it as "Apply to visible/source selection" rather than a silent global.
+4. **Avoid for now: Generate wizard**
+   - The wizard is already carrying detection/audio/style choices.
+   - Creator title context is about metadata after clips exist, not detection setup.
+
+Frontend implementation map:
+
+- `gui/index.html`
+  - Upload page controls: `#section-upload`, `#btn-gen-ai-titles`, folder/tray rows.
+  - Scheduled metadata modal: `#meta-modal`, `#modal-meta-title`, `#modal-meta-desc`, `#modal-description-preview`.
+  - Completed: added a small source-level **Optional AI Notes** action near folder `AI Titles`.
+  - Completed: added a per-clip **Optional AI Notes** textarea in `#meta-modal`.
+- `gui/app.js`
+  - Folder/source UI: `_buildClipTrayFolder()` / tray folder actions around `AI Titles`.
+  - Title entry points: `generateAITitlesManual()`, `generateAITitlesForFolder(stem, btn)`, `regenerateTitle(schedIdx)`.
+  - Schedule helpers: `_scheduleClipIndices()`, `descriptionFieldsForClip()`, `applyGeneratedMetadataToSchedule()`, `openMetaModal()`, `saveMetaModal()`, `normalizeScheduledMetadata()`.
+  - Completed: added state/payload handling for `creator_title_context`.
+  - Completed: when context changes, scheduled generated description snippets are invalidated so previews do not keep stale AI summaries.
+  - Completed: static guards ensure the field is preserved in scheduled metadata and passed during title regeneration.
+
+Backend/data implementation map:
+
+- `api_bridge.py`
+  - Completed: normalized context is stored on persisted moments as `moment["creator_title_context"]`.
+  - Completed: added a sanitizer/truncator for creator context.
+  - Completed: added `save_source_title_context(source_id/source_stem, text)` to update matching `_moments`, matching scheduled rows, and save state.
+  - Completed: `_title_context_for_clip()` includes `creator_title_context`.
+  - Completed: `_store_generated_metadata()` and the title context summary inherit sanitized creator context.
+  - Completed: `_write_metadata_sidecar()` adds a compact `Creator Context:` line under `Analysis Context`.
+  - Completed: `save_scheduled()` / `_normalize_scheduled_items()` preserve `creator_title_context` on scheduled items.
+- `title_generator.py`
+  - Completed: `summarize_clip_context()` includes sanitized creator context.
+  - Completed: `_analysis_prompt_lines()` adds a `Creator-provided context` line.
+  - Completed: `_prompt_safe_text()` redaction is reused and the limit is 420 chars.
+  - Completed: `_build_ollama_prompt()` and `generate_titles_batch()` inherit it through existing `clip_contexts`.
+  - Completed: descriptions do not dump creator notes verbatim.
+
+Tests/docs:
+
+- Completed: `tests/test_title_context.py`
+  - Prompt includes sanitized creator context.
+  - Secrets/local paths/prompt-like text are redacted.
+  - Long context is truncated.
+  - Generated description does not expose raw creator prompt wording by default.
+- Completed: `tests/test_api_bridge_path_safety.py`
+  - `_title_context_for_clip()` attaches compact creator context.
+  - Sidecar writes sanitized context.
+  - Generated metadata stores the title context used.
+- Completed: `tests/test_upload_scheduling.py`
+  - Scheduled `creator_title_context` survives normalization/save.
+  - Per-clip override is passed when regenerating a scheduled title.
+- Completed: `tests/test_gui_static_guards.py`
+  - Source/folder AI context control exists.
+  - Metadata modal AI context field exists.
+  - Frontend preserves/passes `creator_title_context`.
+- Completed: README updates:
+  - Titles, Metadata, And Sidecars.
+  - Upload workflow.
+  - Data & Privacy/state notes: creator context is local, optional, persisted in `viria_state.json`, and sent only to local Ollama when local AI title generation uses Ollama.
+
+Concept:
+
+- This is a strong idea, but the safe version is not "scrape GameFAQs and feed the whole guide to Ollama." It should be a provider-backed game-context/RAG layer for titles, descriptions, tags, and AI moment labels.
+- The app should use the same clip analysis it already has, then retrieve a few compact game/story facts from licensed/attributable online sources.
+- Knowledge should enrich metadata only at first. Do not let it change clip detection/ranking until the metadata path is proven stable.
+- The goal is to help Ollama know things like game title, enemy/location/mechanic/story-beat names, and broad story context without inventing details that are not visible in the clip.
+- Do not require users to build or import local knowledge packs.
+
+Research notes:
+
+- GameFAQs/walkthrough content is not a safe default scraping source. GameFAQs contributors retain copyright in guides, and Fandom/GameSpot terms also place responsibility on users not to submit infringing material.
+- Wikidata is useful for structured game metadata because its main structured data is CC0/public-domain equivalent, but it will not usually know exact walkthrough/story moments.
+- Fandom wiki text is often CC BY-SA, but licenses vary by wiki, attribution/share-alike matters, non-text files are separate, and off-wiki/forum content should not be assumed licensed.
+- IGDB can provide game metadata through its API, but it requires Twitch developer credentials and is better as a later optional provider, not a first-run requirement.
+- MediaWiki APIs can expose site rights/license metadata through `meta=siteinfo`, so wiki providers should check license/rights info before using page extracts.
+- RAG/document-grounding best practice is to chunk large documents and retrieve only relevant snippets to avoid token bloat and truncation.
+- Retrieved web content is untrusted content. OWASP flags prompt injection from files/websites as a real risk, so retrieved snippets must be treated as data, not instructions.
+
+Recommended product shape:
+
+1. Start with an opt-in online **Game Knowledge** provider layer, not local imports.
+   - Default can stay off until the user enables **Use online game context for metadata**.
+   - The feature should clearly say it only helps titles/descriptions/tags at first.
+   - No arbitrary URL scraping.
+   - No GameFAQs ingestion unless we later have an explicit license, public API, or partner-approved path.
+   - User should not need to curate files.
+2. Use a source registry with provider tiers:
+   - **Tier 0: Existing clip analysis** - transcript, OCR/visual labels, source filename/folder, game title, moment categories, AI labels, scene/audio signals.
+   - **Tier 1: Structured metadata** - Wikidata first for CC0 facts, then optional IGDB once API credentials/config are handled.
+   - **Tier 2: Licensed wiki context** - MediaWiki/Fandom/wiki.gg-style providers only when license/rights info is detectable and compatible with our attribution rules.
+   - **Tier 3: Walkthrough/detail sources** - only if the source grants explicit usable rights through API/terms/partnership. Treat GameFAQs as blocked by default.
+3. Add a compact source schema before any broad provider work:
+   - `game_title`
+   - `aliases`
+   - `safe_tags`
+   - `characters`
+   - `enemies`
+   - `locations`
+   - `mechanics`
+   - `story_beats`
+   - `spoiler_level`
+   - `source_name`
+   - `source_url`
+   - `provider`
+   - `license`
+   - `license_url`
+   - `attribution`
+   - `revision_id` / `retrieved_at` where available
+4. Retrieval should return only compact matched facts:
+   - matched game
+   - matched aliases/entities
+   - matched locations/mechanics/story beats
+   - source/license summary
+   - confidence/reason
+   - capped excerpt only when license/terms allow it, never a full article or walkthrough block
+5. Default spoiler behavior:
+   - "Avoid spoilers beyond the clip" should be default-on.
+   - Story beats should only be used when matched by transcript/OCR/visual context or a strong source-position clue.
+   - If story position is uncertain, use broad game context only: genre, setting, mechanics, enemy names, location names detected on screen or in transcript.
+6. UI home:
+   - Put this in **Settings > Data & Privacy > Advanced Features** as a new **Game Knowledge** tab.
+   - Add a lighter **Local AI** status line: `Game Knowledge: Off / Online context ready / Sources cached`.
+   - Upload metadata and AI title flows should show whether Game Knowledge influenced generated metadata.
+   - Do not add another Generate wizard step unless this later affects detection/ranking.
+7. Metadata behavior:
+   - Titles should use context to get more specific, not longer.
+   - Descriptions should stay viewer-facing and never expose prompt/debug phrasing.
+   - Sidecar/debug files can record compact source/context metadata for inspection.
+   - Metadata modals should show "Sources used" with source names/licenses/URLs.
+   - Tags may include safe game/entity tags while staying within the existing YouTube tag budget.
+
+Implementation map:
+
+- New helper: `game_context.py`
+  - Provider registry and result normalization.
+  - Match by game title/aliases plus transcript/category/visual clues.
+  - Fetch compact source context from approved providers.
+  - Check provider license/rights metadata before using page extracts.
+  - Cache compact facts, source metadata, and retrieval timestamps.
+  - Return compact, prompt-safe context.
+- `config.py`
+  - Add local app-data paths for cache only, e.g. `GAME_CONTEXT_CACHE_FILE` and `GAME_CONTEXT_CACHE_DIR`.
+  - Add provider config paths if needed, e.g. `GAME_CONTEXT_PROVIDERS_FILE`.
+- `.gitignore` and `scripts/check_release_safety.py`
+  - Exclude local provider credentials, cache files, raw fetched page extracts, and backups from commits/releases.
+- `api_bridge.py`
+  - `_title_context_for_clip()` should attach compact `game_context`.
+  - `_classify_selected_moments()` and `_classify_ai_moment_shadow()` should pass context-enriched moments to AI labels.
+  - `_write_metadata_sidecar()` should include a compact `Game Context` line.
+  - `_store_generated_metadata()` already stores `title_context`, so it can inherit context once summarization is updated.
+  - Add enable/disable, refresh, cache-status, clear-cache, and source-inspection APIs after the helper exists.
+- `title_generator.py`
+  - `summarize_clip_context()` should include sanitized `game_context`.
+  - `_analysis_prompt_lines()` should add one compact `Local game context` line for title prompts.
+  - `_build_moment_classification_prompt()` should include compact context while keeping "do not invent" rules.
+  - `_description_context_line()` / `_context_sentence()` should use game context only when a matched fact is confident.
+  - `generate_tags()` can add safe context tags while respecting tag caps.
+- `candidate_ranker.py`
+  - Debug summaries can expose compact matched facts, not raw fetched article text.
+- `gui/index.html`
+  - Data & Privacy advanced modal: add `Game Knowledge` tab.
+  - Local AI card: add a compact status row and opt-in state.
+  - Metadata modal: show "used local game knowledge" when true.
+- `gui/app.js`
+  - Render Game Knowledge status.
+  - Add enable/disable, refresh, clear-cache, and source-inspection controls.
+  - Keep raw fetched text out of normal UI and share-safe export.
+
+Provider options to investigate in order:
+
+1. **Wikidata provider first**
+   - Pros: CC0 structured facts, no user API key for basic SPARQL/API usage, good for game title, aliases, genre, developer/publisher, series, platform, release date, official site, external identifiers.
+   - Limits: usually weak for walkthrough/story beats.
+   - Use for baseline game identity and tags.
+2. **MediaWiki-compatible wiki provider**
+   - Pros: can query license/rights info via siteinfo, can retrieve page extracts/revisions with source URLs, often has enemies/locations/mechanics/story pages.
+   - Limits: licenses differ, attribution matters, page text can contain spoilers and untrusted prompt text.
+   - Use only compact facts and source attribution; avoid copying prose into video descriptions.
+3. **IGDB provider**
+   - Pros: strong official-ish game metadata API, useful themes/genres/keywords/storyline/summary.
+   - Limits: requires Twitch app credentials and provider setup.
+   - Use after UX for provider credentials is clear.
+4. **Search-result/browser lookup provider**
+   - Pros: can find relevant official/wiki pages for a game without hardcoding every wiki.
+   - Limits: search APIs have cost/terms; arbitrary scraping is risky.
+   - Keep as later work, not v1.
+5. **GameFAQs/walkthrough provider**
+   - Blocked by default.
+   - Only revisit if a source/API/license explicitly permits reuse or we obtain permission.
+
+Security/privacy guardrails:
+
+- No automatic scraping of GameFAQs or arbitrary walkthrough sites.
+- Online game context must be opt-in and clearly marked.
+- Store only compact cached facts and provenance by default; do not cache whole pages unless explicitly justified and licensed.
+- If Ollama is used, compact snippets/facts go only to local Ollama prompts.
+- Treat retrieved text as untrusted reference material, not instructions.
+- Strip or redact local paths, tokens, secrets, URLs with credentials, and prompt-like instructions before including context in prompts.
+- Cap fetched page size, snippet count, prompt length, request rate, and cache size.
+- Add allowlisted provider domains and reject redirects to unexpected hosts.
+- Respect provider terms, license metadata, robots/API requirements, and rate limits.
+- Share-safe export must exclude raw fetched text, exact request URLs with params, provider credentials, source cache files, and raw source IDs where needed.
+- Clearing Game Knowledge should remove caches, fetched snippets, indexes, summaries, and backups where practical.
+- If CC BY-SA or similar source text materially shapes an output, preserve attribution in sidecar/debug and show sources in the metadata modal. Prefer facts/entity names over prose reuse.
+
+Test map:
+
+- `tests/test_game_context.py`
+  - Provider result sanitization, alias matching, caps, source/license fields, spoiler filtering, malformed provider payloads, request errors, redirects, rate limiting, and prompt-injection text.
+- `tests/test_title_context.py`
+  - Title prompt includes compact context but not raw full source text.
+  - Description/tags use matched context without mirroring prompt/debug language.
+  - No invented enemy/location when context confidence is low.
+- `tests/test_api_bridge_path_safety.py`
+  - Cache clear/delete path safety and app-data containment.
+  - `_title_context_for_clip()` attaches only compact context.
+- `tests/test_data_privacy_summary.py`
+  - Game Knowledge status shows enabled/cache/source counts without leaking raw fetched text, credentials, or exact request URLs in share-safe export.
+- `tests/test_release_guards.py`
+  - Release safety rejects packaged game-context caches, provider credentials, raw fetched extracts, and backups.
+- README updates:
+  - Titles, Metadata, And Sidecars.
+  - Data & Privacy.
+  - Debugging And State.
+  - Optional Game Knowledge setup with opt-in network, provider, attribution, copyright, and privacy wording.

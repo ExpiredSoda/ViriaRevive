@@ -32,6 +32,7 @@ _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 YOUTUBE_HTTP_TIMEOUT_SECONDS = 120
 YOUTUBE_UPLOAD_TIMEOUT_SECONDS = 2 * 60 * 60
 YOUTUBE_UPLOAD_MAX_CHUNKS = 2048
+YOUTUBE_PUBLISH_BUFFER = timedelta(minutes=10)
 
 
 # ── Authentication ───────────────────────────────────────────────────────────
@@ -383,6 +384,12 @@ def upload_to_youtube(
     """
     from googleapiclient.http import MediaFileUpload
 
+    privacy = str(privacy or "private").lower()
+    publish_at = _as_utc(scheduled_time) if privacy == "public" else None
+    if publish_at and publish_at <= datetime.now(timezone.utc) + YOUTUBE_PUBLISH_BUFFER:
+        minutes = int(YOUTUBE_PUBLISH_BUFFER.total_seconds() // 60)
+        raise ValueError(f"scheduled_time must be at least {minutes} minutes in the future")
+
     yt = get_youtube_service(account_id or channel_id)
 
     # Ensure Shorts format — append #Shorts to title and description
@@ -393,10 +400,6 @@ def upload_to_youtube(
         description = f"{description}\n\n#Shorts".strip() if description else "#Shorts"
     tags = _normalize_tags(tags)
     category_id = DEFAULT_VIDEO_CATEGORY_ID
-
-    publish_at = _as_utc(scheduled_time) if privacy == "public" else None
-    if publish_at and publish_at <= datetime.now(timezone.utc):
-        raise ValueError("scheduled_time must be in the future")
 
     status_privacy = privacy
     if publish_at:

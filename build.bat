@@ -52,10 +52,15 @@ if "%APP_VERSION%"=="" (
 echo [*] Building ViriaRevive v%APP_VERSION%...
 
 if not exist release mkdir release
-if exist "release\ViriaRevive-v%APP_VERSION%-Windows-x64.zip" del /q "release\ViriaRevive-v%APP_VERSION%-Windows-x64.zip"
-if exist "release\ViriaRevive-v%APP_VERSION%-Windows-x64.zip.sha256" del /q "release\ViriaRevive-v%APP_VERSION%-Windows-x64.zip.sha256"
-if exist "release\ViriaRevive-Windows-x64.zip" del /q "release\ViriaRevive-Windows-x64.zip"
-if exist "release\ViriaRevive-Windows-x64.zip.sha256" del /q "release\ViriaRevive-Windows-x64.zip.sha256"
+echo [*] Clearing old release ZIP artifacts...
+for %%F in (
+    release\ViriaRevive-v*-Windows-x64.zip
+    release\ViriaRevive-v*-Windows-x64.zip.sha256
+    release\ViriaRevive-Windows-x64.zip
+    release\ViriaRevive-Windows-x64.zip.sha256
+) do (
+    if exist "%%~F" del /q "%%~F"
+)
 
 venv\Scripts\python.exe scripts\check_version_sync.py
 if errorlevel 1 exit /b 1
@@ -75,16 +80,25 @@ if not exist "dist\ViriaRevive\ViriaRevive.exe" (
 echo [*] Adding release support files...
 copy /Y README.md dist\ViriaRevive\README.md >nul
 copy /Y LICENSE dist\ViriaRevive\LICENSE >nul
+copy /Y THIRD_PARTY_NOTICES.md dist\ViriaRevive\THIRD_PARTY_NOTICES.md >nul
 copy /Y client_secrets.example.json dist\ViriaRevive\client_secrets.example.json >nul
 copy /Y ViriaRevive.vbs dist\ViriaRevive\ViriaRevive.vbs >nul
 copy /Y ViriaRevive_Startup.vbs dist\ViriaRevive\ViriaRevive_Startup.vbs >nul
 copy /Y setup_startup.bat dist\ViriaRevive\setup_startup.bat >nul
 if exist bin (
     if not exist dist\ViriaRevive\bin mkdir dist\ViriaRevive\bin
-    for %%F in (README.md ffmpeg.exe ffprobe.exe) do (
+    for %%F in (README.md FFMPEG_BUILD.json ffmpeg.exe ffprobe.exe) do (
         if exist "bin\%%F" copy /Y "bin\%%F" "dist\ViriaRevive\bin\%%F" >nul
     )
 )
+
+echo [*] Generating release manifest and third-party notices...
+venv\Scripts\python.exe scripts\generate_release_manifest.py --output-dir dist\ViriaRevive
+if errorlevel 1 exit /b 1
+
+echo [*] Running release compliance scan...
+venv\Scripts\python.exe scripts\check_release_compliance.py --require-exists dist\ViriaRevive
+if errorlevel 1 exit /b 1
 
 echo [*] Running release safety scan...
 venv\Scripts\python.exe scripts\check_release_safety.py --require-exists dist\ViriaRevive

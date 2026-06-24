@@ -23,7 +23,7 @@ import webbrowser
 import copy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import yt_dlp
 
@@ -55,7 +55,7 @@ from config import (
     WHISPER_MODEL,
 )
 from detector import find_viral_moments, get_last_scene_detection_diagnostics
-from transcriber import transcribe_clip, find_sentence_boundary
+from transcriber import transcribe_clip, transcribe_clips, find_sentence_boundary
 from subtitler import (
     generate_subtitles,
     get_available_styles,
@@ -122,6 +122,7 @@ from title_generator import (
     ollama_status,
     summarize_clip_context,
     recommended_hashtags,
+    sanitize_creator_title_context,
     OLLAMA_DOWNLOAD_URL,
     OLLAMA_WINDOWS_DOCS_URL,
     OLLAMA_INSTALL_SCRIPT_URL,
@@ -158,6 +159,7 @@ from visual_diagnostics import (
 YOUTUBE_CREDENTIALS_URL = "https://console.cloud.google.com/apis/credentials"
 FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 SCHEDULER_MISSED_GRACE = timedelta(minutes=10)
+SCHEDULE_PUBLISH_BUFFER = timedelta(minutes=10)
 PROCESSING_DEPTHS = {"fast", "balanced", "deep"}
 VOICE_ENROLLMENT_MIN_WORDS = 12
 VOICE_ENROLLMENT_MIN_CREATOR_RATIO = 0.70
@@ -169,6 +171,27 @@ VOICE_ENROLLMENT_CREATOR_STREAM_REASONS = {
     "mic_creator_signal_over_more_words",
     "mic_title_hint_and_speech",
     "mic_title_hint_over_more_words",
+}
+SCHEDULE_SUCCESS_FIELDS = {
+    "uploaded",
+    "uploaded_at",
+    "youtube_id",
+    "youtube_url",
+    "upload_state",
+    "send_status",
+}
+SCHEDULE_BACKEND_STATUS_FIELDS = {
+    "scheduler_status",
+    "scheduler_note",
+    "failure_count",
+    "last_error",
+    "last_failed_at",
+    "retry_after",
+    "missed_at",
+    "upload_attempt_id",
+    "upload_attempt_started_at",
+    "upload_attempt_trigger",
+    "upload_unknown_at",
 }
 
 
@@ -192,6 +215,20 @@ def _safe_int_value(value, default: int = 0) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _local_naive_datetime(value: datetime) -> datetime:
+    """Normalize aware datetimes to local-naive values for persisted scheduler state."""
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
+def _parse_iso_datetime(value) -> datetime:
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
 
 
 def _safe_float_value(value, default: float = 0.0) -> float:
@@ -284,6 +321,72 @@ def _processing_depth_profile(depth: str, detection_preference: str, video_durat
         "voice_profile_ranking": None,
         "visual_max_candidates": 48,
     }
+
+
+def _candidate_analysis_limit(
+    depth: str,
+    detection_preference: str,
+    num_clips: int,
+    candidate_count: int,
+) -> int:
+    """Return how many candidates should get full transcript ranking."""
+    count = max(0, int(candidate_count or 0))
+    if count <= 0:
+        return 0
+    depth = _normalize_processing_depth(depth)
+    preference = normalize_detection_preference(detection_preference)
+    target = max(1, int(num_clips or 1))
+    if depth == "fast":
+        multiplier = 4 if preference == "quality" else 3
+        return min(count, max(target + 4, target * multiplier, 10))
+    if depth == "balanced" and preference == "quantity":
+        return min(count, max(target * 6, 24))
+    return count
+
+
+def _shortlist_candidates_for_transcription(
+    candidates: list[dict],
+    *,
+    depth: str,
+    detection_preference: str,
+    num_clips: int,
+    min_gap: int,
+) -> list[dict]:
+    """Cheaply reduce candidate transcription volume while keeping diversity."""
+    limit = _candidate_analysis_limit(depth, detection_preference, num_clips, len(candidates))
+    if limit <= 0 or limit >= len(candidates):
+        return list(candidates)
+
+    def candidate_score(row: dict) -> float:
+        return _safe_float_value(row.get("score"), 0.0) + 0.08 * _safe_float_value(row.get("scene"), 0.0)
+
+    selected: list[dict] = []
+    min_distance = max(8, int(min_gap or 0))
+    for row in sorted(candidates, key=candidate_score, reverse=True):
+        peak = _safe_float_value(row.get("peak_time", row.get("start")), 0.0)
+        if all(abs(peak - _safe_float_value(other.get("peak_time", other.get("start")), 0.0)) >= min_distance for other in selected):
+            selected.append(row)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        seen = {id(row) for row in selected}
+        for row in sorted(candidates, key=candidate_score, reverse=True):
+            if id(row) not in seen:
+                selected.append(row)
+                seen.add(id(row))
+            if len(selected) >= limit:
+                break
+    selected_ids = {id(row) for row in selected}
+    return [row for row in candidates if id(row) in selected_ids]
+
+
+def _crop_tracking_profile(depth: str) -> dict:
+    depth = _normalize_processing_depth(depth)
+    if depth == "fast":
+        return {"sample_count": 12, "min_sample_rate": 1.0}
+    if depth == "balanced":
+        return {"sample_count": 24, "min_sample_rate": 2.0}
+    return {"sample_count": 50, "min_sample_rate": 4.0}
 
 
 def _feature_status_label(enabled: bool, depth_override) -> str:
@@ -576,6 +679,21 @@ def _install_log_tee():
 
 # ── Local video server (serves clip files for HTML5 <video> preview) ─────────
 
+def _allowed_media_origin(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    text = str(origin).strip()
+    if text == "null":
+        return text
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return None
+    if parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        return text
+    return None
+
+
 class _SilentHandler(http.server.SimpleHTTPRequestHandler):
     """Serves files from a directory with range support and no logging."""
 
@@ -584,7 +702,10 @@ class _SilentHandler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origin = _allowed_media_origin(self.headers.get("Origin"))
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
         self.send_header("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range")
@@ -592,6 +713,10 @@ class _SilentHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_OPTIONS(self):
+        origin = self.headers.get("Origin")
+        if origin and not _allowed_media_origin(origin):
+            self.send_error(403, "Origin not allowed")
+            return
         self.send_response(204)
         self.end_headers()
 
@@ -647,6 +772,7 @@ class ApiBridge:
         self._results: list[Path] = []
         self._moments: list[dict] = []
         self._scheduled: list[dict] = []
+        self._upload_history: list[dict] = []
         self._video_port = _start_video_server(CLIPS_DIR)
         self._music_port = _start_video_server(MUSIC_DIR)
         self._scheduler_running = False
@@ -883,7 +1009,10 @@ class ApiBridge:
                 "diagnostics": diagnostics,
             }
 
-        recommended = pick_voice_stream_ordinal(path)
+        recommended = next(
+            (int(stream["ordinal"]) for stream in streams if stream.get("likely_role") == "commentary"),
+            int(streams[0]["ordinal"]),
+        )
         mode = "single" if len(streams) == 1 else "multi"
         message = (
             "One mixed audio track found"
@@ -970,6 +1099,7 @@ class ApiBridge:
             "source_id": moment.get("source_id"),
             "source_path": moment.get("source_path"),
             "source_stem": moment.get("source_stem"),
+            "creator_title_context": sanitize_creator_title_context(moment.get("creator_title_context")),
             "game_title": self._game_title_for_clip(clip_index),
             "start": moment.get("start"),
             "end": moment.get("end"),
@@ -1103,6 +1233,8 @@ class ApiBridge:
             f"Quality Score: {context_summary.get('quality_score')}",
             f"Selection Quality Score: {context_summary.get('selection_quality_score')}",
         ]
+        if context_summary.get("creator_title_context"):
+            lines.append(f"Creator Context: {context_summary['creator_title_context']}")
         sidecar = clip_path.with_suffix(".txt")
         try:
             sidecar.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1149,6 +1281,10 @@ class ApiBridge:
                 clip_context,
             ),
         }
+        creator_context = sanitize_creator_title_context((clip_context or {}).get("creator_title_context"))
+        if creator_context:
+            moment["creator_title_context"] = creator_context
+            moment["generated_metadata"]["creator_title_context"] = creator_context
 
     def generate_titles(self):
         """Generate titles for all clips using LLM (or heuristic fallback).
@@ -1222,6 +1358,7 @@ class ApiBridge:
                 "description_auto_hashtags": desc_parts["description_auto_hashtags"],
                 "recommended_hashtags": desc_parts["recommended_hashtags"],
                 "tags": tags,
+                "creator_title_context": sanitize_creator_title_context(clip_context.get("creator_title_context")),
                 "title_context": summarize_clip_context(transcripts[i], game_title, clip_context),
                 "metadata_file": metadata_file,
             })
@@ -1275,6 +1412,7 @@ class ApiBridge:
             "description_auto_hashtags": desc_parts["description_auto_hashtags"],
             "tags": tags,
             "game_title": game_title,
+            "creator_title_context": sanitize_creator_title_context(clip_context.get("creator_title_context")),
             "hashtags": desc_parts["recommended_hashtags"],
             "title_context": summarize_clip_context(transcript, game_title, clip_context),
             "metadata_file": metadata_file,
@@ -1456,6 +1594,7 @@ class ApiBridge:
                     "description_auto_hashtags": desc_parts["description_auto_hashtags"],
                     "recommended_hashtags": desc_parts["recommended_hashtags"],
                     "tags": tags,
+                    "creator_title_context": sanitize_creator_title_context(clip_context.get("creator_title_context")),
                     "title_context": summarize_clip_context(transcripts[i], game_title, clip_context),
                     "metadata_file": metadata_file,
                     "renamed": ok,
@@ -1639,15 +1778,17 @@ class ApiBridge:
             removed_ids.add(str(account_id))
         if removed_ids:
             changed = False
-            for item in self._scheduled:
-                item_account = item.get("account_id")
-                item_account_id = str(item_account) if item_account else ""
-                if item_account_id in removed_ids or (account_id is None and not item_account_id):
-                    item["scheduler_status"] = "account_disconnected"
-                    item["scheduler_note"] = "Reconnect YouTube or choose another account before upload"
-                    changed = True
+            with self._get_state_lock():
+                for item in self._scheduled:
+                    item_account = item.get("account_id")
+                    item_account_id = str(item_account) if item_account else ""
+                    if item_account_id in removed_ids or (account_id is None and not item_account_id):
+                        item["scheduler_status"] = "account_disconnected"
+                        item["scheduler_note"] = "Reconnect YouTube or choose another account before upload"
+                        changed = True
+                if changed:
+                    self._save_state()
             if changed:
-                self._save_state()
                 self._js("window.onScheduleUpdated()")
         return {"ok": True}
 
@@ -1875,7 +2016,8 @@ class ApiBridge:
 
     def cancel_upload(self):
         """Cancel an active manual upload between YouTube upload chunks."""
-        self._cancel = True
+        with self._get_state_lock():
+            self._cancel = True
         return {"ok": True}
 
     def _classify_selected_moments(
@@ -2283,6 +2425,18 @@ class ApiBridge:
             item.setdefault("clip_id", moment.get("clip_id"))
             item.setdefault("source_id", moment.get("source_id"))
             item.setdefault("source_stem", moment.get("source_stem"))
+            if "creator_title_context" in item:
+                context = sanitize_creator_title_context(item.get("creator_title_context"))
+                if context:
+                    item["creator_title_context"] = context
+                    moment["creator_title_context"] = context
+                else:
+                    item["creator_title_context"] = ""
+                    moment.pop("creator_title_context", None)
+            else:
+                context = sanitize_creator_title_context(moment.get("creator_title_context"))
+                if context:
+                    item["creator_title_context"] = context
         if idx < len(self._results):
             item.setdefault("clip_filename", self._results[idx].name)
         return item
@@ -2314,13 +2468,16 @@ class ApiBridge:
         title = str(item.get("title") or f"Clip {idx + 1}")
         game_title = self._schedule_game_title(item, idx)
         clip_context = self._title_context_for_clip(idx)
-        generated_text = (
-            item.get("description_generated")
-            or item.get("generated_description")
-            or (self._moments[idx].get("generated_metadata", {}).get("generated_description")
+        if "description_generated" in item or "generated_description" in item:
+            generated_text = item.get("description_generated")
+            if generated_text is None:
+                generated_text = item.get("generated_description")
+        else:
+            generated_text = (
+                self._moments[idx].get("generated_metadata", {}).get("generated_description")
                 if idx < len(self._moments) and isinstance(self._moments[idx], dict)
-                else None)
-        )
+                else None
+            )
         custom_text = item.get("description_custom_text")
         if custom_text is None and not structured:
             custom_text = self._description_profile()["custom_text"]
@@ -2366,6 +2523,121 @@ class ApiBridge:
             normalized.append(self._ensure_schedule_description(item, idx))
         return normalized
 
+    @staticmethod
+    def _schedule_identity_key(item: dict) -> tuple[str, str] | None:
+        if not isinstance(item, dict):
+            return None
+        clip_id = str(item.get("clip_id") or "").strip()
+        if clip_id:
+            return ("clip_id", clip_id)
+        filename = str(item.get("clip_filename") or "").strip()
+        if filename:
+            return ("clip_filename", filename)
+        try:
+            return ("clipIdx", str(int(item.get("clipIdx"))))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _same_schedule_slot(existing: dict, incoming: dict) -> bool:
+        for key in ("date", "time", "account_id", "channel_id"):
+            if str(existing.get(key) or "") != str(incoming.get(key) or ""):
+                return False
+        return True
+
+    @staticmethod
+    def _reset_schedule_success_fields(item: dict) -> None:
+        item["uploaded"] = False
+        for key in SCHEDULE_SUCCESS_FIELDS - {"uploaded"}:
+            item.pop(key, None)
+
+    def _merge_backend_schedule_fields(self, incoming: list[dict], existing: list[dict]) -> list[dict]:
+        existing_by_key: dict[tuple[str, str], dict] = {}
+        for item in existing or []:
+            key = self._schedule_identity_key(item)
+            if key:
+                existing_by_key[key] = item
+
+        merged = []
+        for item in incoming:
+            current = dict(item)
+            previous = existing_by_key.get(self._schedule_identity_key(current))
+            if previous:
+                same_slot = self._same_schedule_slot(previous, current)
+                if same_slot:
+                    for key in SCHEDULE_SUCCESS_FIELDS:
+                        if key in previous and previous.get(key) not in (None, ""):
+                            current[key] = previous[key]
+                    for key in SCHEDULE_BACKEND_STATUS_FIELDS:
+                        if key in previous and key not in current:
+                            current[key] = previous[key]
+                else:
+                    self._reset_schedule_success_fields(current)
+            merged.append(current)
+        return merged
+
+    def _normalize_upload_history(self, history) -> list[dict]:
+        normalized = []
+        for row in history or []:
+            if not isinstance(row, dict):
+                continue
+            clean = dict(row)
+            clean["schema_version"] = _safe_int_value(clean.get("schema_version"), 1) or 1
+            clean.setdefault("upload_id", str(uuid.uuid4()))
+            clean.setdefault("status", "sent_to_youtube")
+            normalized.append(clean)
+        return normalized[-1000:]
+
+    def _append_upload_history(self, record: dict) -> None:
+        if not isinstance(record, dict):
+            return
+        with self._get_state_lock():
+            self._upload_history = self._normalize_upload_history(getattr(self, "_upload_history", []))
+            youtube_id = str(record.get("youtube_id") or "").strip()
+            for idx, existing in enumerate(self._upload_history):
+                if youtube_id and str(existing.get("youtube_id") or "").strip() == youtube_id:
+                    merged = dict(existing)
+                    merged.update({k: v for k, v in record.items() if v not in (None, "")})
+                    self._upload_history[idx] = merged
+                    return
+            self._upload_history.append(record)
+
+    def _upload_history_record(self, item: dict, clip_idx: int, meta: dict, upload_result=None, trigger: str = "manual", timestamp: str | None = None) -> dict:
+        meta = meta or {}
+        item = item or {}
+        timestamp = timestamp or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        publish_at = None
+        try:
+            parsed = self._parse_publish_at(meta) or self._parse_publish_at(item)
+            if parsed:
+                publish_at = parsed.isoformat().replace("+00:00", "Z")
+        except Exception:
+            publish_at = None
+        result = upload_result if isinstance(upload_result, dict) else {}
+        privacy = str(meta.get("privacy") or item.get("privacy") or "private").lower()
+        status = "youtube_scheduled" if trigger != "scheduler" and privacy == "public" and publish_at else "sent_to_youtube"
+        return {
+            "schema_version": 1,
+            "upload_id": str(uuid.uuid4()),
+            "clip_id": meta.get("clip_id") or item.get("clip_id"),
+            "clip_filename": meta.get("clip_filename") or item.get("clip_filename"),
+            "source_id": meta.get("source_id") or item.get("source_id"),
+            "source_stem": meta.get("source_stem") or item.get("source_stem"),
+            "clipIdx": clip_idx,
+            "title": meta.get("title") or item.get("title"),
+            "account_id": meta.get("account_id") or item.get("account_id"),
+            "channel_id": meta.get("channel_id") or item.get("channel_id"),
+            "privacy": privacy,
+            "date": meta.get("date") or item.get("date"),
+            "time": meta.get("time") or item.get("time"),
+            "publish_at_utc": publish_at,
+            "finished_at_utc": timestamp,
+            "status": status,
+            "trigger": trigger,
+            "youtube_id": result.get("id"),
+            "youtube_url": result.get("url"),
+        }
+
     def _clip_payload(self, idx: int, path: Path, include_url: bool = True) -> dict:
         moment = self._ensure_moment_identity(
             self._moments[idx] if idx < len(self._moments) else {},
@@ -2386,6 +2658,7 @@ class ApiBridge:
             "ai_moment_classification": moment.get("ai_moment_classification"),
             "commentary_guard": moment.get("commentary_guard"),
             "voice_profile": moment.get("voice_profile"),
+            "creator_title_context": sanitize_creator_title_context(moment.get("creator_title_context")),
             "subtitle_style": moment.get("subtitle_style"),
             "captions_requested": moment.get("captions_requested"),
             "subtitle_enabled": moment.get("subtitle_enabled"),
@@ -2396,6 +2669,32 @@ class ApiBridge:
         if include_url:
             clip["url"] = f"http://127.0.0.1:{self._video_port}/{quote(path.name)}"
         return clip
+
+    @staticmethod
+    def _compact_moment_categories(categories) -> dict | None:
+        """Return the small label payload needed by library/review screens."""
+        if not isinstance(categories, dict):
+            return None
+        compact = {}
+        primary = str(categories.get("primary") or "").strip()
+        if primary:
+            compact["primary"] = primary
+        confidence = _safe_float_value(categories.get("confidence"), None)
+        if confidence is not None:
+            compact["confidence"] = round(confidence, 4)
+        ai = categories.get("ai")
+        if isinstance(ai, dict):
+            ai_compact = {
+                key: ai.get(key)
+                for key in ("status", "provider", "primary_category", "confidence", "fallback_used")
+                if ai.get(key) is not None
+            }
+            fine_labels = ai.get("fine_labels")
+            if isinstance(fine_labels, list):
+                ai_compact["fine_labels"] = [str(label) for label in fine_labels[:2] if label]
+            if ai_compact:
+                compact["ai"] = ai_compact
+        return compact or None
 
     @staticmethod
     def _empty_personalization() -> dict:
@@ -2959,6 +3258,14 @@ class ApiBridge:
         score = score_voice_profile(profile, features.get("features", []))
         score["active_seconds"] = features.get("active_seconds", 0.0)
         score["duration"] = features.get("duration", 0.0)
+        return score
+
+    def _voice_profile_inactive_score(self, profile_snapshot: dict | None = None) -> dict:
+        profile = sanitize_voice_profile(profile_snapshot or getattr(self, "_voice_profile", empty_voice_profile()))
+        score = score_voice_profile(profile, None)
+        if profile.get("enabled") and profile.get("enrolled"):
+            score["reason"] = "ranking_inactive"
+        score["active_seconds"] = 0.0
         return score
 
     def _probe_media_duration(self, path: Path, default: float = 60.0) -> float:
@@ -3677,6 +3984,42 @@ class ApiBridge:
             clips.append(self._clip_payload(i, p, include_url=True))
         return {"clips": clips, "moments": self._moments}
 
+    def save_source_title_context(self, source_id=None, source_stem=None, text=""):
+        """Save optional creator notes used only for local title/metadata generation."""
+        source_id = str(source_id or "").strip()
+        source_stem = str(source_stem or "").strip()
+        if not source_id and not source_stem:
+            return {"error": "Missing source identity"}
+        context = sanitize_creator_title_context(text)
+        updated_indices = []
+        with self._get_state_lock():
+            for idx, path in enumerate(self._results):
+                if idx >= len(self._moments):
+                    continue
+                moment = self._ensure_moment_identity(self._moments[idx], path)
+                self._moments[idx] = moment
+                matches_source_id = source_id and str(moment.get("source_id") or "") == source_id
+                matches_source_stem = source_stem and str(moment.get("source_stem") or "") == source_stem
+                if not (matches_source_id or matches_source_stem):
+                    continue
+                if context:
+                    moment["creator_title_context"] = context
+                else:
+                    moment.pop("creator_title_context", None)
+                updated_indices.append(idx)
+            for item in self._scheduled:
+                matches_source_id = source_id and str(item.get("source_id") or "") == source_id
+                matches_source_stem = source_stem and str(item.get("source_stem") or "") == source_stem
+                if not (matches_source_id or matches_source_stem):
+                    continue
+                previous = sanitize_creator_title_context(item.get("creator_title_context"))
+                item["creator_title_context"] = context
+                if previous != context:
+                    item["description_generated"] = ""
+                    item["generated_description"] = ""
+            self._save_state()
+        return {"ok": True, "updated": len(updated_indices), "creator_title_context": context}
+
     def open_output_folder(self):
         try:
             os.startfile(str(CLIPS_DIR))
@@ -3767,30 +4110,74 @@ class ApiBridge:
 
     def delete_library_file(self, filename):
         """Delete a video file from the clips folder by filename."""
-        target = self._safe_child_path(CLIPS_DIR, filename)
-        if target and target.exists() and target.is_file():
-            try:
-                removed_ids = {
-                    self._moments[i].get("clip_id")
-                    for i, p in enumerate(self._results)
-                    if p.name == target.name and i < len(self._moments)
-                }
-                target.unlink()
-                # Also remove from results if it was there
-                keep = [i for i, p in enumerate(self._results) if p.name != target.name]
+        result = self.delete_library_files([filename])
+        if result.get("deleted"):
+            return {"ok": True}
+        failed = result.get("failed") or []
+        if failed:
+            return {"error": failed[0].get("error") or "Delete failed"}
+        return {"error": result.get("error") or "File not found"}
+
+    def delete_library_files(self, filenames):
+        """Delete multiple video files from the clips folder by exact filename."""
+        if not isinstance(filenames, list):
+            return {"ok": False, "deleted": [], "failed": [{"filename": "", "error": "Expected a list of filenames"}]}
+
+        video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+        targets: list[tuple[str, Path]] = []
+        failed = []
+        seen = set()
+
+        for raw in filenames:
+            name = str(raw or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if Path(name).name != name:
+                failed.append({"filename": name, "error": "Invalid filename"})
+                continue
+            target = self._safe_child_path(CLIPS_DIR, name)
+            if not target or not target.exists() or not target.is_file():
+                failed.append({"filename": name, "error": "File not found"})
+                continue
+            if target.suffix.lower() not in video_exts:
+                failed.append({"filename": name, "error": "Not a supported video file"})
+                continue
+            targets.append((name, target))
+
+        deleted = []
+        deleted_names = set()
+        removed_ids = set()
+        lock = getattr(self, "_state_lock", threading.RLock())
+        with lock:
+            for name, target in targets:
+                try:
+                    target.unlink()
+                    deleted.append(name)
+                    deleted_names.add(name)
+                except Exception as exc:
+                    failed.append({"filename": name, "error": str(exc)})
+
+            if deleted_names:
+                for i, path in enumerate(self._results):
+                    if Path(path).name in deleted_names and i < len(self._moments):
+                        clip_id = self._moments[i].get("clip_id")
+                        if clip_id:
+                            removed_ids.add(clip_id)
+
+                keep = [i for i, path in enumerate(self._results) if Path(path).name not in deleted_names]
+                old_moments = list(self._moments)
                 self._results = [self._results[i] for i in keep]
-                self._moments = [self._moments[i] for i in keep if i < len(self._moments)]
+                self._moments = [old_moments[i] for i in keep if i < len(old_moments)]
                 self._scheduled = [
                     s for s in self._scheduled
-                    if s.get("clip_id") not in removed_ids and s.get("clip_filename") != target.name
+                    if s.get("clip_id") not in removed_ids and s.get("clip_filename") not in deleted_names
                 ]
                 self._scheduled = self._normalize_scheduled_items(self._scheduled)
-                self._mark_personalization_clips_deleted(removed_ids, {target.name})
+                self._mark_personalization_clips_deleted(removed_ids, deleted_names)
                 self._save_state()
-                return {"ok": True}
-            except Exception as e:
-                return {"error": str(e)}
-        return {"error": "File not found"}
+
+        return {"ok": bool(deleted), "deleted": deleted, "failed": failed}
 
     # ── Exposed: library (all videos) ────────────────────────────────────
 
@@ -3832,12 +4219,15 @@ class ApiBridge:
                     )
                     if known_idx < len(self._moments):
                         self._moments[known_idx] = moment
+                    compact_categories = self._compact_moment_categories(moment.get("moment_categories"))
                     clip.update({
                         "clip_id": moment.get("clip_id"),
                         "source_id": moment.get("source_id"),
                         "source_stem": moment.get("source_stem", ""),
                         "primary_category": moment.get("primary_category"),
+                        "moment_categories": compact_categories,
                         "ai_moment_classification": moment.get("ai_moment_classification"),
+                        "creator_title_context": sanitize_creator_title_context(moment.get("creator_title_context")),
                         "subtitle_style": moment.get("subtitle_style"),
                         "captions_requested": moment.get("captions_requested"),
                         "subtitle_enabled": moment.get("subtitle_enabled"),
@@ -3847,12 +4237,15 @@ class ApiBridge:
                     })
                 else:
                     moment = self._ensure_moment_identity({}, p)
+                    compact_categories = self._compact_moment_categories(moment.get("moment_categories"))
                     clip.update({
                         "clip_id": moment.get("clip_id"),
                         "source_id": moment.get("source_id"),
                         "source_stem": moment.get("source_stem", ""),
                         "primary_category": moment.get("primary_category"),
+                        "moment_categories": compact_categories,
                         "ai_moment_classification": moment.get("ai_moment_classification"),
+                        "creator_title_context": sanitize_creator_title_context(moment.get("creator_title_context")),
                         "subtitle_style": moment.get("subtitle_style"),
                         "captions_requested": moment.get("captions_requested"),
                         "subtitle_enabled": moment.get("subtitle_enabled"),
@@ -3905,7 +4298,8 @@ class ApiBridge:
     def save_scheduled(self, scheduled_list):
         """Replace the full scheduled list (called from JS on every change)."""
         with self._state_lock:
-            self._scheduled = self._normalize_scheduled_items(scheduled_list or [])
+            incoming = self._normalize_scheduled_items(scheduled_list or [])
+            self._scheduled = self._merge_backend_schedule_fields(incoming, self._scheduled)
             self._save_state()
         return {"ok": True}
 
@@ -3914,7 +4308,12 @@ class ApiBridge:
         with self._state_lock:
             self._prune_missing_results()
             self._scheduled = self._normalize_scheduled_items(self._scheduled)
-            return {"scheduled": self._scheduled}
+            stale_attempts = self._reconcile_incomplete_upload_attempts()
+            missed = self._mark_overdue_public_schedules_missed()
+            if stale_attempts or missed:
+                self._save_state()
+            self._upload_history = self._normalize_upload_history(getattr(self, "_upload_history", []))
+            return {"scheduled": self._scheduled, "upload_history": self._upload_history}
 
     # ── Exposed: upload ──────────────────────────────────────────────────
 
@@ -3976,9 +4375,10 @@ class ApiBridge:
             if privacy == "public" and not publish_at:
                 label = meta.get("title") or meta.get("clip_filename") or f"clip {original_index + 1}"
                 raise ValueError(f"Scheduled publish time is required for public upload: {label}")
-            if publish_at and privacy == "public" and publish_at <= now_utc:
+            if publish_at and privacy == "public" and publish_at <= now_utc + SCHEDULE_PUBLISH_BUFFER:
                 label = meta.get("title") or meta.get("clip_filename") or f"clip {original_index + 1}"
-                raise ValueError(f"Scheduled publish time is in the past for {label}")
+                minutes = int(SCHEDULE_PUBLISH_BUFFER.total_seconds() // 60)
+                raise ValueError(f"Scheduled publish time must be at least {minutes} minutes from now for {label}")
         return ordered
 
     def _get_upload_lock(self):
@@ -3988,14 +4388,26 @@ class ApiBridge:
             self._upload_lock = lock
         return lock
 
+    def _get_state_lock(self):
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._state_lock = lock
+        return lock
+
+    def _is_cancelled(self) -> bool:
+        with self._get_state_lock():
+            return bool(getattr(self, "_cancel", False))
+
     def start_upload(self, clips_metadata, schedule_start, interval_hours, channel_id=None):
         """Upload clips with per-clip metadata.
 
         clips_metadata: list of {index, clip_id, source_id, title, description, tags, category_id, privacy, publish_at}
         channel_id: YouTube channel ID to upload to (from get_channels())
         """
-        if self._processing:
-            return {"error": "Processing in progress"}
+        with self._get_state_lock():
+            if getattr(self, "_processing", False):
+                return {"error": "Processing in progress"}
         try:
             ordered = self._validate_upload_metadata(clips_metadata)
         except Exception as exc:
@@ -4005,8 +4417,15 @@ class ApiBridge:
         upload_lock = self._get_upload_lock()
         if not upload_lock.acquire(blocking=False):
             return {"error": "Upload already in progress"}
-        self._processing = True
-        self._cancel = False
+        with self._get_state_lock():
+            if getattr(self, "_processing", False):
+                try:
+                    upload_lock.release()
+                except RuntimeError:
+                    pass
+                return {"error": "Processing in progress"}
+            self._processing = True
+            self._cancel = False
         threading.Thread(
             target=self._run_upload,
             args=(clips_metadata, schedule_start, interval_hours, channel_id, upload_lock),
@@ -4023,7 +4442,7 @@ class ApiBridge:
             return {"error": "Clip file not found"}
         try:
             normalized_meta = self._ensure_schedule_description(dict(meta or {}), clip_index)
-            upload_to_youtube(
+            result = upload_to_youtube(
                 video_path,
                 title=normalized_meta.get("title", f"Viral Clip #{clip_index + 1}"),
                 description=normalized_meta.get("final_description") or normalized_meta.get("description", ""),
@@ -4032,8 +4451,13 @@ class ApiBridge:
                 privacy=normalized_meta.get("privacy", "private"),
                 channel_id=normalized_meta.get("channel_id") or channel_id,
                 account_id=normalized_meta.get("account_id"),
-                cancel_check=lambda: self._cancel,
+                cancel_check=self._is_cancelled,
             )
+            with self._get_state_lock():
+                self._append_upload_history(
+                    self._upload_history_record(normalized_meta, clip_index, normalized_meta, result, trigger="single")
+                )
+                self._save_state()
             return {"ok": True}
         except Exception as e:
             return {"error": str(e)}
@@ -4042,9 +4466,10 @@ class ApiBridge:
 
     def start_scheduler(self):
         """Start the background upload scheduler thread."""
-        if self._scheduler_running:
-            return {"ok": True}
-        self._scheduler_running = True
+        with self._get_state_lock():
+            if self._scheduler_running:
+                return {"ok": True}
+            self._scheduler_running = True
         threading.Thread(target=self._scheduler_loop, daemon=True).start()
         print("[+] Background upload scheduler started")
         return {"ok": True}
@@ -4054,6 +4479,9 @@ class ApiBridge:
     def load_persisted_state(self):
         """Return persisted results/moments/scheduled for frontend init."""
         self._prune_missing_results()
+        with self._state_lock:
+            if self._mark_overdue_public_schedules_missed():
+                self._save_state()
         clips = []
         for i, p in enumerate(self._results):
             clips.append(self._clip_payload(i, p, include_url=False))
@@ -4062,6 +4490,7 @@ class ApiBridge:
             "clips": clips,
             "moments": self._moments[:len(self._results)],
             "scheduled": self._scheduled,
+            "upload_history": self._normalize_upload_history(getattr(self, "_upload_history", [])),
         }
 
     # ── Candidate-debug recovery ─────────────────────────────────────────
@@ -4198,6 +4627,7 @@ class ApiBridge:
 
             clip_duration = int(settings.get("clip_duration", CLIP_DURATION))
             detection_preference = normalize_detection_preference(settings.get("detection_preference"))
+            processing_depth = _normalize_processing_depth(settings.get("processing_depth"))
             quality_floor = float(settings.get("quality_floor", quality_floor_for_preference(detection_preference)))
             model = settings.get("whisper_model", WHISPER_MODEL)
             language = settings.get("whisper_language") or None
@@ -4211,6 +4641,15 @@ class ApiBridge:
             crop_vertical = settings.get("crop_vertical", CROP_VERTICAL)
             with self._voice_profile_lock:
                 voice_profile_snapshot = json.loads(json.dumps(self._voice_profile))
+            recovery_voice_profile_status = voice_profile_status(
+                voice_profile_snapshot,
+                file_exists=VOICE_PROFILE_FILE.exists(),
+                size_bytes=VOICE_PROFILE_FILE.stat().st_size if VOICE_PROFILE_FILE.exists() else 0,
+            )
+            recovery_voice_scoring_active = bool(
+                _normalize_bool_setting(settings.get("voice_profile_ranking"), False)
+                and recovery_voice_profile_status.get("can_score")
+            )
 
             run_warnings = list(payload.get("warnings") or [])
             run_warnings.append("rendered_from_candidate_debug")
@@ -4304,7 +4743,11 @@ class ApiBridge:
                     if retry_words:
                         final_words = retry_words
                         final_stream = retry_stream
-                final_voice_profile_score = self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                final_voice_profile_score = (
+                    self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                    if recovery_voice_scoring_active
+                    else self._voice_profile_inactive_score(voice_profile_snapshot)
+                )
                 words = final_words
                 if final_words:
                     final_candidate = {
@@ -4385,7 +4828,14 @@ class ApiBridge:
                 if crop_vertical:
                     self._clip_push(idx, total, "audio", 100, f"Clip {idx}/{total}: Tracking speakers...")
                     try:
-                        crop_params = get_crop_params_dynamic(video_path, start, end)
+                        crop_profile = _crop_tracking_profile(processing_depth)
+                        crop_params = get_crop_params_dynamic(
+                            video_path,
+                            start,
+                            end,
+                            sample_count=int(crop_profile["sample_count"]),
+                            min_sample_rate=float(crop_profile["min_sample_rate"]),
+                        )
                     except Exception as e:
                         print(f"[!] Crop detection failed for recovered clip {idx}: {e}")
                         crop_params = None
@@ -4868,8 +5318,16 @@ class ApiBridge:
                 print(f"[audio] User-selected transcription stream: 0:a:{speech_stream}")
             else:
                 try:
+                    stream_probe_samples = 2 if processing_depth == "fast" else (4 if processing_depth == "balanced" else 6)
+                    stream_probe_seconds = 12 if processing_depth == "fast" else (16 if processing_depth == "balanced" else 20)
                     speech_stream = select_speech_stream(
-                        video_path, candidates, candidate_model, language, SUBTITLES_DIR
+                        video_path,
+                        candidates,
+                        candidate_model,
+                        language,
+                        SUBTITLES_DIR,
+                        max_samples=stream_probe_samples,
+                        sample_seconds=stream_probe_seconds,
                     )
                     audio_source_debug["stream_selection"] = get_last_speech_stream_selection()
                 except Exception as e:
@@ -4897,11 +5355,27 @@ class ApiBridge:
             stem = source_stem
             evaluations: list[dict] = []
             probe_buffer = 14
-            candidate_total = len(candidates)
+            detected_candidate_total = len(candidates)
+            analysis_candidates = _shortlist_candidates_for_transcription(
+                candidates,
+                depth=processing_depth,
+                detection_preference=detection_preference,
+                num_clips=num_clips,
+                min_gap=min_gap,
+            )
+            candidate_total = len(analysis_candidates)
+            if candidate_total < detected_candidate_total:
+                run_warnings.append("candidate_transcription_shortlisted")
+                print(
+                    "[perf] Candidate transcription shortlist: "
+                    f"{candidate_total}/{detected_candidate_total} candidates"
+                )
             self._push("candidates", 0, f"Analyzing {candidate_total} candidate moments...")
 
             candidate_analysis_started = time.monotonic()
-            for idx, candidate in enumerate(candidates, 1):
+            candidate_rows: list[dict] = []
+            extracted_wavs: list[Path] = []
+            for idx, candidate in enumerate(analysis_candidates, 1):
                 if self._cancel:
                     return self._cancelled()
                 start = int(candidate["start"])
@@ -4910,13 +5384,46 @@ class ApiBridge:
                 wav.unlink(missing_ok=True)
 
                 pct = int((idx - 1) / max(candidate_total, 1) * 100)
-                self._push("candidates", pct, f"Analyzing candidate {idx}/{candidate_total} before rendering...")
+                self._push("candidates", pct, f"Extracting candidate audio {idx}/{candidate_total}...")
 
-                words = []
+                extracted = extract_audio_clip(video_path, start, extended_end, wav, audio_stream=speech_stream)
+                row = {
+                    "idx": idx,
+                    "candidate": candidate,
+                    "start": start,
+                    "extended_end": extended_end,
+                    "wav": wav,
+                    "pct": pct,
+                    "extracted": bool(extracted),
+                }
+                candidate_rows.append(row)
+                if extracted:
+                    extracted_wavs.append(wav)
+
+            batch_words_by_path: dict[str, list] = {}
+            if extracted_wavs:
+                self._push("candidates", 35, f"Batch transcribing {len(extracted_wavs)} candidates...")
+                batch_words = transcribe_clips(extracted_wavs, model_size=candidate_model, language=language)
+                batch_words_by_path = {
+                    str(path): words
+                    for path, words in zip(extracted_wavs, batch_words)
+                }
+
+            voice_scoring_active = bool(voice_profile_debug.get("ranking_active"))
+            for row in candidate_rows:
+                if self._cancel:
+                    return self._cancelled()
+                idx = int(row["idx"])
+                candidate = row["candidate"]
+                start = int(row["start"])
+                extended_end = int(row["extended_end"])
+                wav = row["wav"]
+                pct = int(row["pct"])
+                self._push("candidates", pct, f"Scoring candidate {idx}/{candidate_total} before rendering...")
+
+                words = list(batch_words_by_path.get(str(wav), []))
                 used_stream = speech_stream
                 retry_report = None
-                if extract_audio_clip(video_path, start, extended_end, wav, audio_stream=speech_stream):
-                    words = transcribe_clip(wav, model_size=candidate_model, language=language)
 
                 if allow_stream_retry and needs_stream_retry(words, extended_end - start):
                     words, alt_stream = self._try_alternate_audio_streams(
@@ -4928,7 +5435,10 @@ class ApiBridge:
                     retry_report = getattr(self, "_last_stream_retry", None)
                     if alt_stream is not None:
                         used_stream = alt_stream
-                voice_profile_score = self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                if voice_scoring_active:
+                    voice_profile_score = self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                else:
+                    voice_profile_score = self._voice_profile_inactive_score(voice_profile_snapshot)
 
                 evaluation = evaluate_candidate(
                     candidate,
@@ -5397,7 +5907,11 @@ class ApiBridge:
                     if retry_words:
                         final_words = retry_words
                         final_stream = retry_stream
-                final_voice_profile_score = self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                final_voice_profile_score = (
+                    self._voice_profile_score_for_wav(wav, voice_profile_snapshot)
+                    if voice_profile_debug.get("ranking_active")
+                    else self._voice_profile_inactive_score(voice_profile_snapshot)
+                )
 
                 if final_words:
                     final_candidate = {
@@ -5549,7 +6063,14 @@ class ApiBridge:
                         return self._cancelled()
                     self._clip_push(clip_num, total, "audio", 100, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
-                        crop_params = get_crop_params_dynamic(video_path, start, end)
+                        crop_profile = _crop_tracking_profile(processing_depth)
+                        crop_params = get_crop_params_dynamic(
+                            video_path,
+                            start,
+                            end,
+                            sample_count=int(crop_profile["sample_count"]),
+                            min_sample_rate=float(crop_profile["min_sample_rate"]),
+                        )
                     except Exception as e:
                         print(f"[!] Crop detection failed for clip {clip_num}: {e}")
                         crop_params = None
@@ -5915,20 +6436,23 @@ class ApiBridge:
     # ── Upload orchestrator (background thread) ──────────────────────────
 
     def _scheduled_upload_active(self, clip_idx, meta=None, channel_id=None) -> bool:
-        for item in self._scheduled:
-            if item.get("uploaded"):
-                continue
-            if not self._scheduled_item_matches_clip(item, clip_idx, meta):
-                continue
-            if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
-                continue
-            if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
-                continue
-            if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
-                continue
-            if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
-                continue
-            return True
+        with self._get_state_lock():
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                if str(item.get("scheduler_status") or "").lower() == "upload_outcome_unknown":
+                    continue
+                if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                    continue
+                if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
+                    continue
+                if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                    continue
+                if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                    continue
+                if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                    continue
+                return True
         return False
 
     def _scheduled_item_matches_clip(self, item, clip_idx, meta=None) -> bool:
@@ -5965,30 +6489,117 @@ class ApiBridge:
         except (TypeError, ValueError):
             return False
 
-    def _mark_scheduled_uploaded(self, clip_idx, meta, upload_result=None):
+    def _mark_scheduled_uploaded(self, clip_idx, meta, upload_result=None, trigger: str = "manual"):
         """Mark the matching scheduled item as uploaded after YouTube accepts it."""
-        timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        changed = False
-        for item in self._scheduled:
-            if not self._scheduled_item_matches_clip(item, clip_idx, meta):
-                continue
-            if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
-                continue
-            if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
-                continue
-            if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
-                continue
-            item["uploaded"] = True
-            item["uploaded_at"] = timestamp
-            if isinstance(upload_result, dict):
-                if upload_result.get("id"):
-                    item["youtube_id"] = upload_result["id"]
-                if upload_result.get("url"):
-                    item["youtube_url"] = upload_result["url"]
-            changed = True
-        if changed:
-            self._save_state()
-        return changed
+        with self._get_state_lock():
+            meta = meta or {}
+            timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            changed = False
+            for item in self._scheduled:
+                if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                    continue
+                if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                    continue
+                if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                    continue
+                if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                    continue
+                item["uploaded"] = True
+                item["uploaded_at"] = timestamp
+                item["upload_state"] = (
+                    "youtube_scheduled"
+                    if trigger != "scheduler" and str(item.get("privacy") or meta.get("privacy") or "").lower() == "public"
+                    else "sent_to_youtube"
+                )
+                item["send_status"] = item["upload_state"]
+                for key in SCHEDULE_BACKEND_STATUS_FIELDS:
+                    item.pop(key, None)
+                if isinstance(upload_result, dict):
+                    if upload_result.get("id"):
+                        item["youtube_id"] = upload_result["id"]
+                    if upload_result.get("url"):
+                        item["youtube_url"] = upload_result["url"]
+                self._append_upload_history(
+                    self._upload_history_record(item, clip_idx, meta, upload_result, trigger=trigger, timestamp=timestamp)
+                )
+                changed = True
+            if changed:
+                self._save_state()
+            return changed
+
+    def _begin_scheduled_upload_attempt(self, clip_idx, meta=None, trigger: str = "manual", channel_id=None) -> str | None:
+        """Persist a durable in-progress marker before calling YouTube."""
+        with self._get_state_lock():
+            meta = meta or {}
+            attempt_id = f"{trigger}-{uuid.uuid4().hex}"
+            timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            changed = False
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                    continue
+                if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
+                    continue
+                if meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                    continue
+                if meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                    continue
+                if meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                    continue
+                item["scheduler_status"] = "uploading"
+                item["scheduler_note"] = "Sending to YouTube"
+                item["upload_attempt_id"] = attempt_id
+                item["upload_attempt_started_at"] = timestamp
+                item["upload_attempt_trigger"] = trigger
+                item.pop("upload_unknown_at", None)
+                changed = True
+            if changed:
+                self._save_state()
+                return attempt_id
+            return None
+
+    def _clear_scheduled_upload_attempt(self, clip_idx, meta=None, channel_id=None) -> bool:
+        """Clear an in-progress marker when an upload is cancelled before acceptance."""
+        with self._get_state_lock():
+            meta = meta or {}
+            changed = False
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                    continue
+                if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
+                    continue
+                if str(item.get("scheduler_status") or "").lower() == "uploading":
+                    for key in ("scheduler_status", "scheduler_note", "upload_attempt_id", "upload_attempt_started_at", "upload_attempt_trigger"):
+                        item.pop(key, None)
+                    changed = True
+            if changed:
+                self._save_state()
+            return changed
+
+    def _mark_scheduled_upload_failed_for_clip(self, clip_idx, meta, error, now=None) -> bool:
+        """Mark matching scheduled rows as failed after a known upload error."""
+        with self._get_state_lock():
+            meta = meta or {}
+            changed = False
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                if not self._scheduled_item_matches_clip(item, clip_idx, meta):
+                    continue
+                if meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
+                    continue
+                if meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                    continue
+                if meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                    continue
+                self._mark_scheduled_upload_failed(item, error, now)
+                changed = True
+            if changed:
+                self._save_state()
+            return changed
 
     def _run_upload(self, clips_metadata, schedule_start_iso, interval_hours, channel_id=None, upload_lock=None):
         try:
@@ -5998,7 +6609,7 @@ class ApiBridge:
             skipped = 0
 
             for i, (_original_index, meta, scheduled) in enumerate(ordered_metadata):
-                if self._cancel:
+                if self._is_cancelled():
                     return self._cancelled()
                 pct = int((i / total) * 100)
 
@@ -6017,6 +6628,8 @@ class ApiBridge:
                     continue
 
                 self._push("upload", pct, f"Uploading clip {i + 1}/{total}...")
+                self._begin_scheduled_upload_attempt(idx, meta, trigger="manual", channel_id=channel_id)
+                self._js("window.onScheduleUpdated()")
 
                 clip_base_pct = int((i / total) * 100)
                 clip_span_pct = 100 / total
@@ -6025,19 +6638,28 @@ class ApiBridge:
                     overall = min(99, int(clip_base_pct + (float(chunk_percent) / 100.0) * clip_span_pct))
                     self._push("upload", overall, f"Uploading clip {clip_number}/{total}... {int(chunk_percent)}%")
 
-                result = upload_to_youtube(
-                    video_path,
-                    title=meta.get("title", f"Viral Clip #{i + 1}"),
-                    description=meta.get("final_description") or meta.get("description", ""),
-                    tags=meta.get("tags", generate_tags()),
-                    category_id=DEFAULT_VIDEO_CATEGORY_ID,
-                    privacy=meta.get("privacy", "private"),
-                    scheduled_time=scheduled,
-                    channel_id=meta.get("channel_id") or channel_id,
-                    account_id=meta.get("account_id"),
-                    cancel_check=lambda: self._cancel or not self._scheduled_upload_active(idx, meta, channel_id),
-                    on_progress=_upload_progress,
-                )
+                try:
+                    result = upload_to_youtube(
+                        video_path,
+                        title=meta.get("title", f"Viral Clip #{i + 1}"),
+                        description=meta.get("final_description") or meta.get("description", ""),
+                        tags=meta.get("tags", generate_tags()),
+                        category_id=DEFAULT_VIDEO_CATEGORY_ID,
+                        privacy=meta.get("privacy", "private"),
+                        scheduled_time=scheduled,
+                        channel_id=meta.get("channel_id") or channel_id,
+                        account_id=meta.get("account_id"),
+                        cancel_check=lambda: self._is_cancelled() or not self._scheduled_upload_active(idx, meta, channel_id),
+                        on_progress=_upload_progress,
+                    )
+                except Exception as upload_error:
+                    if self._is_cancelled():
+                        self._clear_scheduled_upload_attempt(idx, meta, channel_id)
+                        self._js("window.onScheduleUpdated()")
+                        return self._cancelled()
+                    self._mark_scheduled_upload_failed_for_clip(idx, meta, upload_error)
+                    self._js("window.onScheduleUpdated()")
+                    raise
                 uploaded += 1
                 if self._mark_scheduled_uploaded(idx, meta, result):
                     self._js("window.onScheduleUpdated()")
@@ -6055,11 +6677,12 @@ class ApiBridge:
             self._js(f"window.onPipelineComplete({str(success).lower()}, {uploaded}, {total}, {error_msg})")
 
         except Exception as e:
-            if self._cancel:
+            if self._is_cancelled():
                 return self._cancelled()
             self._error(f"Upload failed: {e}")
         finally:
-            self._processing = False
+            with self._get_state_lock():
+                self._processing = False
             if upload_lock:
                 try:
                     upload_lock.release()
@@ -6070,23 +6693,44 @@ class ApiBridge:
 
     def _scheduler_loop(self):
         """Check every 30s for scheduled uploads whose time has arrived."""
-        while self._scheduler_running:
+        while True:
+            with self._get_state_lock():
+                if not self._scheduler_running:
+                    break
+                scheduled_snapshot = list(self._scheduled)
             now = datetime.now()
             changed = False
 
-            for item in list(self._scheduled):
-                if item.get("uploaded"):
-                    continue
-                if item.get("scheduler_status") == "account_disconnected":
-                    continue
-                if not self._scheduled_retry_due(item, now):
-                    continue
-                try:
-                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}")
-                except (KeyError, ValueError):
-                    continue
+            for snapshot_item in scheduled_snapshot:
+                with self._get_state_lock():
+                    item = None
+                    snapshot_key = self._schedule_identity_key(snapshot_item)
+                    if snapshot_key:
+                        item = next(
+                            (
+                                current
+                                for current in self._scheduled
+                                if self._schedule_identity_key(current) == snapshot_key
+                            ),
+                            None,
+                        )
+                    if item is None and any(current is snapshot_item for current in self._scheduled):
+                        item = snapshot_item
+                    if item is None:
+                        continue
+                    if item.get("uploaded"):
+                        continue
+                    if item.get("scheduler_status") in {"account_disconnected", "upload_outcome_unknown"}:
+                        continue
+                    if not self._scheduled_retry_due(item, now):
+                        continue
+                    try:
+                        sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}")
+                    except (KeyError, ValueError):
+                        continue
 
-                if now >= sched_dt:
+                    if now < sched_dt:
+                        continue
                     if self._scheduled_item_missed_upload_window(item, sched_dt, now):
                         if item.get("scheduler_status") != "missed":
                             item["scheduler_status"] = "missed"
@@ -6102,51 +6746,74 @@ class ApiBridge:
                         print("[scheduler] Removed scheduled item for a missing clip")
                         continue
                     item["clipIdx"] = clip_idx
-                    upload_lock = self._get_upload_lock()
+                    title = item.get("title", f"Viral Clip #{clip_idx + 1}")
+                    tags = item.get("tags", generate_tags())
+                    if isinstance(tags, str):
+                        tags = [t.strip() for t in tags.split(",") if t.strip()]
+                    meta = self._ensure_schedule_description(dict(item), clip_idx)
+
+                upload_lock = self._get_upload_lock()
+                with self._get_state_lock():
                     if self._processing or not upload_lock.acquire(blocking=False):
                         print("[scheduler] Upload already in progress; will retry scheduled item")
                         continue
                     self._processing = True
                     self._cancel = False
-                    title = item.get("title", f"Viral Clip #{clip_idx + 1}")
-                    print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
-                    status_message = json.dumps(f"Uploading: {title}")
-                    self._js(f"window.onSchedulerStatus({status_message})")
-                    try:
-                        tags = item.get("tags", generate_tags())
-                        if isinstance(tags, str):
-                            tags = [t.strip() for t in tags.split(",") if t.strip()]
-                        upload_to_youtube(
-                            video_path,
-                            title=title,
-                            description=item.get("final_description") or item.get("description", ""),
-                            tags=tags,
-                            category_id=DEFAULT_VIDEO_CATEGORY_ID,
-                            privacy=item.get("privacy", "private"),
-                            channel_id=item.get("channel_id"),
-                            account_id=item.get("account_id"),
-                            cancel_check=lambda item=item: self._cancel or item not in self._scheduled,
-                        )
-                        item["uploaded"] = True
-                        changed = True
-                        print(f"[scheduler] Uploaded: {title}")
-                        self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
 
-                        # Auto-delete from disk after successful upload
-                        if self._delete_after_upload:
-                            self._delete_uploaded_clip(clip_idx, video_path)
-
-                    except Exception as e:
-                        print(f"[scheduler] Upload failed: {e}")
-                        self._mark_scheduled_upload_failed(item, e, now)
+                print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
+                status_message = json.dumps(f"Uploading: {title}")
+                self._js(f"window.onSchedulerStatus({status_message})")
+                try:
+                    attempt_id = self._begin_scheduled_upload_attempt(
+                        clip_idx,
+                        meta,
+                        trigger="scheduler",
+                        channel_id=meta.get("channel_id"),
+                    )
+                    if not attempt_id:
+                        print("[scheduler] Scheduled item changed before upload; will retry later")
+                        continue
+                    self._js("window.onScheduleUpdated()")
+                    result = upload_to_youtube(
+                        video_path,
+                        title=title,
+                        description=meta.get("final_description") or meta.get("description", ""),
+                        tags=tags,
+                        category_id=DEFAULT_VIDEO_CATEGORY_ID,
+                        privacy=meta.get("privacy", "private"),
+                        channel_id=meta.get("channel_id"),
+                        account_id=meta.get("account_id"),
+                        cancel_check=lambda meta=meta, clip_idx=clip_idx: (
+                            self._is_cancelled()
+                            or not self._scheduled_upload_active(clip_idx, meta, meta.get("channel_id"))
+                        ),
+                    )
+                    if self._mark_scheduled_uploaded(clip_idx, meta, result, trigger="scheduler"):
                         changed = True
-                        self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
-                    finally:
+                        self._js("window.onScheduleUpdated()")
+                    print(f"[scheduler] Uploaded: {title}")
+                    self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
+
+                    # Auto-delete from disk after successful upload
+                    with self._get_state_lock():
+                        delete_after_upload = bool(self._delete_after_upload)
+                    if delete_after_upload:
+                        self._delete_uploaded_clip(clip_idx, video_path)
+
+                except Exception as e:
+                    print(f"[scheduler] Upload failed: {e}")
+                    if self._is_cancelled():
+                        self._clear_scheduled_upload_attempt(clip_idx, meta, meta.get("channel_id"))
+                    elif self._mark_scheduled_upload_failed_for_clip(clip_idx, meta, e, now):
+                        changed = True
+                    self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
+                finally:
+                    with self._get_state_lock():
                         self._processing = False
-                        try:
-                            upload_lock.release()
-                        except RuntimeError:
-                            pass
+                    try:
+                        upload_lock.release()
+                    except RuntimeError:
+                        pass
 
             if changed:
                 self._save_state()
@@ -6158,21 +6825,25 @@ class ApiBridge:
         retry_at = item.get("retry_after")
         if not retry_at:
             return True
-        now = now or datetime.now()
+        now = _local_naive_datetime(now or datetime.now())
         try:
-            return now >= datetime.fromisoformat(str(retry_at))
-        except ValueError:
+            retry_dt = _local_naive_datetime(_parse_iso_datetime(retry_at))
+            return now >= retry_dt
+        except (TypeError, ValueError):
             return True
 
     def _mark_scheduled_upload_failed(self, item, error, now=None):
-        now = now or datetime.now()
-        attempts = int(item.get("failure_count") or 0) + 1
-        delay_minutes = min(180, 5 * (2 ** max(0, attempts - 1)))
-        item["failure_count"] = attempts
-        item["scheduler_status"] = "upload_failed"
-        item["last_error"] = str(error)[:500]
-        item["last_failed_at"] = now.replace(microsecond=0).isoformat()
-        item["retry_after"] = (now + timedelta(minutes=delay_minutes)).replace(microsecond=0).isoformat()
+        with self._get_state_lock():
+            now = _local_naive_datetime(now or datetime.now())
+            attempts = int(item.get("failure_count") or 0) + 1
+            delay_minutes = min(180, 5 * (2 ** max(0, attempts - 1)))
+            item["failure_count"] = attempts
+            item["scheduler_status"] = "upload_failed"
+            item["last_error"] = str(error)[:500]
+            item["last_failed_at"] = now.replace(microsecond=0).isoformat()
+            item["retry_after"] = (now + timedelta(minutes=delay_minutes)).replace(microsecond=0).isoformat()
+            for key in ("scheduler_note", "upload_attempt_id", "upload_attempt_started_at", "upload_attempt_trigger", "upload_unknown_at"):
+                item.pop(key, None)
 
     def _scheduled_item_missed_upload_window(self, item, sched_dt, now=None) -> bool:
         """Return True when an overdue public item should wait for user action."""
@@ -6181,8 +6852,29 @@ class ApiBridge:
         privacy = str(item.get("privacy", "private") or "private").lower()
         if privacy != "public":
             return False
-        now = now or datetime.now()
+        now = _local_naive_datetime(now or datetime.now())
+        sched_dt = _local_naive_datetime(sched_dt)
         return now > sched_dt + SCHEDULER_MISSED_GRACE
+
+    def _mark_overdue_public_schedules_missed(self, now=None) -> bool:
+        """Mark overdue public local-watcher items before the scheduler tick runs."""
+        with self._get_state_lock():
+            now = _local_naive_datetime(now or datetime.now())
+            changed = False
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                if item.get("scheduler_status") in {"missed", "account_disconnected", "upload_failed", "upload_outcome_unknown"}:
+                    continue
+                try:
+                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}")
+                except (KeyError, ValueError):
+                    continue
+                if self._scheduled_item_missed_upload_window(item, sched_dt, now):
+                    item["scheduler_status"] = "missed"
+                    item["missed_at"] = now.replace(microsecond=0).isoformat()
+                    changed = True
+            return changed
 
     def _delete_uploaded_clip(self, clip_idx, video_path):
         """Delete a clip file from disk after successful upload."""
@@ -6493,19 +7185,21 @@ class ApiBridge:
 
     def _save_state(self):
         """Persist results, moments, schedule, and settings to JSON."""
-        with self._state_lock:
+        with self._get_state_lock():
             aligned_moments = []
             for i, path in enumerate(self._results):
                 moment = self._moments[i] if i < len(self._moments) else {}
                 aligned_moments.append(self._ensure_moment_identity(moment, path))
             self._moments = aligned_moments
             self._scheduled = self._normalize_scheduled_items(self._scheduled)
+            self._upload_history = self._normalize_upload_history(getattr(self, "_upload_history", []))
 
             data = {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "results": [str(p) for p in self._results],
                 "moments": self._moments,
                 "scheduled": self._scheduled,
+                "upload_history": self._upload_history,
                 "delete_after_upload": self._delete_after_upload,
                 "user_settings": self._user_settings,
             }
@@ -6513,6 +7207,26 @@ class ApiBridge:
                 self._write_state_atomic(data)
             except Exception as e:
                 print(f"[!] Failed to save state: {e}")
+
+    def _reconcile_incomplete_upload_attempts(self, now=None) -> bool:
+        """Turn stale persisted uploading markers into a user-reviewed state."""
+        with self._get_state_lock():
+            now = now or datetime.now(timezone.utc)
+            timestamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            changed = False
+            for item in self._scheduled:
+                if item.get("uploaded"):
+                    continue
+                status = str(item.get("scheduler_status") or "").lower()
+                if status != "uploading":
+                    continue
+                if not item.get("upload_attempt_id"):
+                    continue
+                item["scheduler_status"] = "upload_outcome_unknown"
+                item["scheduler_note"] = "ViriaRevive closed before confirming this upload. Check YouTube Studio before retrying."
+                item["upload_unknown_at"] = timestamp
+                changed = True
+            return changed
 
     def _load_state(self):
         """Load persisted state from previous session."""
@@ -6537,6 +7251,9 @@ class ApiBridge:
                 old_scheduled = data.get("scheduled", [])
                 if not isinstance(old_scheduled, list):
                     old_scheduled = []
+                old_upload_history = data.get("upload_history", [])
+                if not isinstance(old_upload_history, list):
+                    old_upload_history = []
 
                 self._results = []
                 self._moments = []
@@ -6558,17 +7275,25 @@ class ApiBridge:
                     for item in old_scheduled
                 )
                 self._scheduled = self._normalize_scheduled_items(old_scheduled, legacy_index_map=index_map)
+                stale_upload_attempts = self._reconcile_incomplete_upload_attempts()
+                self._upload_history = self._normalize_upload_history(old_upload_history)
                 self._delete_after_upload = bool(data.get("delete_after_upload", False))
                 self._user_settings = data.get("user_settings", {}) if isinstance(data.get("user_settings", {}), dict) else {}
 
                 removed_missing_files = len(self._results) != len(paths)
                 removed_scheduled_items = len(self._scheduled) != len(old_scheduled)
+                history_missing_schema = bool(old_upload_history) and any(
+                    isinstance(item, dict) and not item.get("schema_version")
+                    for item in old_upload_history
+                )
                 needs_rewrite = (
                     schema_version != STATE_SCHEMA_VERSION
                     or identity_missing
                     or schedule_missing_identity
                     or removed_missing_files
                     or removed_scheduled_items
+                    or stale_upload_attempts
+                    or history_missing_schema
                 )
                 if schema_version < STATE_SCHEMA_VERSION:
                     self._backup_state_file(f"pre_v{STATE_SCHEMA_VERSION}")
@@ -6734,11 +7459,13 @@ class ApiBridge:
 
     def _error(self, msg):
         self._js(f"window.onPipelineComplete(false, 0, 0, `{self._esc(msg)}`)")
-        self._processing = False
+        with self._get_state_lock():
+            self._processing = False
 
     def _cancelled(self):
         self._js("window.onPipelineCancelled()")
-        self._processing = False
+        with self._get_state_lock():
+            self._processing = False
 
     def _js(self, code):
         """Execute JS in the frontend. Queues calls if window is hidden/minimized."""

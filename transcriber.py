@@ -1,6 +1,8 @@
 from pathlib import Path
 import multiprocessing
+from multiprocessing.connection import wait
 import queue
+import time
 import wave
 
 _model_cache = {}
@@ -40,6 +42,47 @@ def transcribe_clip(
     return words
 
 
+def transcribe_clips(
+    audio_paths: list[Path], model_size: str = "base", language: str = None
+) -> list[list]:
+    """Transcribe multiple audio files with one Whisper model load.
+
+    This keeps the original process isolation/timeout behavior, but amortizes
+    the expensive model load across candidate batches.
+    """
+    paths = [Path(path) for path in audio_paths or []]
+    if not paths:
+        return []
+    timeout = _batch_transcription_timeout_seconds(paths)
+    print(f"[*] Batch transcribing {len(paths)} clips with Whisper {model_size}...")
+    payload = _run_transcription_batch_process(paths, model_size, language, timeout)
+    if payload.get("timeout"):
+        print(f"[!] Batch transcription timed out after {timeout}s")
+        return [[] for _ in paths]
+    if payload.get("cancelled"):
+        print("[!] Batch transcription cancelled")
+        return [[] for _ in paths]
+    if payload.get("error"):
+        print(f"[!] Batch transcription failed: {payload['error']}")
+        return [[] for _ in paths]
+
+    rows = payload.get("results") or []
+    output: list[list] = []
+    for idx, path in enumerate(paths):
+        row = rows[idx] if idx < len(rows) and isinstance(rows[idx], dict) else {}
+        if row.get("error"):
+            print(f"[!] Transcription failed for {path.name}: {row['error']}")
+            output.append([])
+            continue
+        words = row.get("words") or []
+        lang = row.get("language") or ""
+        print(f"[+] Transcribed {len(words)} words  (lang: {lang})")
+        output.append(words)
+    while len(output) < len(paths):
+        output.append([])
+    return output
+
+
 def _run_transcription_process(audio_path: Path, model_size: str, language: str | None, timeout: int) -> dict:
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue(maxsize=1)
@@ -68,6 +111,98 @@ def _run_transcription_process(audio_path: Path, model_size: str, language: str 
         return {"error": "worker produced no result"}
 
 
+def _run_transcription_batch_process(audio_paths: list[Path], model_size: str, language: str | None, timeout: int) -> dict:
+    ctx = multiprocessing.get_context("spawn")
+    result_parent, result_child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_transcribe_batch_process_worker,
+        args=([str(path) for path in audio_paths], model_size, language, result_child),
+        daemon=True,
+    )
+    try:
+        proc.start()
+    finally:
+        result_child.close()
+    try:
+        return _receive_transcription_result(proc, result_parent, timeout)
+    finally:
+        result_parent.close()
+
+
+def _receive_transcription_result(proc, result_conn, timeout: int) -> dict:
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_transcription_process(proc)
+            return {"timeout": True}
+
+        ready = wait([result_conn, proc.sentinel], timeout=remaining)
+        if not ready:
+            _terminate_transcription_process(proc)
+            return {"timeout": True}
+
+        if result_conn in ready:
+            try:
+                payload = result_conn.recv()
+            except EOFError:
+                return _missing_transcription_result(proc)
+            except Exception as exc:
+                _terminate_transcription_process(proc)
+                return {"error": str(exc)}
+
+            proc.join(5)
+            if proc.is_alive():
+                _terminate_transcription_process(proc)
+                return {"timeout": True}
+            if isinstance(payload, dict):
+                return payload
+            return {"error": "worker produced invalid result"}
+
+        if proc.sentinel in ready:
+            proc.join(0)
+            try:
+                if result_conn.poll():
+                    payload = result_conn.recv()
+                    if isinstance(payload, dict):
+                        return payload
+                    return {"error": "worker produced invalid result"}
+            except EOFError:
+                pass
+            except Exception as exc:
+                return {"error": str(exc)}
+            return _missing_transcription_result(proc)
+
+
+def _terminate_transcription_process(proc):
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            try:
+                proc.kill()
+            except AttributeError:
+                proc.terminate()
+            proc.join(2)
+
+
+def _missing_transcription_result(proc) -> dict:
+    proc.join(0)
+    if proc.exitcode not in (0, None):
+        return {"error": f"worker exited with code {proc.exitcode}"}
+    return {"error": "worker produced no result"}
+
+
+def _send_transcription_result(result_conn, payload: dict):
+    try:
+        sender = getattr(result_conn, "send", None)
+        if sender is None:
+            sender = result_conn.put
+        sender(payload)
+    except Exception:
+        pass
+
+
 def _transcribe_process_worker(audio_path: str, model_size: str, language: str | None, result_queue):
     try:
         from faster_whisper import WhisperModel
@@ -80,6 +215,34 @@ def _transcribe_process_worker(audio_path: str, model_size: str, language: str |
     except Exception as exc:
         try:
             result_queue.put({"error": str(exc)})
+        except Exception:
+            pass
+
+
+def _transcribe_batch_process_worker(audio_paths: list[str], model_size: str, language: str | None, result_conn):
+    try:
+        from faster_whisper import WhisperModel
+        from subprocess_utils import CancelledError
+
+        device, compute = _get_device()
+        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
+        model = WhisperModel(model_size, device=device, compute_type=compute)
+        results = []
+        for audio_path in audio_paths:
+            try:
+                words, detected_language = _transcribe_words(model, Path(audio_path), language)
+                results.append({"words": words, "language": detected_language})
+            except CancelledError as exc:
+                _send_transcription_result(result_conn, {"cancelled": True, "error": str(exc), "results": results})
+                return
+            except Exception as exc:
+                results.append({"error": str(exc)})
+        _send_transcription_result(result_conn, {"results": results})
+    except Exception as exc:
+        _send_transcription_result(result_conn, {"error": str(exc)})
+    finally:
+        try:
+            result_conn.close()
         except Exception:
             pass
 
@@ -119,6 +282,14 @@ def _audio_duration_seconds(audio_path: Path) -> float:
 def _transcription_timeout_seconds(audio_path: Path) -> int:
     duration = _audio_duration_seconds(audio_path)
     return int(min(900, max(90, duration * 8.0)))
+
+
+def _batch_transcription_timeout_seconds(audio_paths: list[Path]) -> int:
+    durations = [_audio_duration_seconds(path) for path in audio_paths]
+    total_duration = sum(durations)
+    # One model load plus per-file decode. Cap high enough for long batches but
+    # still bounded so the app can recover from a stuck worker.
+    return int(min(1800, max(120, 60 + total_duration * 7.0 + len(audio_paths) * 4.0)))
 
 
 # ── Sentence-boundary detection ───────────────────────────────────────────────

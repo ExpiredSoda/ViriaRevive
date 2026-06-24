@@ -58,13 +58,6 @@ GUI_DIR = ROOT / "gui"
 for name in ("index.html", "app.js", "style.css"):
     DATA_FILES.append((str(GUI_DIR / name), "gui"))
 
-BIN_DIR = ROOT / "bin"
-if BIN_DIR.exists():
-    for name in ("README.md", "ffmpeg.exe", "ffprobe.exe"):
-        path = BIN_DIR / name
-        if path.exists():
-            DATA_FILES.append((str(path), "bin"))
-
 HIDDEN_IMPORTS = [
     "version",
     "audio_streams",

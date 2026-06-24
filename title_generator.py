@@ -38,6 +38,7 @@ AI_FINE_LABELS = (
     "combat_action",
     "funny_failure",
     "death_scene",
+    "possible_failure",
     "tutorial_tip",
     "lore_story",
     "scenic_atmosphere",
@@ -347,6 +348,12 @@ def _clean_base_title(title: str) -> str:
     return title or "Gaming Moment"
 
 
+def sanitize_creator_title_context(text: str | None, *, limit: int = 420) -> str:
+    """Normalize short creator-provided title guidance without storing secrets."""
+    value = _prompt_safe_text(text or "", limit=limit)
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def summarize_clip_context(
     transcript: str | None = None,
     game_title: str | None = None,
@@ -381,9 +388,11 @@ def summarize_clip_context(
     moment_type = _infer_moment_type(normal, ranker, matched, clip_context)
 
     resolved_game = (game_title or clip_context.get("game_title") or "").strip()
+    creator_context = sanitize_creator_title_context(clip_context.get("creator_title_context"))
     summary = {
         "schema_version": TITLE_CONTEXT_SCHEMA_VERSION,
         "game_title": resolved_game,
+        "creator_title_context": creator_context,
         "moment_type": moment_type,
         "primary_category": clip_context.get("primary_category") or moment_categories.get("primary"),
         "ai_primary_category": ai_classification.get("primary_category"),
@@ -456,6 +465,7 @@ def _build_ollama_prompt(
         "create ONE title that makes people want to watch.\n"
         f"{game_line}\n"
         "Use the analysis as grounding, but do not expose scores in the title.\n"
+        "Use creator-provided context only as guidance; do not quote it verbatim.\n"
         "Prefer the strongest spoken hook/payoff over generic clipbait.\n\n"
         "RULES:\n"
         "- Max 70 characters before hashtags\n"
@@ -798,10 +808,21 @@ def _heuristic_moment_classification(
     confidence = _round_or_none(categories.get("confidence"))
     moment_type = context.get("moment_type") or "general gameplay"
     fine_labels = []
-    if visual.get("possible_failure_score", 0) and _float_or_zero(visual.get("possible_failure_score")) >= 0.45:
+    ranker = clip_context.get("ranker") if isinstance(clip_context.get("ranker"), dict) else {}
+    category_scores = categories.get("scores") if isinstance(categories.get("scores"), dict) else {}
+    normal = _normal_text(transcript or clip_context.get("transcript") or "")
+    visual_failure = _float_or_zero(visual.get("possible_failure_score"))
+    confirmed_failure = (
+        primary == "death_or_failure"
+        or moment_type in {"death/failure", "funny failure"}
+        or _float_or_zero(category_scores.get("death_or_failure")) >= 0.50
+        or _float_or_zero(ranker.get("aftermath_points")) >= 2.0
+        or bool(re.search(r"\b(died|dead|death|killed|game over|failed|failure|we died|i died)\b", normal))
+    )
+    if visual_failure >= 0.45:
         primary = "death_or_failure"
-        fine_labels.append("death_scene")
-        confidence = max(confidence or 0.0, 0.62)
+        fine_labels.append("death_scene" if confirmed_failure else "possible_failure")
+        confidence = max(confidence or 0.0, 0.62 if confirmed_failure else 0.52)
     if visual.get("scenic_score", 0) and _float_or_zero(visual.get("scenic_score")) >= 0.55 and primary not in {"death_or_failure", "high_energy"}:
         primary = "atmosphere_or_visual"
         fine_labels.append("scenic_atmosphere")
@@ -1195,6 +1216,8 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         lines.append(f"- Detector candidate: {', '.join(candidate_parts)}")
     if context.get("scene_detection_status"):
         lines.append(f"- Scene detection status: {context['scene_detection_status']}")
+    if context.get("creator_title_context"):
+        lines.append(f"- Creator-provided context: {context['creator_title_context']}")
     ranker_parts = []
     for key in ("hook_points", "weak_points", "aftermath_points", "first_word_start"):
         if ranker.get(key) is not None:

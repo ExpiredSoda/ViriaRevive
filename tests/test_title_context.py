@@ -69,6 +69,32 @@ class TitleContextTests(unittest.TestCase):
         self.assertIn("Scene detection status: ok", prompt)
         self.assertIn('Transcript: "Oh my god', prompt)
 
+    def test_prompt_uses_sanitized_creator_title_context(self):
+        context = {
+            **_clip_context(),
+            "creator_title_context": r"Blind Alan Wake nursing home run C:\Users\ExpiredSoda\client_secrets.json api_key=secret123 " + "extra " * 120,
+        }
+
+        prompt = _build_ollama_prompt(
+            context["transcript"],
+            game_title="Alan Wake",
+            clip_context=context,
+        )
+        summary = summarize_clip_context(context["transcript"], "Alan Wake", context)
+        description = generate_description(
+            "He Was Right Behind Me In Alan Wake #shorts #AlanWake",
+            "Alan Wake",
+            clip_context=context,
+        )
+
+        self.assertIn("Creator-provided context:", prompt)
+        self.assertIn("Blind Alan Wake nursing home run", prompt)
+        self.assertIn("[local-path]", prompt)
+        self.assertIn("api_key=[redacted]", prompt)
+        self.assertNotIn("client_secrets.json", prompt)
+        self.assertLessEqual(len(summary["creator_title_context"]), 420)
+        self.assertNotIn("Blind Alan Wake nursing home run", description)
+
     def test_description_and_tags_use_analysis_context(self):
         context = _clip_context()
 
@@ -148,6 +174,50 @@ class TitleContextTests(unittest.TestCase):
             "atmosphere_or_visual",
             "low_value",
         })
+
+    def test_ai_moment_visual_only_failure_uses_possible_failure_label(self):
+        context = {
+            **_clip_context(),
+            "transcript": "Look at this hallway and keep moving forward.",
+            "ranker": {"hook_points": 0.0, "weak_points": 0.0, "aftermath_points": 0.0},
+            "moment_categories": {"primary": "commentary_or_review", "confidence": 0.42, "scores": {}},
+            "primary_category": "commentary_or_review",
+            "visual_diagnostics": {"possible_failure_score": 0.56},
+        }
+
+        result = classify_moment_ai(
+            context["transcript"],
+            "Alan Wake",
+            context,
+            enabled=True,
+            ollama_ready=False,
+        )
+
+        self.assertEqual(result["primary_category"], "death_or_failure")
+        self.assertIn("possible_failure", result["fine_labels"])
+        self.assertNotIn("death_scene", result["fine_labels"])
+
+    def test_ai_moment_confirmed_failure_can_use_death_scene_label(self):
+        context = {
+            **_clip_context(),
+            "transcript": "I died right there and got sent all the way back.",
+            "ranker": {"hook_points": 0.0, "weak_points": 0.0, "aftermath_points": 3.0},
+            "moment_categories": {"primary": "death_or_failure", "confidence": 0.72},
+            "primary_category": "death_or_failure",
+            "visual_diagnostics": {"possible_failure_score": 0.56},
+        }
+
+        result = classify_moment_ai(
+            context["transcript"],
+            "Alan Wake",
+            context,
+            enabled=True,
+            ollama_ready=False,
+        )
+
+        self.assertEqual(result["primary_category"], "death_or_failure")
+        self.assertIn("death_scene", result["fine_labels"])
+        self.assertNotIn("possible_failure", result["fine_labels"])
 
     def test_ai_moment_classification_sanitizes_valid_ollama_json(self):
         with patch("title_generator.ask_ollama_json", return_value={

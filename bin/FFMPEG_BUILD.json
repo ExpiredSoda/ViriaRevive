@@ -1,0 +1,16 @@
+{
+  "provider": "BtbN FFmpeg Builds",
+  "variant": "ffmpeg-master-latest-win64-gpl.zip",
+  "license": "GPL FFmpeg build; forbidden commercial-only build option absent in verified build configuration",
+  "version": "ffmpeg version N-125185-g30155f9c3a-20260623",
+  "download_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+  "checksums_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256",
+  "archive_sha256": "0ed615c7340aa693bdecc6f6a94472eeabbf0038ca2d864928dcbd89ce538fba",
+  "source_url": "https://github.com/BtbN/FFmpeg-Builds",
+  "ffmpeg_source_url": "https://ffmpeg.org/download.html",
+  "ffmpeg_commit": "30155f9c3a",
+  "ffmpeg_commit_url": "https://github.com/FFmpeg/FFmpeg/commit/30155f9c3a",
+  "retrieved_at_utc": "2026-06-23T23:55:00Z",
+  "sha256_ffmpeg": "331638f652c2c1b5984a25505ad53a6374d1051b4235f64fd233a9bcb3174290",
+  "sha256_ffprobe": "9cf6b30c1c98152da04e185673b675fc2b5050a518fccd152c502b7b612c861e"
+}

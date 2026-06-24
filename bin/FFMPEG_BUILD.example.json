@@ -1,0 +1,14 @@
+{
+  "provider": "BtbN FFmpeg Builds",
+  "variant": "win64-gpl",
+  "license": "GPL-licensed FFmpeg build; do not use nonfree",
+  "version": "replace with ffmpeg -version first line",
+  "download_url": "https://github.com/BtbN/FFmpeg-Builds/releases/...",
+  "source_url": "https://github.com/BtbN/FFmpeg-Builds",
+  "ffmpeg_source_url": "https://ffmpeg.org/download.html",
+  "license_terms": "Include the applicable GPL/LGPL license text in the release notices",
+  "corresponding_source": "Publish or link to complete corresponding source for the exact FFmpeg build",
+  "retrieved_at_utc": "YYYY-MM-DDTHH:MM:SSZ",
+  "sha256_ffmpeg": "replace-with-lowercase-sha256-of-bin-ffmpeg.exe",
+  "sha256_ffprobe": "replace-with-lowercase-sha256-of-bin-ffprobe.exe"
+}

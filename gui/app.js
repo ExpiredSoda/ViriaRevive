@@ -18,6 +18,7 @@ const state = {
     calYear: new Date().getFullYear(),
     calMonth: new Date().getMonth(),
     scheduled: [],          // [{clipIdx, clip_id, source_id, date, time, title, description, tags, category_id, privacy, uploaded}]
+    uploadHistory: [],
     editingScheduleIdx: -1,
     pickerDate: null,
     _schedPreset: 'allpeaks',
@@ -26,15 +27,24 @@ const state = {
     libraryClips: [],
     libraryView: 'grid',
     resultsMomentFilter: 'all',
+    resultsOpenFolders: {},
+    resultsSelectedFilenames: new Set(),
+    resultsVisibleFilenames: [],
+    clipTraySearch: '',
     libraryMomentFilter: 'all',
+    libraryOpenFolders: {},
+    librarySelectedFilenames: new Set(),
+    libraryVisibleFilenames: [],
     // Preview
     previewClipIdx: -1,
     previewLibraryClip: null,
     // Delete
     pendingDeleteIdx: -1,
     pendingDeleteFilename: null,
-    pendingDeleteSource: null, // 'results' | 'library' | 'preview'
+    pendingDeleteFilenames: [],
+    pendingDeleteSource: null, // 'results' | 'results-bulk' | 'library' | 'library-bulk' | 'preview'
     pendingFeedback: null,
+    sourceContextEditing: null,
     // Batch queue
     batchQueue: [],       // [{url, status: 'pending'|'active'|'done'|'error', label, audioSource, subtitleStyle}]
     batchIndex: -1,       // current index being processed (-1 = not running)
@@ -44,6 +54,7 @@ const state = {
     wizardSavedAudioSource: null,
     wizardProcessingDepth: 'balanced',
     progressStartedAt: 0,
+    dependencies: { ffmpeg: null, ffprobe: null, checked: false, error: '' },
 };
 
 const DEFAULT_CATEGORY_ID = '20'; // Gaming
@@ -57,6 +68,7 @@ const FEEDBACK_REASON_PRESETS = {
     favorite: ['Post this', 'Best moment', 'Creator voice', 'Strong payoff', 'Replayable'],
 };
 let _lastOllamaStatus = null;
+let _ollamaModelDownloadActive = false;
 let _subtitlePreviewUrl = '';
 let _settingsPersistTimer = null;
 
@@ -138,8 +150,93 @@ function scheduledPublishFields(item) {
 
 function isScheduleMissed(item, now = new Date()) {
     if (!item || item.uploaded) return false;
+    if (String(item.privacy || 'private').toLowerCase() !== 'public') return false;
     const d = scheduledLocalDate(item);
-    return !!d && d.getTime() < now.getTime();
+    return !!d && now.getTime() > d.getTime() + SCHEDULE_BUFFER_MINUTES * 60 * 1000;
+}
+
+function missingFfmpegParts(deps = state.dependencies) {
+    const missing = [];
+    if (!deps || deps.ffmpeg !== true) missing.push('ffmpeg');
+    if (!deps || deps.ffprobe !== true) missing.push('ffprobe');
+    return missing;
+}
+
+function renderFfmpegStatus() {
+    const deps = state.dependencies || {};
+    const card = document.getElementById('ffmpeg-status-card');
+    const stateEl = document.getElementById('ffmpeg-status-state');
+    const detailEl = document.getElementById('ffmpeg-status-detail');
+    const modalStatus = document.getElementById('ffmpeg-modal-status');
+    const missing = missingFfmpegParts(deps);
+    const ready = deps.checked && missing.length === 0;
+
+    if (card) {
+        card.classList.toggle('hidden', ready);
+        card.classList.toggle('ready', ready);
+        card.classList.toggle('missing', !ready);
+    }
+    if (stateEl) stateEl.textContent = ready ? 'FFmpeg ready' : 'FFmpeg setup needed';
+    if (detailEl) {
+        detailEl.textContent = ready
+            ? 'ffmpeg and ffprobe were found.'
+            : deps.error
+                ? 'Could not check FFmpeg. Recheck after installing both ffmpeg.exe and ffprobe.exe.'
+                : `Missing ${missing.join(' and ')}. Install FFmpeg or place both executables in the app bin folder.`;
+    }
+    if (modalStatus) {
+        modalStatus.textContent = ready
+            ? 'Recheck passed. You can close this dialog.'
+            : `Still missing ${missing.join(' and ')}.`;
+    }
+}
+
+async function refreshFfmpegDependencies({ quiet = false, showModalOnMissing = false } = {}) {
+    const recheckBtns = document.querySelectorAll('[data-ffmpeg-recheck]');
+    recheckBtns.forEach(btn => { btn.disabled = true; btn.dataset.previousText = btn.textContent; btn.textContent = 'Checking...'; });
+    try {
+        const deps = await pywebview.api.check_dependencies();
+        state.dependencies = {
+            ffmpeg: deps.ffmpeg === true,
+            ffprobe: deps.ffprobe === true,
+            checked: true,
+            error: '',
+        };
+    } catch (e) {
+        state.dependencies = { ffmpeg: false, ffprobe: false, checked: true, error: String(e || 'check failed') };
+    } finally {
+        recheckBtns.forEach(btn => { btn.disabled = false; btn.textContent = btn.dataset.previousText || 'Recheck'; delete btn.dataset.previousText; });
+    }
+
+    renderFfmpegStatus();
+    const missing = missingFfmpegParts();
+    if (missing.length) {
+        if (!quiet) toast(`FFmpeg setup incomplete: missing ${missing.join(' and ')}`, 'warning');
+        if (showModalOnMissing) showModal('ffmpeg-modal');
+        return false;
+    }
+    if (!quiet) toast('FFmpeg setup looks good', 'success');
+    return true;
+}
+
+async function ensureFfmpegReady(action = 'continue') {
+    if (!state.dependencies.checked) {
+        await refreshFfmpegDependencies({ quiet: true, showModalOnMissing: false });
+    }
+    const missing = missingFfmpegParts();
+    if (!missing.length) return true;
+    renderFfmpegStatus();
+    showModal('ffmpeg-modal');
+    const card = document.getElementById('ffmpeg-status-card');
+    if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.classList.remove('upload-focus-pulse');
+        void card.offsetWidth;
+        card.classList.add('upload-focus-pulse');
+        window.setTimeout(() => card.classList.remove('upload-focus-pulse'), 1200);
+    }
+    toast(`Install FFmpeg before you ${action}`, 'error');
+    return false;
 }
 
 function _isTodayDateStr(dateStr, now = new Date()) {
@@ -160,6 +257,233 @@ function hasPendingSchedule() {
 function ensureSchedulerForPending() {
     if (!state.ytConnected || !hasPendingSchedule()) return;
     try { pywebview.api.start_scheduler(); } catch (_) {}
+}
+
+function scheduleItemStatus(item, now = new Date()) {
+    if (!item) return { key: 'invalid', className: 'invalid', label: 'Invalid' };
+    const schedulerStatus = String(item.scheduler_status || '').toLowerCase();
+    const uploadState = String(item.upload_state || item.send_status || '').toLowerCase();
+    const privacy = String(item.privacy || 'private').toLowerCase();
+    if (schedulerStatus === 'upload_failed') return { key: 'failed', className: 'failed', label: 'Upload failed' };
+    if (schedulerStatus === 'upload_outcome_unknown') return { key: 'unknown', className: 'failed', label: 'Check YouTube' };
+    if (schedulerStatus === 'account_disconnected') return { key: 'disconnected', className: 'disconnected', label: 'Needs account' };
+    if ((schedulerStatus === 'missed' && privacy === 'public') || isScheduleMissed(item, now)) return { key: 'missed', className: 'missed', label: 'Missed time' };
+    if (schedulerStatus === 'uploading' || uploadState === 'sending') return { key: 'sending', className: 'sending', label: 'Sending' };
+    if (item.uploaded || uploadState === 'sent_to_youtube' || uploadState === 'youtube_scheduled') {
+        if (uploadState === 'youtube_scheduled' || (String(item.privacy || '').toLowerCase() === 'public' && item.publish_at_utc)) {
+            return { key: 'youtube_scheduled', className: 'youtube-scheduled', label: 'YouTube scheduled' };
+        }
+        return { key: 'sent', className: 'sent', label: 'Sent' };
+    }
+    if (!scheduledLocalDate(item)) return { key: 'invalid', className: 'invalid', label: 'Needs time' };
+    return { key: 'pending', className: 'pending', label: 'Pending locally' };
+}
+
+function uploadReadinessState() {
+    const now = new Date();
+    const pendingItems = state.scheduled.filter(s => !s.uploaded);
+    const allStatuses = state.scheduled.map(s => scheduleItemStatus(s, now));
+    const activeStatuses = pendingItems.map(s => scheduleItemStatus(s, now));
+    const hasAttention = activeStatuses.some(s => ['missed', 'failed', 'unknown', 'disconnected', 'invalid'].includes(s.key));
+    const missingAccount = pendingItems.some(s => !s.account_id || !s.channel_id) || !state.ytConnected;
+    const missingTitle = pendingItems.some(s => !String(s.title || '').trim());
+    const sentCount = allStatuses.filter(s => ['sent', 'youtube_scheduled'].includes(s.key)).length;
+
+    const account = state.ytConnected
+        ? { label: 'Accounts', value: 'Connected', state: 'ready', icon: '1', focus: 'accounts' }
+        : { label: 'Accounts', value: 'Needs account', state: 'blocked', icon: '1', focus: 'accounts' };
+
+    let clips;
+    if (!state.results.length) clips = { label: 'Videos', value: 'No clips', state: 'neutral', icon: '2', focus: 'clips' };
+    else if (missingTitle) clips = { label: 'Videos', value: 'Needs titles', state: 'warning', icon: '2', focus: 'clips' };
+    else clips = { label: 'Videos', value: 'Ready', state: 'ready', icon: '2', focus: 'clips' };
+
+    let schedule;
+    if (!pendingItems.length) {
+        schedule = { label: 'Calendar', value: sentCount ? `${sentCount} sent` : 'Nothing scheduled', state: sentCount ? 'ready' : 'neutral', icon: '3', focus: 'schedule' };
+    } else if (hasAttention) {
+        schedule = { label: 'Calendar', value: 'Needs attention', state: 'warning', icon: '3', focus: 'schedule' };
+    } else {
+        schedule = { label: 'Calendar', value: `${pendingItems.length} scheduled`, state: 'ready', icon: '3', focus: 'schedule' };
+    }
+
+    let review;
+    if (!pendingItems.length) review = { label: 'Send', value: sentCount ? 'Sent to YouTube' : 'Nothing to send', state: sentCount ? 'ready' : 'neutral', icon: '4', focus: 'review' };
+    else if (missingAccount) review = { label: 'Send', value: 'Needs YouTube channel', state: 'blocked', icon: '4', focus: 'review' };
+    else if (hasAttention) review = { label: 'Send', value: 'Review calendar', state: 'warning', icon: '4', focus: 'review' };
+    else review = { label: 'Send', value: 'Ready to send', state: 'ready', icon: '4', focus: 'review' };
+
+    return [account, clips, schedule, review];
+}
+
+function renderUploadReadinessStrip() {
+    const strip = document.getElementById('upload-readiness-strip');
+    if (!strip) return;
+    strip.innerHTML = uploadReadinessState().map(item => `
+        <button type="button" class="upload-readiness-step is-${item.state}" onclick="focusUploadReadiness('${escHtml(item.focus || '')}')">
+            <span class="upload-readiness-icon">${escHtml(item.icon)}</span>
+            <span class="upload-readiness-text">
+                <span class="upload-readiness-label">${escHtml(item.label)}</span>
+                <span class="upload-readiness-value">${escHtml(item.value)}</span>
+            </span>
+        </button>
+    `).join('');
+}
+
+function focusUploadReadiness(target) {
+    const ids = {
+        accounts: 'yt-connect-card',
+        clips: 'clip-tray-card',
+        schedule: 'calendar-area-card',
+        review: 'upload-review-panel',
+    };
+    const el = document.getElementById(ids[target] || target);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('upload-focus-pulse');
+    void el.offsetWidth;
+    el.classList.add('upload-focus-pulse');
+    window.setTimeout(() => el.classList.remove('upload-focus-pulse'), 1200);
+}
+
+function uploadHistoryDateKey(row) {
+    const direct = String(row?.date || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
+    const raw = row?.publish_at_utc || row?.finished_at_utc || row?.uploaded_at || row?.sent_at || '';
+    if (!raw) return '';
+    const d = new Date(raw);
+    return Number.isNaN(d.getTime()) ? '' : _toDateStr(d);
+}
+
+function uploadHistoryByDate(channelFilter = 'all') {
+    const grouped = {};
+    (state.uploadHistory || []).forEach(row => {
+        if (!row || typeof row !== 'object') return;
+        if (channelFilter !== 'all' && row.channel_id && row.channel_id !== channelFilter) return;
+        const dateKey = uploadHistoryDateKey(row);
+        if (!dateKey) return;
+        if (!grouped[dateKey]) grouped[dateKey] = [];
+        grouped[dateKey].push(row);
+    });
+    return grouped;
+}
+
+function _formatScheduleDateLabel(dateStr, timeStr = '') {
+    const d = new Date(`${dateStr}T${timeStr || '12:00'}:00`);
+    if (Number.isNaN(d.getTime())) return 'Not scheduled';
+    const base = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return timeStr ? `${base}, ${timeStr}` : base;
+}
+
+function uploadSummaryState() {
+    const now = new Date();
+    const rows = (state.scheduled || []).map((s, idx) => ({
+        ...s,
+        _idx: idx,
+        _date: scheduledLocalDate(s),
+        _status: scheduleItemStatus(s, now),
+    }));
+    const queued = rows.filter(s => !s.uploaded);
+    const sent = rows.filter(s => ['sent', 'youtube_scheduled'].includes(s._status.key));
+    const attention = queued.filter(s => ['missed', 'failed', 'unknown', 'disconnected', 'invalid'].includes(s._status.key));
+    const sortedQueued = [...queued].sort((a, b) => {
+        const at = a._date ? a._date.getTime() : Number.MAX_SAFE_INTEGER;
+        const bt = b._date ? b._date.getTime() : Number.MAX_SAFE_INTEGER;
+        return at - bt;
+    });
+    const first = sortedQueued[0] || null;
+    const last = sortedQueued[sortedQueued.length - 1] || null;
+    const selectedChannelId = first ? (first.channel_id || '') : (document.getElementById('smart-sched-channel')?.value || state.selectedChannel || '');
+    const channel = selectedChannelId ? channelById(selectedChannelId) : null;
+    const privacy = String(first?.privacy || document.getElementById('smart-sched-privacy')?.value || 'public').toLowerCase();
+    const missingAccount = queued.some(s => !s.account_id || !s.channel_id) || (!!queued.length && !state.ytConnected);
+
+    const historyCount = (state.uploadHistory || []).length;
+    const startLabel = first ? _formatScheduleDateLabel(first.date, first.time) : 'Not scheduled';
+    let spanLabel = 'No queued clips';
+    if (first && last) {
+        spanLabel = first.date === last.date
+            ? _formatScheduleDateLabel(first.date)
+            : `${_formatScheduleDateLabel(first.date)} - ${_formatScheduleDateLabel(last.date)}`;
+    } else if (historyCount) {
+        spanLabel = `${historyCount} sent in history`;
+    }
+
+    let reviewClass = 'neutral';
+    let reviewLabel = 'Not ready';
+    if (!queued.length && sent.length) {
+        reviewClass = 'ready';
+        reviewLabel = 'Sent';
+    } else if (!queued.length) {
+        reviewLabel = 'No queue';
+    } else if (missingAccount) {
+        reviewClass = 'blocked';
+        reviewLabel = 'Needs account';
+    } else if (attention.length) {
+        reviewClass = 'warning';
+        reviewLabel = 'Needs review';
+    } else {
+        reviewClass = 'ready';
+        reviewLabel = 'Ready';
+    }
+
+    const publicQueued = queued.some(s => String(s.privacy || privacy).toLowerCase() === 'public');
+    const modeNote = !queued.length
+        ? 'Schedule clips on the calendar before sending them to YouTube.'
+        : publicQueued
+            ? 'Send now to YouTube; public clips publish at their calendar time.'
+            : 'Send now to YouTube with the selected private or unlisted visibility.';
+    const actionTitle = queued.length
+        ? `${queued.length} clip${queued.length !== 1 ? 's' : ''} queued`
+        : sent.length
+            ? `${sent.length} sent to YouTube`
+            : 'No clips queued';
+    const actionDetail = queued.length
+        ? `${channel?.title || 'No channel selected'} · ${privacy} · ${startLabel}`
+        : historyCount
+            ? `${historyCount} previous upload${historyCount !== 1 ? 's' : ''} stored locally`
+            : 'Schedule clips before sending them to YouTube.';
+
+    return {
+        queuedCount: queued.length,
+        sentCount: sent.length,
+        attentionCount: attention.length,
+        clipsLabel: queued.length
+            ? `${queued.length} queued`
+            : sent.length
+                ? `${sent.length} sent`
+                : `${state.results.length} available`,
+        channelLabel: channel?.title || (selectedChannelId ? selectedChannelId : 'None selected'),
+        visibilityLabel: privacy.charAt(0).toUpperCase() + privacy.slice(1),
+        startLabel,
+        spanLabel,
+        reviewClass,
+        reviewLabel,
+        modeNote,
+        actionTitle,
+        actionDetail,
+    };
+}
+
+function renderUploadSummary() {
+    const summary = uploadSummaryState();
+    const setText = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    };
+    setText('upload-summary-clips', summary.clipsLabel);
+    setText('upload-summary-channel', summary.channelLabel);
+    setText('upload-summary-visibility', summary.visibilityLabel);
+    setText('upload-summary-start', summary.startLabel);
+    setText('upload-summary-span', summary.spanLabel);
+    setText('upload-mode-note', summary.modeNote);
+    setText('upload-action-title', summary.actionTitle);
+    setText('upload-action-detail', summary.actionDetail);
+    const status = document.getElementById('upload-review-status');
+    if (status) {
+        status.textContent = summary.reviewLabel;
+        status.className = `upload-review-status ${summary.reviewClass}`;
+    }
 }
 
 function descriptionProfile() {
@@ -212,6 +536,13 @@ function gameTitleForClip(idx) {
     return meta.game_title || moment.game_title || '';
 }
 
+function creatorTitleContextForClip(idx) {
+    const clip = state.results[idx] || {};
+    const moment = state.moments[idx] || {};
+    const meta = moment.generated_metadata || {};
+    return String(clip.creator_title_context || moment.creator_title_context || meta.creator_title_context || '').trim();
+}
+
 function composeDescriptionPreview({ generated = '', custom = '', autoHashtags = true, gameTitle = '' } = {}) {
     const parts = [];
     if (String(generated || '').trim()) parts.push(String(generated).trim());
@@ -245,6 +576,7 @@ function applyGeneratedMetadataToSchedule(item, meta) {
         item.generated_description = generated;
     }
     if (meta.game_title) item.game_title = meta.game_title;
+    if (meta.creator_title_context !== undefined) item.creator_title_context = String(meta.creator_title_context || '').trim();
     if (meta.tags) item.tags = meta.tags;
     if (item.description_custom_text === undefined) item.description_custom_text = descriptionProfile().custom_text;
     if (item.description_auto_hashtags === undefined) item.description_auto_hashtags = descriptionProfile().auto_hashtags;
@@ -264,6 +596,7 @@ function descriptionFieldsForClip(clip, idx, title = '') {
     });
     return {
         game_title: gameTitle,
+        creator_title_context: creatorTitleContextForClip(idx),
         description_generated: generated,
         generated_description: generated,
         description_custom_text: profile.custom_text,
@@ -347,13 +680,16 @@ function normalizeScheduledMetadata(items) {
             normalized.push(item);
             return;
         }
-        if (!item.description_generated && !item.generated_description) {
+        const hasGeneratedDescription = Object.prototype.hasOwnProperty.call(item, 'description_generated')
+            || Object.prototype.hasOwnProperty.call(item, 'generated_description');
+        if (!hasGeneratedDescription) {
             item.description_generated = generatedDescriptionForClip(state.results[clipIdx], clipIdx, item.title);
             item.generated_description = item.description_generated;
         }
         if (item.description_custom_text === undefined) item.description_custom_text = '';
         if (item.description_auto_hashtags === undefined) item.description_auto_hashtags = descriptionProfile().auto_hashtags;
         if (!item.game_title) item.game_title = gameTitleForClip(clipIdx);
+        if (item.creator_title_context === undefined) item.creator_title_context = creatorTitleContextForClip(clipIdx);
         if (item.channel_id && !item.account_id) Object.assign(item, channelIdentityFields(item.channel_id));
         updateScheduledDescriptionPreview(item);
         normalized.push(item);
@@ -445,6 +781,7 @@ function prettyMomentLabel(value) {
         combat_action: 'Combat',
         funny_failure: 'Funny fail',
         death_scene: 'Death scene',
+        possible_failure: 'Possible failure',
         tutorial_tip: 'Tutorial tip',
         lore_story: 'Lore',
         scenic_atmosphere: 'Scenic',
@@ -460,31 +797,55 @@ function prettyMomentLabel(value) {
 function aiMomentForClip(clip = {}, moment = {}) {
     const categories = clip.moment_categories || moment.moment_categories || {};
     const ai = clip.ai_moment_classification || moment.ai_moment_classification || categories.ai || {};
-    const primary = ai.primary_category || clip.primary_category || moment.primary_category || categories.primary || '';
-    if (!primary) return null;
+    const detectedPrimary = clip.primary_category || moment.primary_category || categories.primary || '';
+    const aiPrimary = ai.primary_category || '';
+    const hasAiLabel = Boolean(ai.status && aiPrimary);
+    const primary = hasAiLabel ? aiPrimary : detectedPrimary;
+    const disagrees = Boolean(detectedPrimary && aiPrimary && detectedPrimary !== aiPrimary);
+    if (!primary && !detectedPrimary) return null;
     const fineLabels = Array.isArray(ai.fine_labels) ? ai.fine_labels.filter(Boolean).slice(0, 2) : [];
     const isOllama = ai.status === 'ok' && ai.provider === 'ollama';
-    const isCategory = !ai.status;
-    const source = isCategory ? 'Category' : (isOllama ? 'AI' : 'Local');
-    const sourceType = isCategory ? 'category' : (isOllama ? 'ai' : 'local');
+    const source = isOllama ? 'Ollama' : 'Fallback';
+    const sourceType = isOllama ? 'ai' : 'local';
+    const detectedChip = detectedPrimary ? {
+        source: 'Detected',
+        primary: detectedPrimary,
+        primaryLabel: prettyMomentLabel(detectedPrimary),
+        sourceType: 'category',
+    } : null;
+    const aiChip = hasAiLabel ? {
+        source,
+        primary: aiPrimary,
+        primaryLabel: prettyMomentLabel(aiPrimary),
+        sourceType,
+    } : null;
+    const chips = [];
+    if (detectedChip && (!aiChip || disagrees)) chips.push(detectedChip);
+    if (aiChip) chips.push(aiChip);
+    if (!chips.length && detectedChip) chips.push(detectedChip);
+    const primaryChip = chips[0];
     const confidence = Number(ai.confidence);
     const confidenceText = Number.isFinite(confidence) ? ` (${Math.round(confidence * 100)}%)` : '';
     const status = ai.status || 'deterministic';
+    const chipSummary = chips
+        .map(chip => `${chip.source}: ${chip.primaryLabel}`)
+        .join(' | ');
     const titleParts = [
-        `${source} moment label: ${prettyMomentLabel(primary)}${confidenceText}`,
+        `Moment label: ${chipSummary}${confidenceText}`,
         status ? `status: ${status}` : '',
         ai.provider ? `provider: ${ai.provider}` : '',
         ai.fallback_used ? 'using local fallback' : '',
         ai.reason || '',
     ].filter(Boolean);
     return {
-        source,
-        primary,
-        primaryLabel: prettyMomentLabel(primary),
+        source: primaryChip.source,
+        primary: primaryChip.primary,
+        primaryLabel: primaryChip.primaryLabel,
         fineLabels: fineLabels.map(prettyMomentLabel).filter(Boolean),
-        isOllama,
-        isCategory,
-        sourceType,
+        chips,
+        isOllama: primaryChip.sourceType === 'ai',
+        isCategory: primaryChip.sourceType === 'category',
+        sourceType: primaryChip.sourceType,
         status,
         title: titleParts.join(' - '),
     };
@@ -564,9 +925,9 @@ function renderMomentFilterBar(containerId, clips, momentForClip, activeFilter, 
         })),
     ];
     const sourceParts = [];
-    if (aiCount) sourceParts.push(`${aiCount} AI`);
-    if (localCount) sourceParts.push(`${localCount} local`);
-    if (categoryCount) sourceParts.push(`${categoryCount} category`);
+    if (aiCount) sourceParts.push(`${aiCount} Ollama`);
+    if (localCount) sourceParts.push(`${localCount} fallback`);
+    if (categoryCount) sourceParts.push(`${categoryCount} detected`);
     el.classList.remove('hidden');
     el.innerHTML = `
         <div class="moment-filter-buttons">
@@ -587,13 +948,19 @@ function renderMomentFilterBar(containerId, clips, momentForClip, activeFilter, 
 function momentLabelMarkup(clip = {}, moment = {}) {
     const info = aiMomentForClip(clip, moment);
     if (!info) return '';
-    const sourceClass = info.sourceType === 'ai' ? 'is-ai' : (info.sourceType === 'category' ? 'is-category' : 'is-local');
+    const chips = Array.isArray(info.chips) && info.chips.length
+        ? info.chips
+        : [{ source: info.source, primaryLabel: info.primaryLabel, sourceType: info.sourceType }];
+    const sourceChips = chips.map(chip => {
+        const sourceClass = chip.sourceType === 'ai' ? 'is-ai' : (chip.sourceType === 'category' ? 'is-category' : 'is-local');
+        return `<span class="moment-chip ${sourceClass}">${escHtml(chip.source)}: ${escHtml(chip.primaryLabel)}</span>`;
+    }).join('');
     const fine = info.fineLabels.length
         ? `<span class="moment-chip is-fine">${escHtml(info.fineLabels[0])}</span>`
         : '';
     return `
         <div class="moment-label-row" title="${escHtml(info.title)}">
-            <span class="moment-chip ${sourceClass}">${escHtml(info.source)}: ${escHtml(info.primaryLabel)}</span>
+            ${sourceChips}
             ${fine}
         </div>`;
 }
@@ -1164,13 +1531,19 @@ function updateOllamaActionButtons(status) {
     }
 
     if (modelBtn) {
-        modelBtn.disabled = !running;
-        modelBtn.textContent = modelReady ? 'AI Model Ready' : running ? 'Download AI Model' : 'Start Ollama First';
-        modelBtn.title = modelReady
-            ? `${model} is installed; click to re-check`
-            : running
-                ? `Download ${model} for AI titles, AI moment labels, and Deep Analysis AI ranking`
-                : 'Start or install Ollama before downloading the local AI model';
+        if (_ollamaModelDownloadActive) {
+            modelBtn.disabled = true;
+            modelBtn.textContent = 'Downloading Model...';
+            modelBtn.title = `Downloading ${model} with Ollama; keep Ollama running`;
+        } else {
+            modelBtn.disabled = !running;
+            modelBtn.textContent = modelReady ? 'AI Model Ready' : running ? `Download ${model}` : 'Start Ollama First';
+            modelBtn.title = modelReady
+                ? `${model} is installed; click to re-check`
+                : running
+                    ? `Download ${model} for AI titles, AI moment labels, and Deep Analysis AI ranking`
+                    : 'Start or install Ollama before downloading the local AI model';
+        }
     }
 }
 
@@ -1276,6 +1649,7 @@ async function installOllamaWithPowerShell() {
 }
 
 async function downloadOllamaModel() {
+    if (_ollamaModelDownloadActive) return toast('Ollama model download is already running', 'info');
     try {
         if (_lastOllamaStatus && _lastOllamaStatus.model_ready) {
             toast(`${_lastOllamaStatus.model} is already ready for local AI features`, 'success');
@@ -1285,16 +1659,27 @@ async function downloadOllamaModel() {
             toast('Start Ollama before downloading the local AI model', 'warning');
             return refreshOllamaStatus();
         }
-        toast('Downloading local AI model with Ollama...', 'info');
+        const model = _lastOllamaStatus?.model || 'qwen2.5:3b';
+        if (!confirm(`Download ${model} with Ollama?\n\nThis can take several minutes and uses your network connection. Keep Ollama running until the app says the model is ready.`)) {
+            return;
+        }
+        _ollamaModelDownloadActive = true;
+        updateOllamaActionButtons(_lastOllamaStatus);
+        const settingsDetail = document.getElementById('settings-ollama-detail');
+        if (settingsDetail) settingsDetail.textContent = `Downloading ${model}...`;
+        toast(`Downloading ${model} with Ollama...`, 'info');
         const r = await pywebview.api.ensure_ollama_model();
         if (r.ready) {
             toast(`${r.model} is ready for local AI features`, 'success');
         } else {
             toast('Ollama is not running yet', 'warning');
         }
-        refreshOllamaStatus();
+        await refreshOllamaStatus();
     } catch (_) {
         toast('Could not download Ollama AI model', 'error');
+    } finally {
+        _ollamaModelDownloadActive = false;
+        updateOllamaActionButtons(_lastOllamaStatus);
     }
 }
 
@@ -1553,8 +1938,7 @@ window.addEventListener('pywebviewready', async () => {
             applyAppMetadata(await pywebview.api.get_app_metadata());
         } catch (_) {}
 
-        const deps = await pywebview.api.check_dependencies();
-        if (!deps.ffmpeg || !deps.ffprobe) showModal('ffmpeg-modal');
+        await refreshFfmpegDependencies({ quiet: true, showModalOnMissing: true });
         refreshOllamaStatus();
 
         // Backend (viria_state.json) is the source of truth for settings.
@@ -1572,10 +1956,12 @@ window.addEventListener('pywebviewready', async () => {
             state.results = visibleClipList(persisted.clips);
             state.moments = persisted.moments || [];
         }
-        if (persisted.scheduled && persisted.scheduled.length) {
+        if (Array.isArray(persisted.scheduled)) {
             state.scheduled = normalizeScheduledMetadata(persisted.scheduled);
-            persistSchedule();
+            if (state.scheduled.length) persistSchedule();
+            else clearStaleScheduleUi();
         }
+        state.uploadHistory = Array.isArray(persisted.upload_history) ? persisted.upload_history : [];
         refreshSubtitlePreviewSnapshot(false);
         await loadPersonalization();
 
@@ -1588,6 +1974,9 @@ window.addEventListener('pywebviewready', async () => {
                 persistSchedule();
             }
             updateYtUI(true);
+        } else {
+            state.ytConnected = false;
+            updateYtUI(false);
         }
 
         // Render peak times legend on init
@@ -1711,6 +2100,7 @@ function navigateTo(section) {
 
 async function startProcessing() {
     if (state.processing) return;
+    if (!(await ensureFfmpegReady('generate clips'))) return;
 
     const urlInput = document.getElementById('url-input').value.trim();
     pruneCompletedBatchItemsForNewRun();
@@ -2918,15 +3308,23 @@ window.onMomentsDetected = function (moments) {
 async function refreshScheduleFromBackend(render = false) {
     try {
         const r = await pywebview.api.get_all_scheduled();
-        if (r.scheduled) state.scheduled = normalizeScheduledMetadata(r.scheduled);
+        if (Array.isArray(r.scheduled)) {
+            state.scheduled = normalizeScheduledMetadata(r.scheduled);
+            _cachedNextUpload = null;
+            _nextUploadCacheTime = 0;
+        }
+        if (Array.isArray(r.upload_history)) state.uploadHistory = r.upload_history;
     } catch (_) {
         state.scheduled = normalizeScheduledMetadata(state.scheduled);
     }
+    if (!state.scheduled.length) clearStaleScheduleUi();
     if (render) {
         renderCalendar();
         renderTimeline();
         renderClipTray();
     }
+    renderUploadReadinessStrip();
+    renderUploadSummary();
 }
 
 window.onPipelineComplete = async function (success, doneCount, totalCount, errorMsg, details = null) {
@@ -3041,13 +3439,23 @@ window.onPipelineCancelled = async function () {
 
 /* ── Scheduler Callbacks ──────────────────────────────────────────────── */
 
-window.onSchedulerStatus = function (msg) {
+window.onSchedulerStatus = async function (msg) {
+    await refreshScheduleFromBackend(false);
+    if (!hasPendingSchedule()) {
+        clearStaleScheduleUi();
+        return;
+    }
+
     const bar = document.getElementById('scheduler-bar');
     bar.classList.remove('hidden');
-    document.getElementById('scheduler-status-text').textContent = msg;
+    const watcherMsg = String(msg || '').includes('Local Upload Watcher')
+        ? String(msg || '')
+        : `Local Upload Watcher: ${msg || 'active'}`;
+    document.getElementById('scheduler-status-text').textContent = watcherMsg;
     // Add uploading notification if it looks like an active upload
-    if (msg.toLowerCase().includes('uploading')) {
-        addNotification('Uploading', msg, 'uploading');
+    if (String(msg || '').toLowerCase().includes('uploading')) {
+        removeNotificationsByType('uploading');
+        addNotification('Uploading', watcherMsg, 'uploading');
     }
 };
 
@@ -3072,30 +3480,33 @@ setInterval(() => {
         _nextUploadCacheTime = now;
     }
 
-    if (!_cachedNextUpload) return;
+    if (!_cachedNextUpload) {
+        clearStaleScheduleUi();
+        return;
+    }
     const diffMs = new Date(`${_cachedNextUpload.date}T${_cachedNextUpload.time}`).getTime() - now;
     if (diffMs > 0) {
         const hrs = Math.floor(diffMs / 3600000);
         const mins = Math.floor((diffMs % 3600000) / 60000);
         document.getElementById('scheduler-status-text').textContent =
-            `Next upload: Clip ${_cachedNextUpload.clipIdx + 1} in ${hrs}h ${mins}m`;
+            `Local Upload Watcher: next send to YouTube is Clip ${_cachedNextUpload.clipIdx + 1} in ${hrs}h ${mins}m`;
+    } else {
+        document.getElementById('scheduler-status-text').textContent =
+            'Local Upload Watcher: calendar needs attention';
     }
 }, 30000);
 
-window.onScheduledUploadDone = function (clipIdx, success, error) {
+window.onScheduledUploadDone = async function (clipIdx, success, error) {
+    removeNotificationsByType('uploading');
     const clipName = state.results[clipIdx]?.filename || `Clip ${clipIdx + 1}`;
     if (success) {
-        toast(`Clip ${clipIdx + 1} uploaded by scheduler`, 'success');
+        toast(`Clip ${clipIdx + 1} sent by Local Upload Watcher`, 'success');
         addNotification(
             'Upload Complete',
             `${clipName} was uploaded to YouTube successfully`,
             'success'
         );
-        state.scheduled.forEach(s => {
-            if (s.clipIdx === clipIdx && !s.uploaded) s.uploaded = true;
-        });
-        renderCalendar();
-        renderTimeline();
+        await refreshScheduleFromBackend(true);
     } else {
         toast(`Scheduler upload failed: ${error}`, 'error');
         addNotification(
@@ -3103,6 +3514,7 @@ window.onScheduledUploadDone = function (clipIdx, success, error) {
             `${clipName}: ${error}`,
             'error'
         );
+        await refreshScheduleFromBackend(true);
     }
 };
 
@@ -3289,14 +3701,21 @@ function _buildResultCard(clip, i) {
     const score = finiteNumber(m.score, 0);
     const sc = score >= 0.7 ? 'high' : score >= 0.4 ? 'mid' : 'low';
     const momentLabel = momentLabelMarkup(clip, m);
+    const filename = resultFilenameKey(clip);
+    const isSelected = state.resultsSelectedFilenames.has(filename);
     const card = document.createElement('div');
-    card.className = 'result-card';
+    card.className = 'result-card' + (isSelected ? ' selected' : '');
     card.dataset.clipIdx = i;
+    card.dataset.filename = filename;
     card.innerHTML = `
         <div class="result-card-thumb" data-clip-idx="${i}" onclick="previewClip(${i})">
             <div class="thumb-placeholder">
                 <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
+            <label class="library-select-check result-select-check" title="Select clip" aria-label="Select ${escHtml(clip.filename)}">
+                <input class="result-select-input" type="checkbox" ${isSelected ? 'checked' : ''}>
+                <span></span>
+            </label>
             <div class="result-card-overlay">
                 <button class="play-btn" type="button" aria-label="Preview clip ${i + 1}">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -3327,13 +3746,159 @@ function _buildResultCard(clip, i) {
             recordClipFeedback(i, btn.dataset.feedback);
         });
     });
+    const selectInput = card.querySelector('.result-select-input');
+    const selectLabel = card.querySelector('.result-select-check');
+    if (selectLabel) selectLabel.addEventListener('click', event => event.stopPropagation());
+    if (selectInput) {
+        selectInput.addEventListener('click', event => event.stopPropagation());
+        selectInput.addEventListener('change', event => {
+            event.stopPropagation();
+            setResultsSelected(clip.filename, selectInput.checked);
+        });
+    }
     renderCardFeedbackState(card, clip);
     return card;
 }
 
 function toggleFolder(headerEl) {
     const folder = headerEl.closest('.result-folder');
-    folder.classList.toggle('open');
+    const isOpen = folder.classList.toggle('open');
+    const resultsGrid = document.getElementById('results-grid');
+    if (resultsGrid && resultsGrid.contains(folder) && folder.dataset.stem) {
+        state.resultsOpenFolders[folder.dataset.stem] = isOpen;
+    }
+    const libraryGrid = document.getElementById('library-grid');
+    if (libraryGrid && libraryGrid.contains(folder) && folder.dataset.stem) {
+        state.libraryOpenFolders[folder.dataset.stem] = isOpen;
+    }
+}
+
+function resultFilenameKey(clipOrFilename) {
+    if (typeof clipOrFilename === 'string') return clipOrFilename;
+    return String(clipOrFilename?.filename || '').trim();
+}
+
+function libraryFilenameKey(clipOrFilename) {
+    if (typeof clipOrFilename === 'string') return clipOrFilename;
+    return String(clipOrFilename?.filename || '').trim();
+}
+
+function pruneResultsSelection() {
+    const valid = new Set(state.results.map(clip => resultFilenameKey(clip)).filter(Boolean));
+    [...state.resultsSelectedFilenames].forEach(filename => {
+        if (!valid.has(filename)) state.resultsSelectedFilenames.delete(filename);
+    });
+}
+
+function renderResultsSelectionState() {
+    const selectedCount = state.resultsSelectedFilenames.size;
+    document.querySelectorAll('.result-card').forEach(card => {
+        const filename = card.dataset.filename || '';
+        const selected = state.resultsSelectedFilenames.has(filename);
+        card.classList.toggle('selected', selected);
+        const checkbox = card.querySelector('.result-select-input');
+        if (checkbox) checkbox.checked = selected;
+    });
+    const selectedEl = document.getElementById('results-selected-count');
+    if (selectedEl) selectedEl.textContent = `${selectedCount} selected`;
+    const hasVisible = (state.resultsVisibleFilenames || []).length > 0;
+    const selectBtn = document.getElementById('results-select-visible');
+    if (selectBtn) selectBtn.disabled = !hasVisible;
+    const clearBtn = document.getElementById('results-clear-selected');
+    if (clearBtn) clearBtn.disabled = selectedCount === 0;
+    const deleteBtn = document.getElementById('results-delete-selected');
+    if (deleteBtn) deleteBtn.disabled = selectedCount === 0;
+}
+
+function setResultsSelected(filename, selected) {
+    const key = resultFilenameKey(filename);
+    if (!key) return;
+    if (selected) state.resultsSelectedFilenames.add(key);
+    else state.resultsSelectedFilenames.delete(key);
+    renderResultsSelectionState();
+}
+
+function selectVisibleResults() {
+    (state.resultsVisibleFilenames || []).forEach(filename => {
+        if (filename) state.resultsSelectedFilenames.add(filename);
+    });
+    renderResultsSelectionState();
+}
+
+function clearResultsSelection() {
+    state.resultsSelectedFilenames.clear();
+    renderResultsSelectionState();
+}
+
+function requestDeleteSelectedResults() {
+    const filenames = [...state.resultsSelectedFilenames].filter(Boolean);
+    if (!filenames.length) return toast('Select clips to delete first', 'warning');
+    state.pendingDeleteIdx = -1;
+    state.pendingDeleteFilename = null;
+    state.pendingDeleteFilenames = filenames;
+    state.pendingDeleteSource = 'results-bulk';
+    document.getElementById('confirm-delete-msg').textContent =
+        `Delete ${filenames.length} selected clip${filenames.length !== 1 ? 's' : ''}? This cannot be undone.`;
+    showModal('confirm-delete-modal');
+}
+
+function pruneLibrarySelection() {
+    const valid = new Set(state.libraryClips.map(clip => libraryFilenameKey(clip)).filter(Boolean));
+    [...state.librarySelectedFilenames].forEach(filename => {
+        if (!valid.has(filename)) state.librarySelectedFilenames.delete(filename);
+    });
+}
+
+function renderLibrarySelectionState() {
+    const selectedCount = state.librarySelectedFilenames.size;
+    document.querySelectorAll('.library-item').forEach(item => {
+        const filename = item.dataset.filename || '';
+        const selected = state.librarySelectedFilenames.has(filename);
+        item.classList.toggle('selected', selected);
+        const checkbox = item.querySelector('.library-select-input');
+        if (checkbox) checkbox.checked = selected;
+    });
+    const selectedEl = document.getElementById('library-selected-count');
+    if (selectedEl) selectedEl.textContent = `${selectedCount} selected`;
+    const hasVisible = (state.libraryVisibleFilenames || []).length > 0;
+    const selectBtn = document.getElementById('library-select-visible');
+    if (selectBtn) selectBtn.disabled = !hasVisible;
+    const clearBtn = document.getElementById('library-clear-selected');
+    if (clearBtn) clearBtn.disabled = selectedCount === 0;
+    const deleteBtn = document.getElementById('library-delete-selected');
+    if (deleteBtn) deleteBtn.disabled = selectedCount === 0;
+}
+
+function setLibrarySelected(filename, selected) {
+    const key = libraryFilenameKey(filename);
+    if (!key) return;
+    if (selected) state.librarySelectedFilenames.add(key);
+    else state.librarySelectedFilenames.delete(key);
+    renderLibrarySelectionState();
+}
+
+function selectVisibleLibrary() {
+    (state.libraryVisibleFilenames || []).forEach(filename => {
+        if (filename) state.librarySelectedFilenames.add(filename);
+    });
+    renderLibrarySelectionState();
+}
+
+function clearLibrarySelection() {
+    state.librarySelectedFilenames.clear();
+    renderLibrarySelectionState();
+}
+
+function requestDeleteSelectedLibrary() {
+    const filenames = [...state.librarySelectedFilenames].filter(Boolean);
+    if (!filenames.length) return toast('Select videos to delete first', 'warning');
+    state.pendingDeleteIdx = -1;
+    state.pendingDeleteFilename = null;
+    state.pendingDeleteFilenames = filenames;
+    state.pendingDeleteSource = 'library-bulk';
+    document.getElementById('confirm-delete-msg').textContent =
+        `Delete ${filenames.length} selected video${filenames.length !== 1 ? 's' : ''}? This cannot be undone.`;
+    showModal('confirm-delete-modal');
 }
 
 async function loadResults() {
@@ -3341,6 +3906,7 @@ async function loadResults() {
         const r = await pywebview.api.get_results();
         state.results = visibleClipList(r.clips);
         state.moments = r.moments || state.moments;
+        pruneResultsSelection();
         refreshSubtitlePreviewSnapshot(false);
         await loadPersonalization();
     } catch (_) {}
@@ -3357,6 +3923,8 @@ function renderResultsGrid() {
         grid.innerHTML = '';
         grid.appendChild(empty);
         empty.style.display = '';
+        state.resultsVisibleFilenames = [];
+        renderResultsSelectionState();
         return;
     }
     state.resultsMomentFilter = normalizeAvailableMomentFilter(
@@ -3374,6 +3942,7 @@ function renderResultsGrid() {
     const visibleResults = state.results
         .map((clip, index) => ({ ...clip, _idx: index }))
         .filter(clip => clipMatchesMomentFilter(clip, state.moments[clip._idx] || {}, state.resultsMomentFilter));
+    state.resultsVisibleFilenames = visibleResults.map(resultFilenameKey).filter(Boolean);
     if (countEl && visibleResults.length !== state.results.length) {
         countEl.textContent = `${visibleResults.length}/${state.results.length} clips`;
     }
@@ -3387,7 +3956,9 @@ function renderResultsGrid() {
     groups.forEach(group => {
         const totalMB = group.clips.reduce((sum, c) => sum + (parseFloat(c.size_mb) || 0), 0).toFixed(1);
         const folder = document.createElement('div');
-        folder.className = 'result-folder' + (autoOpen ? ' open' : '');
+        const hasOpenPref = Object.prototype.hasOwnProperty.call(state.resultsOpenFolders, group.stem);
+        const isOpen = hasOpenPref ? state.resultsOpenFolders[group.stem] === true : autoOpen;
+        folder.className = 'result-folder' + (isOpen ? ' open' : '');
         folder.dataset.stem = group.stem;
 
         const header = document.createElement('div');
@@ -3418,6 +3989,7 @@ function renderResultsGrid() {
 
     grid.innerHTML = '';
     grid.appendChild(frag);
+    renderResultsSelectionState();
 
     // Lazy-load thumbnails — only decode filtered visible cards.
     visibleResults.forEach(clip => {
@@ -3480,6 +4052,7 @@ function requestDeleteResult(idx) {
     if (!clip) return;
     state.pendingDeleteIdx = idx;
     state.pendingDeleteFilename = clip.filename;
+    state.pendingDeleteFilenames = [];
     state.pendingDeleteSource = 'results';
     document.getElementById('confirm-delete-msg').textContent = `Delete "${clip.filename}"? This cannot be undone.`;
     showModal('confirm-delete-modal');
@@ -3488,6 +4061,7 @@ function requestDeleteResult(idx) {
 function requestDeleteLibrary(filename) {
     state.pendingDeleteIdx = -1;
     state.pendingDeleteFilename = filename;
+    state.pendingDeleteFilenames = [];
     state.pendingDeleteSource = 'library';
     document.getElementById('confirm-delete-msg').textContent = `Delete "${filename}"? This cannot be undone.`;
     showModal('confirm-delete-modal');
@@ -3505,9 +4079,37 @@ async function confirmDelete() {
                 if (state.previewClipIdx === state.pendingDeleteIdx) {
                     closePreview();
                 }
-                loadResults();
+                await refreshScheduleFromBackend(false);
+                await loadResults();
+                renderTimeline();
+                renderCalendar();
+                renderClipTray();
             } else {
                 toast(r.error || 'Delete failed', 'error');
+            }
+        } catch (e) { toast('Delete failed: ' + e, 'error'); }
+    } else if (state.pendingDeleteSource === 'results-bulk' && state.pendingDeleteFilenames.length) {
+        const filenames = [...state.pendingDeleteFilenames];
+        try {
+            const r = await pywebview.api.delete_library_files(filenames);
+            const deleted = Array.isArray(r.deleted) ? r.deleted : [];
+            const failed = Array.isArray(r.failed) ? r.failed : [];
+            if (deleted.length) {
+                deleted.forEach(name => state.resultsSelectedFilenames.delete(name));
+                const previewName = state.previewClipIdx >= 0 ? state.results[state.previewClipIdx]?.filename : null;
+                if (previewName && deleted.includes(previewName)) {
+                    closePreview();
+                }
+                await refreshScheduleFromBackend(false);
+                await loadResults();
+                toast(
+                    failed.length
+                        ? `Deleted ${deleted.length}; ${failed.length} could not be deleted`
+                        : `Deleted ${deleted.length} clip${deleted.length !== 1 ? 's' : ''}`,
+                    failed.length ? 'warning' : 'success'
+                );
+            } else {
+                toast((failed[0] && failed[0].error) || r.error || 'Delete failed', 'error');
             }
         } catch (e) { toast('Delete failed: ' + e, 'error'); }
     } else if (state.pendingDeleteSource === 'library' && state.pendingDeleteFilename) {
@@ -3518,15 +4120,41 @@ async function confirmDelete() {
                 if (state.previewLibraryClip?.filename === state.pendingDeleteFilename) {
                     closePreview();
                 }
-                loadLibrary();
+                state.librarySelectedFilenames.delete(state.pendingDeleteFilename);
+                await refreshScheduleFromBackend(false);
+                await loadLibrary();
             } else {
                 toast(r.error || 'Delete failed', 'error');
+            }
+        } catch (e) { toast('Delete failed: ' + e, 'error'); }
+    } else if (state.pendingDeleteSource === 'library-bulk' && state.pendingDeleteFilenames.length) {
+        const filenames = [...state.pendingDeleteFilenames];
+        try {
+            const r = await pywebview.api.delete_library_files(filenames);
+            const deleted = Array.isArray(r.deleted) ? r.deleted : [];
+            const failed = Array.isArray(r.failed) ? r.failed : [];
+            if (deleted.length) {
+                deleted.forEach(name => state.librarySelectedFilenames.delete(name));
+                if (state.previewLibraryClip && deleted.includes(state.previewLibraryClip.filename)) {
+                    closePreview();
+                }
+                await refreshScheduleFromBackend(false);
+                await loadLibrary();
+                toast(
+                    failed.length
+                        ? `Deleted ${deleted.length}; ${failed.length} could not be deleted`
+                        : `Deleted ${deleted.length} video${deleted.length !== 1 ? 's' : ''}`,
+                    failed.length ? 'warning' : 'success'
+                );
+            } else {
+                toast((failed[0] && failed[0].error) || r.error || 'Delete failed', 'error');
             }
         } catch (e) { toast('Delete failed: ' + e, 'error'); }
     }
 
     state.pendingDeleteIdx = -1;
     state.pendingDeleteFilename = null;
+    state.pendingDeleteFilenames = [];
     state.pendingDeleteSource = null;
 }
 
@@ -3536,6 +4164,7 @@ async function loadLibrary() {
     try {
         const r = await pywebview.api.list_all_clips();
         state.libraryClips = r.clips || [];
+        pruneLibrarySelection();
 
         // Update stats
         document.getElementById('lib-stat-count').textContent = r.count || 0;
@@ -3567,8 +4196,11 @@ async function refreshLibrary() {
 function _groupLibraryByStem(clips) {
     const groups = {};
     clips.forEach((clip, i) => {
-        const match = clip.filename.match(/^(.+?)_viral\d+/i);
-        const stem = match ? match[1] : 'Other';
+        let stem = clip.source_stem;
+        if (!stem) {
+            const match = clip.filename.match(/^(.+?)_viral\d+/i);
+            stem = match ? match[1] : 'Other';
+        }
         if (!groups[stem]) groups[stem] = { stem, clips: [] };
         groups[stem].clips.push({ ...clip, _libIdx: i });
     });
@@ -3579,14 +4211,21 @@ function _buildLibraryCard(clip) {
     const item = document.createElement('div');
     item.className = 'library-item';
     item.dataset.clipId = clip.clip_id || '';
+    item.dataset.filename = clip.filename || '';
     const d = new Date(clip.modified * 1000);
     const dateStr = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
     const momentLabel = momentLabelMarkup(clip, clip);
+    const isSelected = state.librarySelectedFilenames.has(clip.filename);
+    item.classList.toggle('selected', isSelected);
     item.innerHTML = `
         <div class="library-item-thumb" data-lib-url="${escHtml(clip.url)}">
             <div class="thumb-placeholder">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
+            <label class="library-select-check" title="Select video" aria-label="Select ${escHtml(clip.filename)}">
+                <input class="library-select-input" type="checkbox" ${isSelected ? 'checked' : ''}>
+                <span></span>
+            </label>
             <div class="library-item-overlay">
                 <button class="play-btn" style="width:40px;height:40px;">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -3611,6 +4250,16 @@ function _buildLibraryCard(clip) {
     const thumbEl = item.querySelector('.library-item-thumb');
     if (thumbEl) {
         thumbEl.addEventListener('click', () => previewLibraryClip(clip.filename, clip.url, clip));
+    }
+    const selectInput = item.querySelector('.library-select-input');
+    const selectLabel = item.querySelector('.library-select-check');
+    if (selectLabel) selectLabel.addEventListener('click', event => event.stopPropagation());
+    if (selectInput) {
+        selectInput.addEventListener('click', event => event.stopPropagation());
+        selectInput.addEventListener('change', event => {
+            event.stopPropagation();
+            setLibrarySelected(clip.filename, selectInput.checked);
+        });
     }
     item.querySelectorAll('.feedback-btn').forEach(btn => {
         btn.addEventListener('click', event => {
@@ -3664,8 +4313,11 @@ function renderLibraryGrid() {
         grid.innerHTML = '';
         grid.appendChild(empty);
         empty.style.display = '';
+        state.libraryVisibleFilenames = [];
+        renderLibrarySelectionState();
         return;
     }
+    state.libraryVisibleFilenames = filtered.map(libraryFilenameKey).filter(Boolean);
 
     const groups = _groupLibraryByStem(filtered);
     const frag = document.createDocumentFragment();
@@ -3674,7 +4326,9 @@ function renderLibraryGrid() {
     groups.forEach(group => {
         const totalMB = group.clips.reduce((sum, c) => sum + (parseFloat(c.size_mb) || 0), 0).toFixed(1);
         const folder = document.createElement('div');
-        folder.className = 'result-folder' + (autoOpen ? ' open' : '');
+        const hasOpenPref = Object.prototype.hasOwnProperty.call(state.libraryOpenFolders, group.stem);
+        const isOpen = hasOpenPref ? state.libraryOpenFolders[group.stem] === true : autoOpen;
+        folder.className = 'result-folder' + (isOpen ? ' open' : '');
         folder.dataset.stem = group.stem;
 
         const header = document.createElement('div');
@@ -3698,6 +4352,7 @@ function renderLibraryGrid() {
 
     grid.innerHTML = '';
     grid.appendChild(frag);
+    renderLibrarySelectionState();
 }
 
 const filterLibrary = _debounce(() => {
@@ -3798,12 +4453,16 @@ function updateYtUI(connected) {
         const accountCount = new Set(state.channels.map(c => c.account_id)).size;
         statusText.textContent = `${accountCount} account${accountCount !== 1 ? 's' : ''} · ${state.channels.length} channel${state.channels.length !== 1 ? 's' : ''}`;
         statusText.classList.add('connected');
+        hideYouTubeSetupCard();
     } else {
         statusText.textContent = 'No accounts connected';
         statusText.classList.remove('connected');
+        showYouTubeSetupCard();
     }
     // Always show Add Account button (can add more accounts)
     channelArea.classList.toggle('hidden', !connected);
+    renderUploadReadinessStrip();
+    renderUploadSummary();
 }
 
 async function loadChannelsAndCategories() {
@@ -3911,6 +4570,7 @@ function selectChannel(id) {
         c.classList.toggle('selected', selected);
         c.setAttribute('aria-pressed', selected ? 'true' : 'false');
     });
+    renderUploadSummary();
 }
 
 function updateModalCategoryDropdown() {
@@ -3960,6 +4620,8 @@ async function loadUploadSection() {
         renderTimeline();
         renderCalendar();
         renderClipTray();
+        renderUploadReadinessStrip();
+        renderUploadSummary();
         return;
     }
     empty.style.display = 'none';
@@ -3975,6 +4637,8 @@ async function loadUploadSection() {
     renderClipTray();
     renderTimeline();
     renderCalendar();
+    renderUploadReadinessStrip();
+    renderUploadSummary();
 }
 
 /* ── Clip Tray (draggable) ────────────────────────────────────────────── */
@@ -3993,7 +4657,8 @@ function _groupClipsByStem(clips) {
             const match = clip.filename.match(/^(.+?)_viral\d+/i);
             stem = match ? match[1] : clip.filename.replace(/\.[^.]+$/, '');
         }
-        if (!groups[stem]) groups[stem] = { stem, clips: [] };
+        if (!groups[stem]) groups[stem] = { stem, source_id: clip.source_id || state.moments[i]?.source_id || '', clips: [] };
+        if (!groups[stem].source_id) groups[stem].source_id = clip.source_id || state.moments[i]?.source_id || '';
         groups[stem].clips.push({ ...clip, _idx: i });
     });
     return Object.values(groups);
@@ -4003,10 +4668,34 @@ function renderClipTray() {
     const list = document.getElementById('clip-tray-list');
     if (!list) return;
     list.innerHTML = '';
+    const summary = document.getElementById('clip-tray-summary');
+    const searchTerm = (document.getElementById('clip-tray-search')?.value || '').trim().toLowerCase();
+    state.clipTraySearch = searchTerm;
 
-    const groups = _groupClipsByStem(state.results);
+    const allGroups = _groupClipsByStem(state.results);
+    const groups = !searchTerm
+        ? allGroups
+        : allGroups.map(group => {
+            const sourceMatches = group.stem.toLowerCase().includes(searchTerm);
+            const clips = sourceMatches
+                ? group.clips
+                : group.clips.filter(clip => String(clip.filename || '').toLowerCase().includes(searchTerm));
+            return { ...group, clips };
+        }).filter(group => group.clips.length);
 
-    if (!groups.length) return;
+    const visibleCount = groups.reduce((sum, group) => sum + group.clips.length, 0);
+    if (summary) {
+        summary.textContent = state.results.length
+            ? (visibleCount === state.results.length ? `${state.results.length} clips` : `${visibleCount}/${state.results.length} clips`)
+            : '';
+    }
+
+    if (!groups.length) {
+        if (state.results.length && searchTerm) {
+            list.innerHTML = '<div class="clip-tray-empty">No matching clips</div>';
+        }
+        return;
+    }
 
     // Always show folders — even with 1 group, the folder gives
     // a "Schedule All" button and keeps the UI consistent
@@ -4019,6 +4708,7 @@ function renderClipTray() {
         const scheduledCount = group.clips.filter(c =>
             state.scheduled.some(s => s.clipIdx === c._idx && !s.uploaded)
         ).length;
+        const hasCreatorContext = group.clips.some(c => creatorTitleContextForClip(c._idx));
 
         const header = document.createElement('div');
         header.className = 'tray-folder-header';
@@ -4038,9 +4728,11 @@ function renderClipTray() {
             <div class="tray-folder-actions" onclick="event.stopPropagation()">
                 ${chDropdownHtml}
                 <button class="tray-folder-sched-btn" title="Schedule all clips from this folder to selected channel">Schedule</button>
+                <button class="tray-folder-context-btn${hasCreatorContext ? ' has-context' : ''}" title="Add optional notes to guide AI titles for this source">Optional AI Notes</button>
                 <button class="tray-folder-ai-btn" title="Generate AI titles only for clips in this folder">AI Titles</button>
             </div>`;
         const folderStem = group.stem; // capture in closure — no encode/decode needed
+        const folderSourceId = group.source_id || '';
         header.addEventListener('click', (e) => {
             if (e.target.closest('.tray-folder-actions')) return;
             folder.classList.toggle('open');
@@ -4061,6 +4753,13 @@ function renderClipTray() {
                 generateAITitlesForFolder(folderStem, aiBtn);
             });
         }
+        const contextBtn = header.querySelector('.tray-folder-context-btn');
+        if (contextBtn) {
+            contextBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                openSourceTitleContextModal(folderStem, folderSourceId);
+            });
+        }
 
         const body = document.createElement('div');
         body.className = 'tray-folder-body';
@@ -4073,6 +4772,11 @@ function renderClipTray() {
         list.appendChild(folder);
     });
 }
+
+const filterClipTray = _debounce(() => {
+    renderClipTray();
+}, 150);
+window.filterClipTray = filterClipTray;
 
 function _createTrayClipEl(clip, idx) {
     const el = document.createElement('div');
@@ -4089,6 +4793,65 @@ function _createTrayClipEl(clip, idx) {
     });
     el.addEventListener('dragend', () => el.classList.remove('dragging'));
     return el;
+}
+
+function sourceTitleContextForStem(stem) {
+    const indices = _findClipIndicesForStem(stem);
+    for (const idx of indices) {
+        const value = creatorTitleContextForClip(idx);
+        if (value) return value;
+    }
+    return '';
+}
+
+function openSourceTitleContextModal(stem, sourceId = '') {
+    state.sourceContextEditing = { stem: String(stem || ''), source_id: String(sourceId || '') };
+    const title = document.getElementById('source-context-title');
+    const field = document.getElementById('source-context-text');
+    if (title) title.textContent = `Optional AI Notes - ${stem || 'Source'}`;
+    if (field) {
+        field.value = sourceTitleContextForStem(stem);
+        field.focus();
+    }
+    showModal('source-context-modal');
+}
+
+async function saveSourceTitleContextModal() {
+    const edit = state.sourceContextEditing || {};
+    const text = document.getElementById('source-context-text')?.value || '';
+    if (!edit.stem && !edit.source_id) return closeModal('source-context-modal');
+    try {
+        const r = await pywebview.api.save_source_title_context(edit.source_id || '', edit.stem || '', text);
+        if (r && r.error) {
+            toast(r.error, 'error');
+            return;
+        }
+        const context = String(r?.creator_title_context || '').trim();
+        const indices = _findClipIndicesForStem(edit.stem || '');
+        indices.forEach(idx => {
+            if (state.results[idx]) state.results[idx].creator_title_context = context;
+            if (state.moments[idx]) state.moments[idx].creator_title_context = context;
+        });
+        state.scheduled.forEach(item => {
+            const sameSource = (edit.source_id && item.source_id === edit.source_id) || (edit.stem && item.source_stem === edit.stem);
+            if (!sameSource) return;
+            const previous = String(item.creator_title_context || '').trim();
+            item.creator_title_context = context;
+            if (previous !== context) {
+                item.description_generated = '';
+                item.generated_description = '';
+                updateScheduledDescriptionPreview(item);
+            }
+        });
+        closeModal('source-context-modal');
+        renderClipTray();
+        renderTimeline();
+        renderCalendar();
+        toast(context ? 'Optional AI notes saved' : 'Optional AI notes cleared', 'success');
+    } catch (e) {
+        console.error('Save source AI notes failed:', e);
+        toast('Could not save optional AI notes', 'error');
+    }
 }
 
 /* ── Smart Presets ────────────────────────────────────────────────────── */
@@ -4239,6 +5002,7 @@ function renderCalendar() {
         if (!schedByDate[s.date]) schedByDate[s.date] = [];
         schedByDate[s.date].push({ ...s, _origIdx: idx });
     });
+    const historyByDate = uploadHistoryByDate(filter);
 
     const frag = document.createDocumentFragment();
     const MAX_CHIPS = 3; // Collapse if more than this
@@ -4269,10 +5033,10 @@ function renderCalendar() {
 
             visible.forEach(s => {
                 const chip = document.createElement('div');
-                const isMissed = isScheduleMissed(s);
-                chip.className = 'cal-chip' + (s.uploaded ? ' uploaded' : isMissed ? ' missed' : '');
+                const status = scheduleItemStatus(s);
+                chip.className = `cal-chip ${status.className}`;
                 chip.innerHTML = `<span>C${s.clipIdx + 1}</span><span class="cal-chip-time">${escHtml(s.time || '')}</span>`;
-                chip.title = `${s.title || 'Clip ' + (s.clipIdx + 1)} — ${s.time}${s.uploaded ? ' (uploaded)' : isMissed ? ' (missed)' : ''}`;
+                chip.title = `${s.title || 'Clip ' + (s.clipIdx + 1)} — ${s.time} (${status.label})`;
                 chip.onclick = (e) => { e.stopPropagation(); openMetaModal(s._origIdx); };
                 cell.appendChild(chip);
             });
@@ -4285,6 +5049,27 @@ function renderCalendar() {
                 more.onclick = (e) => { e.stopPropagation(); openDayDetailView(dateStr, dayItems); };
                 cell.appendChild(more);
             }
+        }
+
+        const representedSent = new Set();
+        (dayItems || []).forEach(s => {
+            const status = scheduleItemStatus(s);
+            if (!['sent', 'youtube_scheduled'].includes(status.key)) return;
+            if (s.youtube_id) representedSent.add(`yt:${s.youtube_id}`);
+            if (s.clip_id) representedSent.add(`clip:${s.clip_id}`);
+        });
+        const historyItems = (historyByDate[dateStr] || []).filter(row => {
+            if (row.youtube_id && representedSent.has(`yt:${row.youtube_id}`)) return false;
+            if (row.clip_id && representedSent.has(`clip:${row.clip_id}`)) return false;
+            return true;
+        });
+        if (historyItems.length) {
+            const marker = document.createElement('div');
+            marker.className = 'cal-history-marker';
+            marker.textContent = `${historyItems.length} sent`;
+            marker.title = `${historyItems.length} previous upload${historyItems.length !== 1 ? 's' : ''} recorded for this day`;
+            marker.onclick = (e) => { e.stopPropagation(); openDayDetailView(dateStr, dayItems || [], historyItems); };
+            cell.appendChild(marker);
         }
 
         cell.addEventListener('click', () => {
@@ -4312,6 +5097,7 @@ function renderCalendar() {
     container.appendChild(frag);
 
     _checkMissedUploads();
+    renderUploadSummary();
 }
 
 function _renderCalChannelTabs() {
@@ -4364,27 +5150,56 @@ function filterCalendarByChannel(channelId) {
     renderTimeline();
 }
 
-function openDayDetailView(dateStr, dayItems) {
+function historyRowStatus(row = {}) {
+    const status = String(row.status || row.upload_state || row.send_status || 'sent_to_youtube').toLowerCase();
+    if (status === 'youtube_scheduled') return { className: 'youtube-scheduled', label: 'Sent - publishes later' };
+    if (status === 'upload_failed' || status === 'failed') return { className: 'failed', label: 'Upload failed' };
+    return { className: 'sent', label: 'Sent to YouTube' };
+}
+
+function historyRowTimeLabel(row = {}) {
+    const local = String(row.date || '').trim() && String(row.time || '').trim()
+        ? `${row.date}T${row.time}:00`
+        : '';
+    const raw = row.publish_at_utc || row.finished_at_utc || row.uploaded_at || local;
+    if (!raw) return String(row.time || '—');
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return String(row.time || '—');
+    return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+
+function openDayDetailView(dateStr, dayItems, historyItems = []) {
     state.pickerDate = dateStr;
     const d = new Date(dateStr + 'T12:00:00');
     const fmtDate = d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-    document.getElementById('day-detail-title').textContent = `${fmtDate} — ${dayItems.length} clip${dayItems.length > 1 ? 's' : ''}`;
+    const sorted = [...(dayItems || [])].sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    const historyRows = Array.isArray(historyItems) ? [...historyItems] : [];
+    historyRows.sort((a, b) => historyRowTimeLabel(a).localeCompare(historyRowTimeLabel(b)));
+    const scheduledCount = sorted.length;
+    const historyCount = historyRows.length;
+    const countText = scheduledCount && historyCount
+        ? `${scheduledCount} scheduled, ${historyCount} history`
+        : historyCount
+            ? `${historyCount} historical upload${historyCount === 1 ? '' : 's'}`
+            : `${scheduledCount} clip${scheduledCount === 1 ? '' : 's'}`;
+    document.getElementById('day-detail-title').textContent = `${fmtDate} — ${countText}`;
 
     const list = document.getElementById('day-detail-list');
     list.innerHTML = '';
-    const sorted = [...dayItems].sort((a, b) => (a.time || '').localeCompare(b.time || ''));
 
     // Add status summary line
-    let sPending = 0, sUploaded = 0, sMissed = 0;
+    let sPending = 0, sSent = 0, sAttention = 0;
     sorted.forEach(s => {
-        if (s.uploaded) sUploaded++;
-        else if (isScheduleMissed(s)) sMissed++;
+        const status = scheduleItemStatus(s);
+        if (['sent', 'youtube_scheduled'].includes(status.key)) sSent++;
+        else if (['missed', 'failed', 'unknown', 'disconnected', 'invalid'].includes(status.key)) sAttention++;
         else sPending++;
     });
     const summaryParts = [];
     if (sPending > 0) summaryParts.push(`<span class="summary-pending">${sPending} pending</span>`);
-    if (sUploaded > 0) summaryParts.push(`<span class="summary-uploaded">${sUploaded} uploaded</span>`);
-    if (sMissed > 0) summaryParts.push(`<span class="summary-missed">${sMissed} missed</span>`);
+    if (sSent > 0) summaryParts.push(`<span class="summary-uploaded">${sSent} sent</span>`);
+    if (historyCount > 0) summaryParts.push(`<span class="summary-uploaded">${historyCount} history</span>`);
+    if (sAttention > 0) summaryParts.push(`<span class="summary-missed">${sAttention} needs attention</span>`);
     const existingSummary = document.getElementById('day-detail-summary');
     if (existingSummary) existingSummary.remove();
     if (summaryParts.length) {
@@ -4395,10 +5210,17 @@ function openDayDetailView(dateStr, dayItems) {
         list.parentNode.insertBefore(summaryEl, list);
     }
 
+    if (sorted.length) {
+        const activeTitle = document.createElement('div');
+        activeTitle.className = 'day-detail-section-title';
+        activeTitle.textContent = 'Current schedule';
+        list.appendChild(activeTitle);
+    }
+
     sorted.forEach(s => {
-        const isMissed = isScheduleMissed(s);
-        const statusClass = s.uploaded ? 'uploaded' : isMissed ? 'missed' : 'pending';
-        const statusLabel = s.uploaded ? 'Uploaded' : isMissed ? 'Missed' : 'Pending';
+        const status = scheduleItemStatus(s);
+        const statusClass = status.className;
+        const statusLabel = status.label;
 
         const item = document.createElement('div');
         item.className = `day-detail-item ${statusClass}`;
@@ -4436,6 +5258,36 @@ function openDayDetailView(dateStr, dayItems) {
         }
     });
 
+    if (historyRows.length) {
+        const historyTitle = document.createElement('div');
+        historyTitle.className = 'day-detail-section-title';
+        historyTitle.textContent = 'Upload history';
+        list.appendChild(historyTitle);
+    }
+
+    historyRows.forEach(row => {
+        const status = historyRowStatus(row);
+        const item = document.createElement('div');
+        item.className = `day-detail-item history ${status.className}`;
+        const title = row.title || row.clip_filename || 'Uploaded clip';
+        const channel = channelById(row.channel_id)?.title || row.channel_id || 'YouTube';
+        const youtubeId = row.youtube_id ? ` · ${row.youtube_id}` : '';
+        item.innerHTML = `
+            <div class="day-detail-history-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>
+            </div>
+            <div class="day-detail-info">
+                <div class="day-detail-item-title">${escHtml(title)}</div>
+                <div class="day-detail-meta">
+                    <span class="day-detail-time">${escHtml(historyRowTimeLabel(row))}</span>
+                    <span class="day-detail-status ${escHtml(status.className)}">${escHtml(status.label)}</span>
+                    <span class="day-detail-privacy">${escHtml(row.privacy || 'public')}</span>
+                </div>
+                <div class="day-detail-history-note">${escHtml(channel)}${escHtml(youtubeId)}</div>
+            </div>`;
+        list.appendChild(item);
+    });
+
     showModal('day-detail-modal');
 }
 
@@ -4459,7 +5311,7 @@ function _checkMissedUploads() {
     const banner = document.getElementById('missed-uploads-banner');
     if (missed.length > 0) {
         document.getElementById('missed-uploads-text').textContent =
-            `${missed.length} scheduled upload${missed.length > 1 ? 's were' : ' was'} missed (app was offline)`;
+            `${missed.length} calendar send time${missed.length > 1 ? 's were' : ' was'} missed (app was offline)`;
         banner.classList.remove('hidden');
     } else {
         banner.classList.add('hidden');
@@ -4826,6 +5678,16 @@ async function regenerateTitle(schedIdx) {
     const s = state.scheduled[schedIdx];
     if (!s) return;
     try {
+        const contextInput = document.getElementById('modal-meta-creator-context');
+        if (contextInput) {
+            const previousContext = String(s.creator_title_context || '').trim();
+            s.creator_title_context = String(contextInput.value || '').trim();
+            if (previousContext !== s.creator_title_context) {
+                s.description_generated = '';
+                s.generated_description = '';
+                await pywebview.api.save_scheduled(state.scheduled);
+            }
+        }
         const r = await pywebview.api.generate_title_for_clip(s.clipIdx);
         if (r.title) {
             s.title = r.title;
@@ -4838,6 +5700,8 @@ async function regenerateTitle(schedIdx) {
             if (titleInput) titleInput.value = r.title;
             const descInput = document.getElementById('modal-meta-desc');
             if (descInput) descInput.value = s.description_custom_text || '';
+            const creatorContextInput = document.getElementById('modal-meta-creator-context');
+            if (creatorContextInput) creatorContextInput.value = s.creator_title_context || '';
             updateMetaDescriptionPreview();
             const tagsInput = document.getElementById('modal-meta-tags');
             if (tagsInput && r.tags) tagsInput.value = r.tags;
@@ -4867,37 +5731,45 @@ function renderTimeline() {
     const panel = document.getElementById('schedule-timeline');
     const list = document.getElementById('timeline-list');
 
-    if (!state.scheduled.length) { panel.classList.add('hidden'); return; }
+    if (!state.scheduled.length) {
+        panel.classList.add('hidden');
+        if (list) list.innerHTML = '';
+        clearStaleScheduleUi();
+        renderUploadReadinessStrip();
+        renderUploadSummary();
+        return;
+    }
     panel.classList.remove('hidden');
 
     const now = new Date();
 
     // Single-pass: count + build sorted array, with channel filter
     const filter = state.calChannelFilter;
-    let uploadedCount = 0, missedCount = 0;
+    let sentCount = 0, attentionCount = 0;
     const sorted = state.scheduled.map((s, i) => {
-        if (s.uploaded) uploadedCount++;
-        else if (isScheduleMissed(s, now)) missedCount++;
+        const status = scheduleItemStatus(s, now);
+        if (['sent', 'youtube_scheduled'].includes(status.key)) sentCount++;
+        else if (['missed', 'failed', 'unknown', 'disconnected', 'invalid'].includes(status.key)) attentionCount++;
         return { ...s, _idx: i };
     }).filter(s => filter === 'all' || !s.channel_id || s.channel_id === filter)
       .sort((a, b) => (`${a.date}T${a.time}` > `${b.date}T${b.time}` ? 1 : -1));
 
-    const pendingCount = state.scheduled.length - uploadedCount - missedCount;
+    const pendingCount = state.scheduled.length - sentCount - attentionCount;
 
     const summaryEl = document.getElementById('smart-sched-summary');
     if (summaryEl) {
         const parts = [];
         if (pendingCount > 0) parts.push(`${pendingCount} pending`);
-        if (uploadedCount > 0) parts.push(`${uploadedCount} done`);
-        if (missedCount > 0) parts.push(`${missedCount} missed`);
+        if (sentCount > 0) parts.push(`${sentCount} sent`);
+        if (attentionCount > 0) parts.push(`${attentionCount} needs attention`);
         summaryEl.textContent = parts.join(' · ');
     }
 
     const frag = document.createDocumentFragment();
     sorted.forEach(s => {
-        const isMissed = isScheduleMissed(s, now);
-        const statusClass = s.uploaded ? 'uploaded' : isMissed ? 'missed' : 'pending';
-        const statusLabel = s.uploaded ? 'Uploaded' : isMissed ? 'Missed' : s.privacy;
+        const status = scheduleItemStatus(s, now);
+        const statusClass = status.className;
+        const statusLabel = status.label;
         const dateFmt = _fmtDateFull(s.date, s.time);
 
         const item = document.createElement('div');
@@ -4923,7 +5795,9 @@ function renderTimeline() {
     list.innerHTML = '';
     list.appendChild(frag);
 
-    document.getElementById('scheduler-bar').classList.toggle('hidden', pendingCount === 0 && missedCount === 0);
+    document.getElementById('scheduler-bar').classList.toggle('hidden', pendingCount === 0 && attentionCount === 0);
+    renderUploadReadinessStrip();
+    renderUploadSummary();
     _checkMissedUploads();
 }
 
@@ -4942,6 +5816,7 @@ function clearSchedule() {
     persistSchedule();
     renderTimeline();
     renderCalendar();
+    renderClipTray();
     toast('Schedule cleared', 'success');
 }
 
@@ -5010,6 +5885,24 @@ function uploadOverdueNow() {
     }
 }
 
+function clearStaleScheduleUi() {
+    const summaryEl = document.getElementById('smart-sched-summary');
+    if (summaryEl) summaryEl.textContent = '';
+
+    const schedulerBar = document.getElementById('scheduler-bar');
+    if (schedulerBar) schedulerBar.classList.add('hidden');
+    const schedulerText = document.getElementById('scheduler-status-text');
+    if (schedulerText) schedulerText.textContent = 'Local Upload Watcher active';
+
+    const missedBanner = document.getElementById('missed-uploads-banner');
+    if (missedBanner) missedBanner.classList.add('hidden');
+
+    _cachedNextUpload = null;
+    _nextUploadCacheTime = 0;
+    removeNotificationsByType('uploading');
+    renderUploadSummary();
+}
+
 function dismissMissedBanner() {
     document.getElementById('missed-uploads-banner').classList.add('hidden');
 }
@@ -5073,7 +5966,7 @@ function pickClipForDate(clipIdx) {
     if (!clip) return;
 
     const title = clip.filename.replace(/\.mp4$/i, '');
-    const channelId = state.selectedChannel || null;
+    const channelId = _getScheduleChannelId() || state.selectedChannel || null;
     const scheduledAt = _resolveSchedulableDateTime(dateStr, time);
     state.scheduled.push({
         ...clipIdentityFields(clip, clipIdx),
@@ -5113,6 +6006,7 @@ function openMetaModal(schedIdx) {
 
     document.getElementById('meta-modal-title').textContent = `Clip ${item.clipIdx + 1} — ${item.date}`;
     document.getElementById('modal-meta-title').value = item.title;
+    document.getElementById('modal-meta-creator-context').value = item.creator_title_context || creatorTitleContextForClip(item.clipIdx) || '';
     document.getElementById('modal-meta-desc').value = item.description_custom_text || '';
     document.getElementById('modal-meta-tags').value = item.tags;
     document.getElementById('modal-meta-privacy').value = item.privacy;
@@ -5132,6 +6026,7 @@ function updateMetaDescriptionPreview() {
     if (!preview || idx < 0 || !state.scheduled[idx]) return;
     const item = { ...state.scheduled[idx] };
     item.title = document.getElementById('modal-meta-title')?.value || item.title || 'Untitled';
+    item.creator_title_context = (document.getElementById('modal-meta-creator-context')?.value || '').trim();
     item.description_custom_text = document.getElementById('modal-meta-desc')?.value || '';
     item.description_generated = item.description_generated || item.generated_description || item.title;
     updateScheduledDescriptionPreview(item);
@@ -5144,8 +6039,12 @@ function saveMetaModal() {
 
     const item = state.scheduled[idx];
     item.title = document.getElementById('modal-meta-title').value || 'Untitled';
+    const previousContext = String(item.creator_title_context || '').trim();
+    item.creator_title_context = (document.getElementById('modal-meta-creator-context')?.value || '').trim();
     item.description_custom_text = document.getElementById('modal-meta-desc').value || '';
-    item.description_generated = item.description_generated || item.generated_description || item.title;
+    item.description_generated = previousContext !== item.creator_title_context
+        ? ''
+        : (item.description_generated || item.generated_description || item.title);
     item.generated_description = item.description_generated;
     item.tags = document.getElementById('modal-meta-tags').value;
     item.category_id = DEFAULT_CATEGORY_ID;
@@ -5214,7 +6113,8 @@ window.onClipDeleted = async function(clipIdx, filename) {
 };
 
 async function startUpload() {
-    if (!state.scheduled.length) return toast('Click "Schedule All Clips" to create a schedule first', 'warning');
+    await refreshScheduleFromBackend(true);
+    if (!state.scheduled.length) return toast('Add clips to the calendar first', 'warning');
 
     state.scheduled = normalizeScheduledMetadata(state.scheduled);
     const pending = state.scheduled
@@ -5228,6 +6128,9 @@ async function startUpload() {
 
     if (pending.some(s => !s._scheduledDate)) {
         return toast('One or more scheduled clips has an invalid date or time', 'error');
+    }
+    if (pending.some(s => scheduleItemStatus(s).key === 'unknown')) {
+        return toast('A clip may already have been sent. Check YouTube Studio, then remove or reschedule it before sending again.', 'error');
     }
 
     const clipsMetadata = pending.map(s => ({
@@ -5244,6 +6147,7 @@ async function startUpload() {
         description_custom_text: s.description_custom_text || '',
         description_auto_hashtags: s.description_auto_hashtags !== false,
         game_title: s.game_title || '',
+        creator_title_context: s.creator_title_context || '',
         tags: (s.tags || '').split(',').map(t => t.trim()).filter(Boolean),
         category_id: DEFAULT_CATEGORY_ID,
         privacy: s.privacy || 'private',
@@ -5256,8 +6160,12 @@ async function startUpload() {
     if (!clipsMetadata.every(meta => meta.account_id)) return toast('Please select a YouTube channel first', 'warning');
     if (!clipsMetadata.every(meta => meta.publish_at)) return toast('Scheduled clips need a valid publish time', 'error');
     const now = new Date();
-    if (pending.some(s => s.privacy === 'public' && s._scheduledDate <= now)) {
-        return toast('One or more public uploads is scheduled in the past. Reschedule missed uploads first.', 'error');
+    const minPublicPublishDate = new Date(now.getTime() + SCHEDULE_BUFFER_MINUTES * 60 * 1000);
+    if (
+        pending.some(s => s.privacy === 'public' && s._scheduledDate <= now) ||
+        pending.some(s => s.privacy === 'public' && s._scheduledDate <= minPublicPublishDate)
+    ) {
+        return toast(`Public uploads need a publish time at least ${SCHEDULE_BUFFER_MINUTES} minutes from now. Reschedule missed uploads first.`, 'error');
     }
 
     try {
@@ -5615,6 +6523,21 @@ function updateNotification(id, updates) {
     if (updates.desc !== undefined) notif.desc = updates.desc;
     if (updates.type !== undefined) notif.type = updates.type;
     if (updates.progress !== undefined) notif.progress = updates.progress;
+    _renderNotifList();
+}
+
+function removeNotificationsByType(type) {
+    let removedAny = false;
+    let removedUnread = 0;
+    for (let i = _notifications.length - 1; i >= 0; i--) {
+        if (_notifications[i].type !== type) continue;
+        removedAny = true;
+        if (_notifications[i].unread) removedUnread++;
+        _notifications.splice(i, 1);
+    }
+    if (!removedAny) return;
+    _notifUnreadCount = Math.max(0, _notifUnreadCount - removedUnread);
+    _updateNotifBadge();
     _renderNotifList();
 }
 

@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -68,6 +69,35 @@ class MediaTimeoutTests(unittest.TestCase):
                 clipper._log_ffmpeg_command("Crop render", cmd)
 
         self.assertIn("ffmpeg -i input.mp4 out.mp4", out.getvalue())
+
+    def test_rename_safe_replaces_existing_output_without_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "new.mp4"
+            dst = root / "clip.mp4"
+            src.write_bytes(b"new")
+            dst.write_bytes(b"old")
+
+            with patch.object(Path, "unlink", side_effect=AssertionError("should not pre-delete output")):
+                clipper._rename_safe(src, dst)
+
+            self.assertEqual(dst.read_bytes(), b"new")
+            self.assertFalse(src.exists())
+
+    def test_rename_safe_failure_preserves_existing_output_and_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "new.mp4"
+            dst = root / "clip.mp4"
+            src.write_bytes(b"new")
+            dst.write_bytes(b"old")
+
+            with patch("clipper.os.replace", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    clipper._rename_safe(src, dst)
+
+            self.assertEqual(dst.read_bytes(), b"old")
+            self.assertEqual(src.read_bytes(), b"new")
 
     def test_subprocess_timeout_preserves_partial_output(self):
         subprocess_utils.reset_cancel()

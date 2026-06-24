@@ -28,6 +28,9 @@ if errorlevel 1 exit /b 1
 venv\Scripts\python.exe scripts\check_dependency_pins.py
 if errorlevel 1 exit /b 1
 
+venv\Scripts\python.exe scripts\check_release_compliance.py --require-exists dist\ViriaRevive
+if errorlevel 1 exit /b 1
+
 venv\Scripts\python.exe scripts\check_release_safety.py --require-exists dist\ViriaRevive
 if errorlevel 1 exit /b 1
 
@@ -50,8 +53,13 @@ if "%ISCC_EXE%"=="" (
     exit /b 1
 )
 
-if exist "release\ViriaReviveSetup-v%APP_VERSION%.exe" del /Q "release\ViriaReviveSetup-v%APP_VERSION%.exe"
-if exist "release\ViriaReviveSetup-v%APP_VERSION%.exe.sha256" del /Q "release\ViriaReviveSetup-v%APP_VERSION%.exe.sha256"
+echo [*] Clearing old installer artifacts...
+for %%F in (
+    release\ViriaReviveSetup-v*.exe
+    release\ViriaReviveSetup-v*.exe.sha256
+) do (
+    if exist "%%~F" del /Q "%%~F"
+)
 
 echo [*] Using Inno Setup compiler: %ISCC_EXE%
 "%ISCC_EXE%" /Q /DMyAppVersion=%APP_VERSION% /DMyAppVersionQuad=%APP_VERSION_QUAD% installer\ViriaRevive.iss

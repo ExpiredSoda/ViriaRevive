@@ -89,7 +89,8 @@ def get_crop_params(video_path: Path, start: int, end: int,
 
 
 def get_crop_params_dynamic(video_path: Path, start: int, end: int,
-                            target_ratio: float = 9 / 16, sample_count: int = 50):
+                            target_ratio: float = 9 / 16, sample_count: int = 50,
+                            min_sample_rate: float = 4.0):
     """Return (crop_w, crop_h, keyframes) or None if already vertical.
 
     Dynamic crop — tracks the active person per-window with stable cuts.
@@ -115,7 +116,15 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
         pan_axis = "y"
 
     # Get per-frame person tracking data
-    detections, scale_x, scale_y = _detect_all_persons(video_path, start, end, width, height, sample_count)
+    detections, scale_x, scale_y = _detect_all_persons(
+        video_path,
+        start,
+        end,
+        width,
+        height,
+        sample_count,
+        min_sample_rate=min_sample_rate,
+    )
 
     if len(detections) < 3:
         # Too few detections — use what we have as static fallback
@@ -394,7 +403,7 @@ def _read_frame_at(cv2, video_path: Path, seconds: float, timeout=5.0):
     return frame is not None, frame
 
 
-def _detect_all_persons(video_path, start, end, width, height, sample_count):
+def _detect_all_persons(video_path, start, end, width, height, sample_count, min_sample_rate=4.0):
     """Track persons across frames for dynamic cropping.
 
     Primary: YOLO person detection (catches ALL people regardless of pose).
@@ -431,9 +440,11 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
             print("[i] Using Haar cascade face detector (fallback)")
 
     duration = max(1, end - start)
-    # Dense sampling — at least 4 samples per second for smooth tracking
-    effective_samples = max(sample_count, int(duration * 4))
-    step = max(0.25, duration / effective_samples)
+    # Dense sampling is caller-tuned by processing depth. Deep keeps the older
+    # 4fps behavior; Fast/Balanced use fewer samples to reduce ffmpeg launches.
+    min_sample_rate = max(0.5, float(min_sample_rate or 4.0))
+    effective_samples = max(sample_count, int(duration * min_sample_rate))
+    step = max(1.0 / min_sample_rate, duration / effective_samples)
     sample_times = list(_frange(0, duration, step))
     if not sample_times:
         sample_times = [0]
@@ -474,12 +485,15 @@ def _detect_all_persons(video_path, start, end, width, height, sample_count):
             raise CancelledError("Person detection cancelled")
 
         # Timeout-safe frame read — OpenCV can hang on corrupt frames
-        ok, frame = _read_frame_at(cv2, video_path, start + t, timeout=5.0)
-        if not ok and getattr(_read_frame_at, "last_status", "") == "timeout":
-            print("[!] Crop tracking frame read timed out -> using detections so far")
-            break
-        if not ok or frame is None:
-            continue
+        if abs(float(t)) < 0.001 and test_frame is not None:
+            ok, frame = True, test_frame
+        else:
+            ok, frame = _read_frame_at(cv2, video_path, start + t, timeout=5.0)
+            if not ok and getattr(_read_frame_at, "last_status", "") == "timeout":
+                print("[!] Crop tracking frame read timed out -> using detections so far")
+                break
+            if not ok or frame is None:
+                continue
 
         persons = []
 

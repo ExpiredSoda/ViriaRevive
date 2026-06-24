@@ -70,7 +70,7 @@
             </div>
 
             <div class="sidebar-footer">
-                <span class="version" id="app-version">v2.2.0</span>
+                <span class="version" id="app-version">v2.3.0</span>
                 <button class="ollama-status checking" id="ollama-status" onclick="refreshOllamaStatus()" title="Checking Ollama status">
                     <span class="ollama-dot"></span>
                     <span class="ollama-label">Ollama</span>
@@ -87,6 +87,21 @@
                     <div class="hero">
                         <h1>Create Viral Clips</h1>
                         <p class="subtitle">Paste a YouTube URL and let AI find the most engaging moments, add stylish subtitles, and export ready-to-post 9:16 clips.</p>
+                    </div>
+
+                    <div id="ffmpeg-status-card" class="setup-status-card ffmpeg-setup-card hidden" role="status" aria-live="polite">
+                        <div class="setup-status-icon">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3V9z"/></svg>
+                        </div>
+                        <div class="setup-status-copy">
+                            <strong id="ffmpeg-status-state">FFmpeg setup needed</strong>
+                            <span id="ffmpeg-status-detail">Install FFmpeg or place ffmpeg.exe and ffprobe.exe in the app bin folder.</span>
+                        </div>
+                        <div class="setup-status-actions">
+                            <button class="btn-secondary btn-sm" data-ffmpeg-recheck onclick="refreshFfmpegDependencies()">Recheck</button>
+                            <button class="btn-secondary btn-sm" onclick="openFfmpegDownload()">Download</button>
+                            <button class="btn-secondary btn-sm" onclick="openAppBinFolder()">App Bin</button>
+                        </div>
                     </div>
 
                     <div class="url-input-card card card-glow">
@@ -248,6 +263,14 @@
                         </button>
                     </div>
                 </div>
+                <div class="results-toolbar">
+                    <div class="library-bulk-actions" id="results-bulk-actions">
+                        <span id="results-selected-count">0 selected</span>
+                        <button class="btn-secondary btn-sm" id="results-select-visible" onclick="selectVisibleResults()" disabled>Select visible</button>
+                        <button class="btn-secondary btn-sm" id="results-clear-selected" onclick="clearResultsSelection()" disabled>Clear</button>
+                        <button class="btn-danger btn-sm" id="results-delete-selected" onclick="requestDeleteSelectedResults()" disabled>Delete selected</button>
+                    </div>
+                </div>
                 <div id="results-moment-filters" class="moment-filter-bar hidden" aria-label="Result moment filters"></div>
                 <div id="results-grid" class="results-grid">
                     <div class="empty-state" id="results-empty">
@@ -360,6 +383,12 @@
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
                         </button>
                     </div>
+                    <div class="library-bulk-actions" id="library-bulk-actions">
+                        <span id="library-selected-count">0 selected</span>
+                        <button class="btn-secondary btn-sm" id="library-select-visible" onclick="selectVisibleLibrary()" disabled>Select visible</button>
+                        <button class="btn-secondary btn-sm" id="library-clear-selected" onclick="clearLibrarySelection()" disabled>Clear</button>
+                        <button class="btn-danger btn-sm" id="library-delete-selected" onclick="requestDeleteSelectedLibrary()" disabled>Delete selected</button>
+                    </div>
                 </div>
                 <div id="library-moment-filters" class="moment-filter-bar hidden" aria-label="Library moment filters"></div>
 
@@ -393,244 +422,306 @@
                     </div>
                     <p>No clips to upload</p>
                     <span>Generate clips first, or drop video files into the clips folder</span>
-                    <button class="btn-secondary btn-sm" style="margin-top:12px" onclick="openFolder()">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                        Open Clips Folder
-                    </button>
+                    <div class="empty-state-actions">
+                        <button class="btn-primary btn-sm" onclick="refreshUploadClips()">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                            Refresh / Import
+                        </button>
+                        <button class="btn-secondary btn-sm" onclick="openFolder()">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                            Open Clips Folder
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Upload content -->
                 <div id="upload-content" class="upload-content hidden">
-                    <!-- YouTube Connection -->
-                    <div class="card yt-connect-card">
-                        <div class="yt-connect-header">
-                            <div class="yt-connect-info">
-                                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.43z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/></svg>
-                                <div>
-                                    <h3>YouTube Accounts</h3>
-                                    <span id="yt-status-text" class="yt-status-text">No accounts connected</span>
+                    <div class="upload-top-grid">
+                        <!-- YouTube Connection -->
+                        <div id="yt-connect-card" class="card yt-connect-card">
+                            <div class="yt-connect-header">
+                                <div class="yt-connect-info">
+                                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19.13C5.12 19.56 12 19.56 12 19.56s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.43z"/><polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/></svg>
+                                    <div>
+                                        <h3>YouTube Accounts</h3>
+                                        <span id="yt-status-text" class="yt-status-text">No accounts connected</span>
+                                    </div>
+                                </div>
+                                <div class="yt-connect-actions">
+                                    <button class="btn-secondary btn-sm" id="btn-yt-connect" onclick="connectYouTube()">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                        Add Account
+                                    </button>
                                 </div>
                             </div>
-                            <div class="yt-connect-actions">
-                                <button class="btn-secondary btn-sm" id="btn-yt-connect" onclick="connectYouTube()">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                                    Add Account
+                            <div id="yt-channel-area" class="yt-channel-area hidden">
+                                <div id="yt-channel-list" class="yt-channel-list"></div>
+                            </div>
+                            <div id="yt-setup-card" class="yt-setup-card hidden">
+                                <div>
+                                    <strong>YouTube needs your OAuth file</strong>
+                                    <span id="yt-setup-message">Add a Desktop app OAuth JSON named <code>client_secrets.json</code> to the app data folder. Keep the OAuth app in Testing and add yourself as a test user.</span>
+                                </div>
+                                <div class="yt-setup-actions">
+                                    <button class="btn-secondary btn-sm" onclick="openYouTubeOAuthConsole()">Open Google Credentials</button>
+                                    <button class="btn-secondary btn-sm" onclick="openDataFolder()">Open Data Folder</button>
+                                    <button class="btn-secondary btn-sm" onclick="showYouTubeSetup()">Setup Guide</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Smart Schedule — one panel does everything -->
+                        <div id="smart-schedule-card" class="smart-schedule card">
+                            <div class="smart-sched-header">
+                                <h3>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                    Smart Schedule
+                                </h3>
+                                <span id="smart-sched-summary" class="smart-sched-summary"></span>
+                            </div>
+
+                            <!-- Clips per day presets -->
+                            <div class="smart-presets">
+                                <button class="smart-preset active" data-preset="allpeaks" onclick="setSmartPreset('allpeaks')">
+                                    <span class="smart-preset-icon">MAX</span>
+                                    <span>All Peak Slots</span>
+                                </button>
+                                <button class="smart-preset" data-preset="1perday" onclick="setSmartPreset('1perday')">
+                                    <span class="smart-preset-icon">1/d</span>
+                                    <span>1 per day</span>
+                                </button>
+                                <button class="smart-preset" data-preset="2perday" onclick="setSmartPreset('2perday')">
+                                    <span class="smart-preset-icon">2/d</span>
+                                    <span>2 per day</span>
+                                </button>
+                                <button class="smart-preset" data-preset="3perday" onclick="setSmartPreset('3perday')">
+                                    <span class="smart-preset-icon">3/d</span>
+                                    <span>3 per day</span>
+                                </button>
+                                <button class="smart-preset" data-preset="5perday" onclick="setSmartPreset('5perday')">
+                                    <span class="smart-preset-icon">5/d</span>
+                                    <span>5 per day</span>
+                                </button>
+                                <button class="smart-preset" data-preset="custom" onclick="setSmartPreset('custom')">
+                                    <span class="smart-preset-icon">...</span>
+                                    <span>Custom</span>
                                 </button>
                             </div>
-                        </div>
-                        <div id="yt-channel-area" class="yt-channel-area hidden">
-                            <div id="yt-channel-list" class="yt-channel-list"></div>
-                        </div>
-                        <div id="yt-setup-card" class="yt-setup-card hidden">
-                            <div>
-                                <strong>YouTube needs your OAuth file</strong>
-                                <span id="yt-setup-message">Add a Desktop app OAuth JSON named <code>client_secrets.json</code> to the app data folder. Keep the OAuth app in Testing and add yourself as a test user.</span>
-                            </div>
-                            <div class="yt-setup-actions">
-                                <button class="btn-secondary btn-sm" onclick="openYouTubeOAuthConsole()">Open Google Credentials</button>
-                                <button class="btn-secondary btn-sm" onclick="openDataFolder()">Open Data Folder</button>
-                                <button class="btn-secondary btn-sm" onclick="showYouTubeSetup()">Setup Guide</button>
-                            </div>
-                        </div>
-                    </div>
 
-                    <!-- Smart Schedule — one panel does everything -->
-                    <div class="smart-schedule card">
-                        <div class="smart-sched-header">
-                            <h3>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                                Smart Schedule
-                            </h3>
-                            <span id="smart-sched-summary" class="smart-sched-summary"></span>
-                        </div>
-
-                        <!-- Clips per day presets -->
-                        <div class="smart-presets">
-                            <button class="smart-preset active" data-preset="allpeaks" onclick="setSmartPreset('allpeaks')">
-                                <span class="smart-preset-icon">MAX</span>
-                                <span>All Peak Slots</span>
-                            </button>
-                            <button class="smart-preset" data-preset="1perday" onclick="setSmartPreset('1perday')">
-                                <span class="smart-preset-icon">1/d</span>
-                                <span>1 per day</span>
-                            </button>
-                            <button class="smart-preset" data-preset="2perday" onclick="setSmartPreset('2perday')">
-                                <span class="smart-preset-icon">2/d</span>
-                                <span>2 per day</span>
-                            </button>
-                            <button class="smart-preset" data-preset="3perday" onclick="setSmartPreset('3perday')">
-                                <span class="smart-preset-icon">3/d</span>
-                                <span>3 per day</span>
-                            </button>
-                            <button class="smart-preset" data-preset="5perday" onclick="setSmartPreset('5perday')">
-                                <span class="smart-preset-icon">5/d</span>
-                                <span>5 per day</span>
-                            </button>
-                            <button class="smart-preset" data-preset="custom" onclick="setSmartPreset('custom')">
-                                <span class="smart-preset-icon">...</span>
-                                <span>Custom</span>
-                            </button>
-                        </div>
-
-                        <!-- Peak times info + options row -->
-                        <div class="peak-times-info">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                            <span>Auto-assigns proven YouTube peak times for maximum reach</span>
-                        </div>
-                        <div class="smart-options">
-                            <div class="smart-option-group">
-                                <label>Publish visibility</label>
-                                <select id="smart-sched-privacy">
-                                    <option value="public" selected>Public at scheduled time</option>
-                                    <option value="private">Private upload</option>
-                                    <option value="unlisted">Unlisted upload</option>
-                                </select>
+                            <!-- Peak times info + options row -->
+                            <div class="peak-times-info">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                                <span>Auto-assigns proven YouTube peak times for maximum reach</span>
                             </div>
-                            <div class="smart-option-group smart-custom-interval hidden" id="smart-custom-interval">
-                                <label>Clips per day</label>
-                                <input type="number" id="smart-sched-custom-perday" value="4" min="1" max="20" style="width: 60px;">
-                            </div>
-                            <div class="smart-option-group">
-                                <label>Channel</label>
-                                <select id="smart-sched-channel">
-                                    <option value="">Select channel...</option>
-                                </select>
-                            </div>
-                            <div class="smart-option-group">
-                                <label>Start from</label>
-                                <select id="smart-sched-start">
-                                    <option value="tomorrow" selected>Tomorrow</option>
-                                    <option value="today">Today</option>
-                                </select>
-                            </div>
-                            <button class="btn-primary smart-schedule-btn" onclick="autoScheduleClips()">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-                                Schedule All Clips
-                            </button>
-                        </div>
-
-                        <!-- Peak times legend (dynamic) -->
-                        <div class="peak-times-legend">
-                            <span class="peak-label">Peak slots used:</span>
-                            <span id="peak-times-slots"></span>
-                        </div>
-                    </div>
-
-                    <!-- Missed uploads banner (hidden by default) -->
-                    <div id="missed-uploads-banner" class="missed-uploads-banner hidden">
-                        <div class="missed-banner-left">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-                            <span id="missed-uploads-text">Some scheduled uploads were missed</span>
-                        </div>
-                        <div class="missed-banner-actions">
-                            <button class="btn-secondary btn-sm" onclick="rescheduleOverdue()">Reschedule</button>
-                            <button class="btn-primary btn-sm" onclick="uploadOverdueNow()">Upload Now</button>
-                            <button class="missed-dismiss" onclick="dismissMissedBanner()">&times;</button>
-                        </div>
-                    </div>
-
-                    <!-- Calendar + Clip Tray for manual scheduling -->
-                    <div class="calendar-layout">
-                        <div class="clip-tray card">
-                            <h3>Your Clips</h3>
-                            <p class="clip-tray-hint">Drag onto calendar dates</p>
-                            <div id="clip-tray-list" class="clip-tray-list"></div>
-                        </div>
-                        <div class="calendar-area card">
-                            <!-- Channel filter tabs -->
-                            <div id="cal-channel-tabs" class="cal-channel-tabs hidden">
-                                <button class="cal-ch-tab active" data-channel="all" onclick="filterCalendarByChannel('all')">All Channels</button>
-                            </div>
-                            <div class="cal-header">
-                                <button class="cal-nav" onclick="calNavMonth(-1)">&lt;</button>
-                                <h3 id="cal-month-label"></h3>
-                                <button class="cal-nav" onclick="calNavMonth(1)">&gt;</button>
-                                <button class="cal-today-btn" onclick="calGoToday()">Today</button>
-                            </div>
-                            <div class="cal-grid">
-                                <div class="cal-weekdays">
-                                    <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+                            <div class="smart-options">
+                                <div class="smart-option-group">
+                                    <label>Publish visibility</label>
+                                    <select id="smart-sched-privacy" onchange="renderUploadSummary()">
+                                        <option value="public" selected>Public at scheduled time</option>
+                                        <option value="private">Private upload</option>
+                                        <option value="unlisted">Unlisted upload</option>
+                                    </select>
                                 </div>
-                                <div id="cal-days" class="cal-days"></div>
+                                <div class="smart-option-group smart-custom-interval hidden" id="smart-custom-interval">
+                                    <label>Clips per day</label>
+                                    <input type="number" id="smart-sched-custom-perday" value="4" min="1" max="20" style="width: 60px;" oninput="_renderPeakTimesLegend(); renderUploadSummary()">
+                                </div>
+                                <div class="smart-option-group">
+                                    <label>Channel</label>
+                                    <select id="smart-sched-channel" onchange="renderUploadSummary()">
+                                        <option value="">Select channel...</option>
+                                    </select>
+                                </div>
+                                <div class="smart-option-group">
+                                    <label>Start from</label>
+                                    <select id="smart-sched-start" onchange="renderUploadSummary()">
+                                        <option value="tomorrow" selected>Tomorrow</option>
+                                        <option value="today">Today</option>
+                                    </select>
+                                </div>
+                                <button class="btn-primary smart-schedule-btn" onclick="autoScheduleClips()">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                                    Queue Clips on Calendar
+                                </button>
                             </div>
-                            <div class="cal-legend">
-                                <span class="cal-legend-item"><span class="cal-legend-dot pending"></span> Pending</span>
-                                <span class="cal-legend-item"><span class="cal-legend-dot uploaded"></span> Uploaded</span>
-                                <span class="cal-legend-item"><span class="cal-legend-dot missed"></span> Missed</span>
+
+                            <!-- Peak times legend (dynamic) -->
+                            <div class="peak-times-legend">
+                                <span class="peak-label">Peak slots used:</span>
+                                <span id="peak-times-slots"></span>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Upload Plan timeline -->
-                    <div id="schedule-timeline" class="schedule-timeline hidden">
-                        <div class="timeline-header">
-                            <h3>Upload Plan</h3>
-                            <div class="timeline-actions">
-                                <button class="btn-text btn-sm btn-danger-text" onclick="clearSchedule()">Clear All</button>
+                    <div id="upload-readiness-strip" class="upload-readiness-strip" aria-label="Upload readiness"></div>
+
+                    <div class="upload-layout">
+                        <div class="upload-main">
+                            <!-- Missed uploads banner (hidden by default) -->
+                            <div id="missed-uploads-banner" class="missed-uploads-banner hidden">
+                                <div class="missed-banner-left">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                                    <span id="missed-uploads-text">Some calendar send times were missed</span>
+                                </div>
+                                <div class="missed-banner-actions">
+                                    <button class="btn-secondary btn-sm" onclick="rescheduleOverdue()">Reschedule</button>
+                                    <button class="btn-primary btn-sm" onclick="uploadOverdueNow()">Upload Now</button>
+                                    <button class="missed-dismiss" onclick="dismissMissedBanner()">&times;</button>
+                                </div>
+                            </div>
+
+                            <!-- Calendar + Clip Tray for manual scheduling -->
+                            <div class="calendar-layout">
+                                <div id="clip-tray-card" class="clip-tray card">
+                                    <h3>Your Clips</h3>
+                                    <p class="clip-tray-hint">Drag clips onto calendar dates or use Smart Schedule</p>
+                                    <div class="clip-tray-tools">
+                                        <div class="library-search clip-tray-search">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                                            <input type="text" id="clip-tray-search" placeholder="Search clips or sources..." oninput="filterClipTray()">
+                                        </div>
+                                        <span id="clip-tray-summary" class="clip-tray-summary"></span>
+                                    </div>
+                                    <div id="clip-tray-list" class="clip-tray-list"></div>
+                                </div>
+                                <div id="calendar-area-card" class="calendar-area card">
+                                    <!-- Channel filter tabs -->
+                                    <div id="cal-channel-tabs" class="cal-channel-tabs hidden">
+                                        <button class="cal-ch-tab active" data-channel="all" onclick="filterCalendarByChannel('all')">All Channels</button>
+                                    </div>
+                                    <div class="cal-header">
+                                        <button class="cal-nav" onclick="calNavMonth(-1)">&lt;</button>
+                                        <h3 id="cal-month-label"></h3>
+                                        <button class="cal-nav" onclick="calNavMonth(1)">&gt;</button>
+                                        <button class="cal-today-btn" onclick="calGoToday()">Today</button>
+                                    </div>
+                                    <div class="cal-grid">
+                                        <div class="cal-weekdays">
+                                            <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+                                        </div>
+                                        <div id="cal-days" class="cal-days"></div>
+                                    </div>
+                                    <div class="cal-legend">
+                                        <span class="cal-legend-item"><span class="cal-legend-dot pending"></span> Pending locally</span>
+                                        <span class="cal-legend-item"><span class="cal-legend-dot sent"></span> Sent</span>
+                                        <span class="cal-legend-item"><span class="cal-legend-dot missed"></span> Needs attention</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Upload Plan timeline -->
+                            <div id="schedule-timeline" class="schedule-timeline hidden">
+                                <div class="timeline-header">
+                                    <h3>Calendar Plan</h3>
+                                    <div class="timeline-actions">
+                                        <button class="btn-text btn-sm btn-danger-text" onclick="clearSchedule()">Clear All</button>
+                                    </div>
+                                </div>
+                                <div id="timeline-list" class="timeline-list"></div>
                             </div>
                         </div>
-                        <div id="timeline-list" class="timeline-list"></div>
+
+                        <aside id="upload-review-panel" class="card upload-prep-panel">
+                            <div class="upload-prep-header">
+                                <div>
+                                    <h3>Upload Prep</h3>
+                                    <p id="upload-mode-note">Schedule clips, review metadata, then send them to YouTube.</p>
+                                </div>
+                                <span id="upload-review-status" class="upload-review-status">Not ready</span>
+                            </div>
+
+                            <div class="upload-summary-list" aria-label="Upload summary">
+                                <div class="upload-summary-row">
+                                    <span>Queue</span>
+                                    <strong id="upload-summary-clips">0 clips</strong>
+                                </div>
+                                <div class="upload-summary-row">
+                                    <span>Channel</span>
+                                    <strong id="upload-summary-channel">None selected</strong>
+                                </div>
+                                <div class="upload-summary-row">
+                                    <span>Visibility</span>
+                                    <strong id="upload-summary-visibility">Public</strong>
+                                </div>
+                                <div class="upload-summary-row">
+                                    <span>Start</span>
+                                    <strong id="upload-summary-start">Not scheduled</strong>
+                                </div>
+                                <div class="upload-summary-row">
+                                    <span>Span</span>
+                                    <strong id="upload-summary-span">No queued clips</strong>
+                                </div>
+                            </div>
+
+                            <!-- Upload progress -->
+                            <div id="upload-progress-card" class="upload-progress-card hidden">
+                                <div class="progress-header">
+                                    <span id="upload-status">Uploading...</span>
+                                    <span id="upload-percent">0%</span>
+                                </div>
+                                <div class="progress-bar"><div id="upload-fill" class="progress-fill" style="width: 0%"></div></div>
+                                <button class="btn-danger btn-sm" id="btn-cancel-upload" onclick="cancelUpload()" style="margin-top:10px">Stop Upload</button>
+                            </div>
+
+                            <!-- Upload options -->
+                            <div class="upload-options-card">
+                                <div class="upload-cleanup-option">
+                                    <label class="toggle" style="flex-shrink:0">
+                                        <input type="checkbox" id="auto-delete-toggle" onchange="toggleAutoDelete(this.checked)">
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                    <div>
+                                        <span style="font-size:13px;font-weight:500;color:var(--text-1)">Delete from PC after upload</span>
+                                        <span style="font-size:11px;color:var(--text-3);display:block">Auto-remove clips once successfully uploaded to YouTube</span>
+                                    </div>
+                                </div>
+                                <div class="upload-options-prep">
+                                    <div class="description-options-inline">
+                                        <div>
+                                            <span class="description-options-title">Descriptions</span>
+                                            <span class="description-options-status" id="description-options-status">Recommended hashtags on</span>
+                                        </div>
+                                        <label class="auto-check description-auto-check">
+                                            <input type="checkbox" id="desc-auto-hashtags-toggle" checked onchange="toggleDescriptionAutoHashtags(this.checked)">
+                                            Auto hashtags
+                                        </label>
+                                        <button class="btn-secondary btn-sm" onclick="openDescriptionDefaultsModal()">Custom Text...</button>
+                                    </div>
+                                    <div class="upload-options-actions">
+                                        <button class="btn-secondary btn-sm" onclick="refreshUploadClips()" title="Scan clips folder for new videos">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                                            Refresh Clips
+                                        </button>
+                                        <button class="btn-secondary btn-sm" id="btn-gen-ai-titles" onclick="generateAITitlesManual()" title="Generate AI titles for all clips and rename files">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                                            Generate AI Titles
+                                        </button>
+                                        <button class="btn-secondary btn-sm" onclick="toggleGlobalConsole()" title="Show/hide log console">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                                            Console
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </aside>
                     </div>
 
-                    <!-- Upload progress -->
-                    <div id="upload-progress-card" class="card hidden">
-                        <div class="progress-header">
-                            <span id="upload-status">Uploading...</span>
-                            <span id="upload-percent">0%</span>
+                    <div class="upload-action-bar">
+                        <div class="upload-action-summary">
+                            <strong id="upload-action-title">No clips queued</strong>
+                            <span id="upload-action-detail">Schedule clips before sending them to YouTube.</span>
                         </div>
-                        <div class="progress-bar"><div id="upload-fill" class="progress-fill" style="width: 0%"></div></div>
-                        <button class="btn-danger btn-sm" id="btn-cancel-upload" onclick="cancelUpload()" style="margin-top:10px">Stop Upload</button>
-                    </div>
-
-                    <!-- Upload options -->
-                    <div class="card upload-options-card" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;gap:12px;flex-wrap:wrap">
-                        <div style="display:flex;align-items:center;gap:10px">
-                            <label class="toggle" style="flex-shrink:0">
-                                <input type="checkbox" id="auto-delete-toggle" onchange="toggleAutoDelete(this.checked)">
-                                <span class="toggle-slider"></span>
-                            </label>
-                            <div>
-                                <span style="font-size:13px;font-weight:500;color:var(--text-1)">Delete from PC after upload</span>
-                                <span style="font-size:11px;color:var(--text-3);display:block">Auto-remove clips once successfully uploaded to YouTube</span>
-                            </div>
-                        </div>
-                        <div class="description-options-inline">
-                            <div>
-                                <span class="description-options-title">Descriptions</span>
-                                <span class="description-options-status" id="description-options-status">Recommended hashtags on</span>
-                            </div>
-                            <label class="auto-check description-auto-check">
-                                <input type="checkbox" id="desc-auto-hashtags-toggle" checked onchange="toggleDescriptionAutoHashtags(this.checked)">
-                                Auto hashtags
-                            </label>
-                            <button class="btn-secondary btn-sm" onclick="openDescriptionDefaultsModal()">Custom Text...</button>
-                        </div>
-                        <div style="display:flex;gap:8px;flex-wrap:wrap">
-                            <button class="btn-secondary btn-sm" onclick="refreshUploadClips()" title="Scan clips folder for new videos">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                                Refresh Clips
+                        <div class="upload-action-controls">
+                            <button class="btn-secondary btn-preview-queue" onclick="focusUploadReadiness('schedule')" title="Jump to the calendar plan">Preview Queue</button>
+                            <button class="btn-primary btn-upload-go" id="btn-upload" onclick="startUpload()" title="Send pending clips to YouTube now with each clip's calendar publish time">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                    <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                                </svg>
+                                Send Scheduled Clips to YouTube
                             </button>
-                            <button class="btn-secondary btn-sm" id="btn-gen-ai-titles" onclick="generateAITitlesManual()" title="Generate AI titles for all clips and rename files">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-                                Generate AI Titles
-                            </button>
-                            <button class="btn-secondary btn-sm" onclick="toggleGlobalConsole()" title="Show/hide log console">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-                                Console
-                            </button>
                         </div>
                     </div>
-
-                    <!-- Big upload button -->
-                    <button class="btn-primary btn-upload-go" id="btn-upload" onclick="startUpload()" title="Upload pending clips to YouTube now with each clip's calendar publish time">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                            <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-                        </svg>
-                        Upload Scheduled Posts to YouTube
-                    </button>
-
-                    <p class="upload-hint">Public scheduled posts upload private first, then YouTube publishes them at their calendar time. Requires <code>client_secrets.json</code>. <a href="#" onclick="showYouTubeSetup()">Setup guide</a></p>
                 </div>
             </section>
 
@@ -921,7 +1012,7 @@
                         </h3>
                         <div class="setting-row">
                             <p style="color:var(--text-2);font-size:12.5px;line-height:1.6">
-                                <strong id="about-app-title">ViriaRevive v2.2.0</strong> turns long gameplay videos into short vertical clips.
+                                <strong id="about-app-title">ViriaRevive v2.3.0</strong> turns long gameplay videos into short vertical clips.
                                 This fork focuses on transcript-aware detection, multi-track audio, optional subtitles, local learning, local Ollama titles and AI moment labels, and optional YouTube scheduling.
                             </p>
                         </div>
@@ -973,7 +1064,9 @@
         <div class="modal-content card">
             <h2>FFmpeg Not Found</h2>
             <p>ViriaRevive requires both <strong>ffmpeg</strong> and <strong>ffprobe</strong>. Install FFmpeg from <strong>ffmpeg.org</strong>, add it to your system PATH, or place both executables in the app's <strong>bin</strong> folder.</p>
+            <p class="setup-copy" id="ffmpeg-modal-status">Recheck after installing both executables.</p>
             <div class="modal-actions">
+                <button class="btn-secondary" data-ffmpeg-recheck onclick="refreshFfmpegDependencies()">Recheck</button>
                 <button class="btn-secondary" onclick="openFfmpegDownload()">Open FFmpeg Download</button>
                 <button class="btn-secondary" onclick="openAppBinFolder()">Open App Bin Folder</button>
                 <button class="btn-primary" onclick="closeModal('ffmpeg-modal')">Got it</button>
@@ -1223,6 +1316,11 @@
                     <input type="text" class="form-input" id="modal-meta-title" maxlength="100" oninput="updateMetaDescriptionPreview()">
                 </div>
                 <div class="meta-field">
+                    <label>Optional AI Notes <span class="optional">(not uploaded)</span></label>
+                    <textarea class="form-input" id="modal-meta-creator-context" rows="2" maxlength="420" placeholder="Example: blind Alan Wake run in the nursing home chapter..." oninput="updateMetaDescriptionPreview()"></textarea>
+                    <span class="setting-hint">Helps AI titles understand the session. It is stored locally and not copied into the description.</span>
+                </div>
+                <div class="meta-field">
                     <label>Custom Description Text <span class="optional">(optional)</span></label>
                     <textarea class="form-input" id="modal-meta-desc" rows="3" placeholder="Add sponsor copy, socials, or a creator note..." oninput="updateMetaDescriptionPreview()"></textarea>
                     <span class="setting-hint">Added below the generated clip summary. AI metadata refreshes will not replace this text.</span>
@@ -1261,6 +1359,25 @@
             <div class="meta-modal-actions">
                 <button class="btn-danger btn-sm" onclick="removeScheduledItem()">Remove</button>
                 <button class="btn-primary" onclick="saveMetaModal()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Source AI notes modal -->
+    <div id="source-context-modal" class="modal hidden">
+        <div class="modal-content card meta-modal-body source-context-body">
+            <div class="meta-modal-header">
+                <h2 id="source-context-title">Optional AI Notes</h2>
+                <button class="meta-modal-close" onclick="closeModal('source-context-modal')">&times;</button>
+            </div>
+            <p class="source-context-copy">Give title generation a little local context about this source or session. These notes guide AI titles and metadata, but they are not uploaded or copied into descriptions.</p>
+            <div class="meta-field">
+                <label for="source-context-text">Session notes</label>
+                <textarea class="form-input" id="source-context-text" rows="5" maxlength="420" placeholder="Example: blind Alan Wake run in the nursing home chapter, mostly exploring and getting jumped by Taken."></textarea>
+            </div>
+            <div class="meta-modal-actions">
+                <button class="btn-secondary btn-sm" onclick="closeModal('source-context-modal')">Cancel</button>
+                <button class="btn-primary btn-sm" onclick="saveSourceTitleContextModal()">Save Notes</button>
             </div>
         </div>
     </div>
@@ -1723,7 +1840,7 @@
     <!-- Scheduler status bar -->
     <div id="scheduler-bar" class="scheduler-bar hidden">
         <span class="scheduler-dot"></span>
-        <span id="scheduler-status-text">Scheduler active</span>
+        <span id="scheduler-status-text">Local Upload Watcher active</span>
     </div>
 
     <!-- Global console panel (accessible from any section) -->

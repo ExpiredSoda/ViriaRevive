@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,11 +57,37 @@ class UploadSchedulingTests(unittest.TestCase):
         }])
         self.assertEqual(len(ordered), 1)
 
+    def test_public_publish_time_inside_backend_buffer_rejected(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+        with self.assertRaisesRegex(ValueError, "at least 10 minutes"):
+            bridge._validate_upload_metadata([{"title": "Too soon", "privacy": "public", "publish_at": soon}])
+
+        ordered = bridge._validate_upload_metadata([{
+            "title": "Private soon",
+            "privacy": "private",
+            "publish_at": soon,
+        }])
+        self.assertEqual(len(ordered), 1)
+
     def test_public_upload_requires_publish_at(self):
         bridge = ApiBridge.__new__(ApiBridge)
 
         with self.assertRaises(ValueError):
             bridge._validate_upload_metadata([{"title": "No schedule", "privacy": "public"}])
+
+    def test_normalize_upload_history_defaults_corrupt_schema_version(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+
+        normalized = bridge._normalize_upload_history([
+            {"schema_version": "bad", "youtube_id": "yt-1"},
+            {"schema_version": None, "youtube_id": "yt-2"},
+            "not a row",
+        ])
+
+        self.assertEqual([row["schema_version"] for row in normalized], [1, 1])
+        self.assertEqual([row["youtube_id"] for row in normalized], ["yt-1", "yt-2"])
 
     def test_active_upload_checks_metadata_channel_id(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -111,6 +138,306 @@ class UploadSchedulingTests(unittest.TestCase):
             "title": "Clip",
         }))
         self.assertFalse(bridge._scheduled[0].get("uploaded", False))
+
+    def test_mark_uploaded_records_upload_history(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1", "source_id": "source-1", "source_stem": "source"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._upload_history = []
+        bridge._save_state = lambda: None
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "source_id": "source-1",
+            "title": "Clip",
+            "privacy": "public",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "uploaded": False,
+        }]
+
+        changed = bridge._mark_scheduled_uploaded(0, {
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "privacy": "public",
+            "publish_at": "2026-06-24T13:00:00Z",
+        }, {"id": "yt-123", "url": "https://youtu.be/yt-123"})
+
+        self.assertTrue(changed)
+        self.assertTrue(bridge._scheduled[0]["uploaded"])
+        self.assertEqual(bridge._scheduled[0]["youtube_id"], "yt-123")
+        self.assertEqual(bridge._scheduled[0]["upload_state"], "youtube_scheduled")
+        self.assertEqual(len(bridge._upload_history), 1)
+        self.assertEqual(bridge._upload_history[0]["youtube_id"], "yt-123")
+        self.assertEqual(bridge._upload_history[0]["status"], "youtube_scheduled")
+
+    def test_upload_attempt_marker_is_saved_before_youtube_upload_and_cleared_on_success(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1", "source_id": "source-1"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._upload_history = []
+        saves = []
+        bridge._save_state = lambda: saves.append(True)
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "privacy": "private",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "uploaded": False,
+        }]
+
+        attempt_id = bridge._begin_scheduled_upload_attempt(0, {
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+        }, trigger="manual")
+
+        self.assertTrue(attempt_id)
+        self.assertTrue(saves)
+        self.assertEqual(bridge._scheduled[0]["scheduler_status"], "uploading")
+        self.assertEqual(bridge._scheduled[0]["upload_attempt_id"], attempt_id)
+        self.assertEqual(bridge._scheduled[0]["upload_attempt_trigger"], "manual")
+
+        bridge._mark_scheduled_uploaded(0, {
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "privacy": "private",
+        }, {"id": "yt-123"})
+
+        self.assertTrue(bridge._scheduled[0]["uploaded"])
+        self.assertNotIn("scheduler_status", bridge._scheduled[0])
+        self.assertNotIn("upload_attempt_id", bridge._scheduled[0])
+
+    def test_stale_upload_attempt_reopens_as_unknown_outcome_and_is_not_active(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "privacy": "private",
+            "uploaded": False,
+            "scheduler_status": "uploading",
+            "upload_attempt_id": "manual-old",
+            "upload_attempt_started_at": "2026-06-23T12:00:00Z",
+        }]
+
+        changed = bridge._reconcile_incomplete_upload_attempts(datetime(2026, 6, 23, 12, 5, tzinfo=timezone.utc))
+
+        self.assertTrue(changed)
+        self.assertEqual(bridge._scheduled[0]["scheduler_status"], "upload_outcome_unknown")
+        self.assertEqual(bridge._scheduled[0]["upload_unknown_at"], "2026-06-23T12:05:00Z")
+        self.assertIn("Check YouTube Studio", bridge._scheduled[0]["scheduler_note"])
+        self.assertFalse(bridge._scheduled_upload_active(0, {
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+        }))
+
+    def test_save_scheduled_preserves_backend_owned_status_fields(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{
+            "clip_id": "clip-1",
+            "source_id": "source-1",
+            "generated_metadata": {"generated_description": "stale old generated summary"},
+        }]
+        bridge._results = [Path("clip.mp4")]
+        bridge._state_lock = threading.RLock()
+        bridge._upload_history = []
+        bridge._user_settings = {}
+        saves = []
+        bridge._save_state = lambda: saves.append(True)
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "channel_id": "channel-a",
+            "account_id": "account-a",
+            "uploaded": True,
+            "uploaded_at": "2026-06-23T12:00:00Z",
+            "youtube_id": "yt-123",
+            "youtube_url": "https://youtu.be/yt-123",
+        }]
+
+        bridge.save_scheduled([{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "channel_id": "channel-a",
+            "account_id": "account-a",
+            "uploaded": False,
+        }])
+
+        self.assertTrue(saves)
+        self.assertTrue(bridge._scheduled[0]["uploaded"])
+        self.assertEqual(bridge._scheduled[0]["youtube_id"], "yt-123")
+
+    def test_save_scheduled_resets_upload_success_fields_when_slot_changes(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1", "source_id": "source-1"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._state_lock = threading.RLock()
+        bridge._upload_history = []
+        bridge._user_settings = {}
+        bridge._save_state = lambda: None
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "description": "desc",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "channel_id": "channel-a",
+            "account_id": "account-a",
+            "uploaded": True,
+            "uploaded_at": "2026-06-23T12:00:00Z",
+            "youtube_id": "yt-123",
+            "youtube_url": "https://youtu.be/yt-123",
+            "upload_state": "sent_to_youtube",
+            "send_status": "sent_to_youtube",
+        }]
+
+        bridge.save_scheduled([{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "description": "desc",
+            "date": "2026-06-25",
+            "time": "09:00",
+            "channel_id": "channel-a",
+            "account_id": "account-a",
+            "uploaded": True,
+            "uploaded_at": "2026-06-23T12:00:00Z",
+            "youtube_id": "yt-123",
+            "youtube_url": "https://youtu.be/yt-123",
+            "upload_state": "sent_to_youtube",
+            "send_status": "sent_to_youtube",
+        }])
+
+        item = bridge._scheduled[0]
+        self.assertFalse(item["uploaded"])
+        self.assertNotIn("uploaded_at", item)
+        self.assertNotIn("youtube_id", item)
+        self.assertNotIn("youtube_url", item)
+        self.assertNotIn("upload_state", item)
+        self.assertNotIn("send_status", item)
+
+    def test_save_scheduled_preserves_in_progress_upload_attempt_fields(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1", "source_id": "source-1"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._state_lock = threading.RLock()
+        bridge._upload_history = []
+        bridge._user_settings = {}
+        bridge._description_profile = lambda: {"custom_text": "", "auto_hashtags": True}
+        bridge._schedule_game_title = lambda item, idx: ""
+        bridge._title_context_for_clip = lambda idx: {}
+        bridge._compose_clip_description = lambda title, game_title, **kwargs: {
+            "description": title,
+            "final_description": title,
+            "generated_description": "",
+            "description_custom_text": "",
+            "description_auto_hashtags": True,
+            "recommended_hashtags": [],
+        }
+        bridge._save_state = lambda: None
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "uploaded": False,
+            "scheduler_status": "uploading",
+            "upload_attempt_id": "manual-abc",
+            "upload_attempt_started_at": "2026-06-23T12:00:00Z",
+            "upload_attempt_trigger": "manual",
+        }]
+
+        bridge.save_scheduled([{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Clip",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "uploaded": False,
+        }])
+
+        self.assertEqual(bridge._scheduled[0]["scheduler_status"], "uploading")
+        self.assertEqual(bridge._scheduled[0]["upload_attempt_id"], "manual-abc")
+        self.assertEqual(bridge._scheduled[0]["upload_attempt_trigger"], "manual")
+
+    def test_save_scheduled_preserves_creator_title_context(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._moments = [{"clip_id": "clip-1", "source_id": "source-1"}]
+        bridge._results = [Path("clip.mp4")]
+        bridge._state_lock = threading.RLock()
+        bridge._upload_history = []
+        bridge._user_settings = {}
+        bridge._description_profile = lambda: {"custom_text": "", "auto_hashtags": True}
+        bridge._schedule_game_title = lambda item, idx: ""
+        bridge._title_context_for_clip = lambda idx: {"creator_title_context": "chapter note"}
+        bridge._compose_clip_description = lambda title, game_title, **kwargs: {
+            "description": kwargs.get("generated_text") or title,
+            "final_description": kwargs.get("generated_text") or title,
+            "generated_description": kwargs.get("generated_text") or "",
+            "description_custom_text": "",
+            "description_auto_hashtags": True,
+            "recommended_hashtags": [],
+        }
+        bridge._save_state = lambda: None
+        bridge._scheduled = []
+
+        bridge.save_scheduled([{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "source_id": "source-1",
+            "title": "Clip",
+            "date": "2026-06-24",
+            "time": "09:00",
+            "creator_title_context": "  chapter note  ",
+            "description_generated": "",
+            "generated_description": "",
+        }])
+
+        self.assertEqual(bridge._scheduled[0]["creator_title_context"], "chapter note")
+        self.assertEqual(bridge._moments[0]["creator_title_context"], "chapter note")
+        self.assertEqual(bridge._scheduled[0]["description_generated"], "")
+
+    def test_reopen_marks_overdue_public_schedule_missed(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._scheduled = [{
+            "title": "Old Public",
+            "privacy": "public",
+            "date": "2026-06-22",
+            "time": "12:00",
+            "uploaded": False,
+        }]
+
+        changed = bridge._mark_overdue_public_schedules_missed(datetime(2026, 6, 22, 12, 11, 0))
+
+        self.assertTrue(changed)
+        self.assertEqual(bridge._scheduled[0]["scheduler_status"], "missed")
+        self.assertEqual(bridge._scheduled[0]["missed_at"], "2026-06-22T12:11:00")
 
     def test_legacy_schedule_without_identity_can_still_match_index(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -172,6 +499,45 @@ class UploadSchedulingTests(unittest.TestCase):
         self.assertEqual(bridge._scheduled[0].get("scheduler_status"), "missed")
         self.assertTrue(any("window.onScheduleUpdated()" in msg for msg in bridge._js_messages))
 
+    def test_scheduler_success_records_youtube_result_and_history(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._scheduler_running = True
+        bridge._scheduled = [{
+            "clipIdx": 0,
+            "clip_id": "clip-1",
+            "clip_filename": "clip.mp4",
+            "title": "Scheduler Clip",
+            "description": "desc",
+            "privacy": "private",
+            "date": "2026-06-22",
+            "time": "12:00",
+            "uploaded": False,
+        }]
+        bridge._results = [Path("clip.mp4")]
+        bridge._moments = [{"clip_id": "clip-1"}]
+        bridge._upload_history = []
+        bridge._processing = False
+        bridge._cancel = False
+        bridge._delete_after_upload = False
+        bridge._upload_lock = threading.Lock()
+        bridge._safe_clip_path = lambda path: Path(path)
+        bridge._save_state = lambda: None
+        bridge._js_messages = []
+        bridge._js = bridge._js_messages.append
+
+        def stop_after_first_loop(_seconds):
+            bridge._scheduler_running = False
+
+        with patch("api_bridge.time.sleep", side_effect=stop_after_first_loop):
+            with patch("api_bridge.upload_to_youtube", return_value={"id": "yt-456", "url": "https://youtu.be/yt-456"}):
+                bridge._scheduler_loop()
+
+        self.assertTrue(bridge._scheduled[0]["uploaded"])
+        self.assertEqual(bridge._scheduled[0]["youtube_id"], "yt-456")
+        self.assertEqual(bridge._scheduled[0]["upload_state"], "sent_to_youtube")
+        self.assertEqual(bridge._upload_history[0]["trigger"], "scheduler")
+        self.assertEqual(bridge._upload_history[0]["youtube_url"], "https://youtu.be/yt-456")
+
     def test_scheduler_skips_disconnected_account_items(self):
         bridge = ApiBridge.__new__(ApiBridge)
         bridge._scheduler_running = True
@@ -204,7 +570,12 @@ class UploadSchedulingTests(unittest.TestCase):
 
     def test_scheduled_upload_failure_sets_retry_backoff(self):
         bridge = ApiBridge.__new__(ApiBridge)
-        item = {"title": "Retry Me"}
+        item = {
+            "title": "Retry Me",
+            "scheduler_status": "uploading",
+            "upload_attempt_id": "scheduler-abc",
+            "upload_attempt_started_at": "2026-06-22T11:59:00Z",
+        }
         now = datetime(2026, 6, 22, 12, 0, 0)
 
         bridge._mark_scheduled_upload_failed(item, RuntimeError("auth failed"), now)
@@ -213,12 +584,38 @@ class UploadSchedulingTests(unittest.TestCase):
         self.assertEqual(item["failure_count"], 1)
         self.assertIn("auth failed", item["last_error"])
         self.assertEqual(item["retry_after"], "2026-06-22T12:05:00")
+        self.assertNotIn("upload_attempt_id", item)
         self.assertFalse(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 4, 59)))
         self.assertTrue(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 5, 0)))
 
         bridge._mark_scheduled_upload_failed(item, RuntimeError("still failed"), now)
         self.assertEqual(item["failure_count"], 2)
         self.assertEqual(item["retry_after"], "2026-06-22T12:10:00")
+
+    def test_scheduled_retry_due_accepts_timezone_aware_retry_after(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        item = {"retry_after": "2026-06-22T12:05:00+00:00"}
+
+        self.assertFalse(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 4, 59, tzinfo=timezone.utc)))
+        self.assertTrue(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 5, 0, tzinfo=timezone.utc)))
+
+        item["retry_after"] = "2026-06-22T12:05:00Z"
+        self.assertTrue(bridge._scheduled_retry_due(item, datetime(2026, 6, 22, 12, 5, 0, tzinfo=timezone.utc)))
+
+    def test_uploader_rejects_public_schedule_inside_buffer_before_auth(self):
+        soon = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        with patch("uploader.get_youtube_service") as service:
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as video_file:
+                with self.assertRaisesRegex(ValueError, "at least 10 minutes"):
+                    upload_to_youtube(
+                        Path(video_file.name),
+                        title="Too Soon",
+                        privacy="public",
+                        scheduled_time=soon,
+                    )
+
+        service.assert_not_called()
 
     def test_public_scheduled_upload_sets_youtube_publish_at(self):
         class FakeRequest:
