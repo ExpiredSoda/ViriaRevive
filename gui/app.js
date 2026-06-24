@@ -4721,14 +4721,16 @@ function renderClipTray() {
             : '';
 
         header.innerHTML = `
-            <span class="tray-folder-toggle">&#9654;</span>
-            <span class="tray-folder-name" title="${escHtml(group.stem)}">${escHtml(group.stem)}</span>
-            <span class="tray-folder-count">${group.clips.length} clips</span>
-            ${scheduledCount ? `<span class="tray-folder-scheduled">${scheduledCount} scheduled</span>` : ''}
+            <div class="tray-folder-main">
+                <span class="tray-folder-toggle">&#9654;</span>
+                <span class="tray-folder-name" title="${escHtml(group.stem)}">${escHtml(group.stem)}</span>
+                <span class="tray-folder-count">${group.clips.length} ${group.clips.length === 1 ? 'clip' : 'clips'}</span>
+                ${scheduledCount ? `<span class="tray-folder-scheduled">${scheduledCount} scheduled</span>` : ''}
+            </div>
             <div class="tray-folder-actions" onclick="event.stopPropagation()">
                 ${chDropdownHtml}
                 <button class="tray-folder-sched-btn" title="Schedule all clips from this folder to selected channel">Schedule</button>
-                <button class="tray-folder-context-btn${hasCreatorContext ? ' has-context' : ''}" title="Add optional notes to guide AI titles for this source">Optional AI Notes</button>
+                <button class="tray-folder-context-btn${hasCreatorContext ? ' has-context' : ''}" title="Add AI context to guide titles for this source">AI Context</button>
                 <button class="tray-folder-ai-btn" title="Generate AI titles only for clips in this folder">AI Titles</button>
             </div>`;
         const folderStem = group.stem; // capture in closure — no encode/decode needed
@@ -4808,7 +4810,7 @@ function openSourceTitleContextModal(stem, sourceId = '') {
     state.sourceContextEditing = { stem: String(stem || ''), source_id: String(sourceId || '') };
     const title = document.getElementById('source-context-title');
     const field = document.getElementById('source-context-text');
-    if (title) title.textContent = `Optional AI Notes - ${stem || 'Source'}`;
+    if (title) title.textContent = `AI Context - ${stem || 'Source'}`;
     if (field) {
         field.value = sourceTitleContextForStem(stem);
         field.focus();

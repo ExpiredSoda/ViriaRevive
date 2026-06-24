@@ -2362,11 +2362,16 @@ textarea:focus-visible,
 
 /* ── Calendar Layout (legacy — keep for calendar panel) ───────────────── */
 
-.calendar-layout { display: grid; grid-template-columns: 190px 1fr; gap: 14px; }
+.calendar-layout {
+    display: grid;
+    grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+}
 
-.clip-tray { padding: 16px; }
-.clip-tray h3 { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
-.clip-tray-hint { font-size: 10.5px; color: var(--text-3); margin-bottom: 12px; }
+.clip-tray { padding: 18px; min-width: 0; }
+.clip-tray h3 { font-size: 14px; font-weight: 800; margin-bottom: 5px; }
+.clip-tray-hint { font-size: 11.5px; color: var(--text-3); margin-bottom: 14px; line-height: 1.35; }
 .clip-tray-tools {
     display: flex;
     align-items: center;
@@ -2386,18 +2391,18 @@ textarea:focus-visible,
     white-space: nowrap;
 }
 .clip-tray-empty {
-    padding: 12px;
+    padding: 14px;
     border: 1px dashed var(--glass-border);
     border-radius: var(--radius-sm);
     color: var(--text-3);
     font-size: 11px;
     text-align: center;
 }
-.clip-tray-list { display: flex; flex-direction: column; gap: 6px; }
+.clip-tray-list { display: flex; flex-direction: column; gap: 8px; }
 
 .tray-clip {
     display: flex; flex-direction: column; gap: 2px;
-    padding: 9px 11px;
+    padding: 10px 12px;
     background: linear-gradient(135deg, rgba(108,92,231,0.06), rgba(0,206,201,0.03));
     border: 1px solid rgba(108,92,231,0.12);
     border-radius: var(--radius-sm);
@@ -2405,54 +2410,74 @@ textarea:focus-visible,
 }
 .tray-clip:hover { border-color: var(--accent); background: linear-gradient(135deg, rgba(108,92,231,0.12), rgba(0,206,201,0.06)); }
 .tray-clip.dragging { opacity: 0.35; }
-.tray-clip-num { font-weight: 700; font-size: 11px; color: var(--accent-light); }
-.tray-clip-name { font-size: 10.5px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tray-clip-size { font-size: 9.5px; color: var(--text-3); font-family: var(--font-mono); }
+.tray-clip-num { font-weight: 800; font-size: 11.5px; color: var(--accent-light); }
+.tray-clip-name { font-size: 11px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tray-clip-size { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); }
 .tray-clip.scheduled { border-color: var(--success); background: linear-gradient(135deg, rgba(0,206,201,0.08), rgba(0,206,201,0.03)); }
 .tray-clip.scheduled .tray-clip-num::after { content: ' ✓'; color: var(--success); font-size: 9px; }
 
 /* Clip tray folders */
 .tray-folder { border: 1px solid var(--glass-border); border-radius: var(--radius-sm); overflow: hidden; }
 .tray-folder-header {
-    display: flex; align-items: center; gap: 6px;
-    padding: 8px 10px; cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 11px 12px;
+    cursor: pointer;
     background: rgba(108,92,231,0.04);
     transition: background var(--transition);
-    flex-wrap: wrap;
 }
 .tray-folder-header:hover { background: rgba(108,92,231,0.10); }
+.tray-folder-main {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    min-width: 0;
+}
 .tray-folder-toggle {
     font-size: 9px; color: var(--text-3);
     transition: transform 0.2s; display: inline-block;
 }
 .tray-folder.open .tray-folder-toggle { transform: rotate(90deg); }
 .tray-folder-name {
-    flex: 1; font-size: 11px; font-weight: 600; color: var(--text-1);
+    font-size: 12px; font-weight: 700; color: var(--text-1);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.tray-folder-count { font-size: 9.5px; color: var(--text-3); font-family: var(--font-mono); white-space: nowrap; }
-.tray-folder-scheduled { font-size: 9px; color: var(--success); font-family: var(--font-mono); white-space: nowrap; }
+.tray-folder-count { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); white-space: nowrap; }
+.tray-folder-scheduled {
+    grid-column: 2 / -1;
+    justify-self: start;
+    font-size: 10px;
+    color: var(--success);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+}
 .tray-folder-actions {
-    display: flex; align-items: center; gap: 4px;
-    width: 100%; margin-top: 4px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(3, auto);
+    align-items: center;
+    gap: 6px;
+    width: 100%;
 }
 .tray-folder-channel {
     flex: 1; min-width: 0;
-    font-size: 9px; padding: 2px 4px; border-radius: 4px;
+    font-size: 10.5px; padding: 6px 8px; border-radius: 6px;
     background: rgba(255,255,255,0.06); color: var(--text-1);
     border: 1px solid var(--glass-border);
     cursor: pointer; font-family: inherit;
 }
 .tray-folder-channel:focus { outline: 1px solid var(--accent); }
 .tray-folder-sched-btn {
-    font-size: 9px; padding: 2px 8px; border-radius: 4px;
+    font-size: 10.5px; padding: 6px 10px; border-radius: 6px;
     background: var(--accent); color: #fff; border: none;
     cursor: pointer; white-space: nowrap; font-weight: 600;
     transition: opacity var(--transition);
 }
 .tray-folder-sched-btn:hover { opacity: 0.8; }
 .tray-folder-ai-btn {
-    font-size: 9px; padding: 2px 8px; border-radius: 4px;
+    font-size: 10.5px; padding: 6px 10px; border-radius: 6px;
     background: rgba(108,92,231,0.15); color: var(--accent); border: 1px solid var(--accent);
     cursor: pointer; white-space: nowrap; font-weight: 600;
     transition: opacity var(--transition);
@@ -2460,7 +2485,7 @@ textarea:focus-visible,
 .tray-folder-ai-btn:hover { opacity: 0.8; }
 .tray-folder-ai-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .tray-folder-context-btn {
-    font-size: 9px; padding: 2px 8px; border-radius: 4px;
+    font-size: 10.5px; padding: 6px 10px; border-radius: 6px;
     background: rgba(255,255,255,0.04); color: var(--text-2); border: 1px solid var(--glass-border);
     cursor: pointer; white-space: nowrap; font-weight: 600;
     transition: all var(--transition);
@@ -2473,7 +2498,7 @@ textarea:focus-visible,
 }
 .tray-folder-body {
     display: none; flex-direction: column; gap: 4px;
-    padding: 6px 8px;
+    padding: 8px 10px;
     background: rgba(0,0,0,0.15);
 }
 .tray-folder.open .tray-folder-body { display: flex; }

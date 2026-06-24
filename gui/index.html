@@ -1316,7 +1316,7 @@
                     <input type="text" class="form-input" id="modal-meta-title" maxlength="100" oninput="updateMetaDescriptionPreview()">
                 </div>
                 <div class="meta-field">
-                    <label>Optional AI Notes <span class="optional">(not uploaded)</span></label>
+                    <label>AI Context <span class="optional">(not uploaded)</span></label>
                     <textarea class="form-input" id="modal-meta-creator-context" rows="2" maxlength="420" placeholder="Example: blind Alan Wake run in the nursing home chapter..." oninput="updateMetaDescriptionPreview()"></textarea>
                     <span class="setting-hint">Helps AI titles understand the session. It is stored locally and not copied into the description.</span>
                 </div>
@@ -1363,11 +1363,11 @@
         </div>
     </div>
 
-    <!-- Source AI notes modal -->
+    <!-- Source AI context modal -->
     <div id="source-context-modal" class="modal hidden">
         <div class="modal-content card meta-modal-body source-context-body">
             <div class="meta-modal-header">
-                <h2 id="source-context-title">Optional AI Notes</h2>
+                <h2 id="source-context-title">AI Context</h2>
                 <button class="meta-modal-close" onclick="closeModal('source-context-modal')">&times;</button>
             </div>
             <p class="source-context-copy">Give title generation a little local context about this source or session. These notes guide AI titles and metadata, but they are not uploaded or copied into descriptions.</p>
@@ -1377,7 +1377,7 @@
             </div>
             <div class="meta-modal-actions">
                 <button class="btn-secondary btn-sm" onclick="closeModal('source-context-modal')">Cancel</button>
-                <button class="btn-primary btn-sm" onclick="saveSourceTitleContextModal()">Save Notes</button>
+                <button class="btn-primary btn-sm" onclick="saveSourceTitleContextModal()">Save Context</button>
             </div>
         </div>
     </div>
