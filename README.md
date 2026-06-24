@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <strong>Current version: v2.3.0</strong>
+  <strong>Current version: v2.3.1</strong>
 </p>
 
 <p align="center">
@@ -126,9 +126,9 @@ reports.
 
 Download a release package from this repository's GitHub Releases page:
 
-1. **Installer EXE** - run `ViriaReviveSetup-v2.3.0.exe`, then launch
+1. **Installer EXE** - run `ViriaReviveSetup-v2.3.1.exe`, then launch
    ViriaRevive from the Start Menu.
-2. **ZIP app** - extract `ViriaRevive-v2.3.0-Windows-x64.zip`, then run
+2. **ZIP app** - extract `ViriaRevive-v2.3.1-Windows-x64.zip`, then run
    `ViriaRevive.exe`.
 
 FFmpeg support depends on the release package:
@@ -257,7 +257,7 @@ build.bat
 release safety/compliance, and creates ZIP artifacts such as:
 
 ```text
-release\ViriaRevive-v2.3.0-Windows-x64.zip
+release\ViriaRevive-v2.3.1-Windows-x64.zip
 release\ViriaRevive-Windows-x64.zip
 ```
 

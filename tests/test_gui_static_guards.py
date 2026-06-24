@@ -139,7 +139,7 @@ class GuiStaticGuardTests(unittest.TestCase):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
 
-        self.assertIn("Optional AI Notes", html)
+        self.assertIn("AI Context", html)
         self.assertIn('id="source-context-modal"', html)
         self.assertIn('id="source-context-text"', html)
         self.assertIn('id="modal-meta-creator-context"', html)
