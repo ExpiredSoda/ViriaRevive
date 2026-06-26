@@ -67,6 +67,11 @@ class TranscriberBatchTests(unittest.TestCase):
              patch("transcriber._run_transcription_batch_process", return_value={"cancelled": True}):
             self.assertEqual(transcriber.transcribe_clips(paths), [[], []])
 
+    def test_transcribe_clip_cancel_returns_empty_words(self):
+        with patch("transcriber._transcription_timeout_seconds", return_value=120), \
+             patch("transcriber._run_transcription_process", return_value={"cancelled": True}):
+            self.assertEqual(transcriber.transcribe_clip(Path("one.wav")), [])
+
     def test_transcribe_clips_delivers_large_batch_payload_in_order(self):
         paths = [Path(f"clip_{idx}.wav") for idx in range(16)]
 
@@ -79,6 +84,33 @@ class TranscriberBatchTests(unittest.TestCase):
             self.assertEqual(words[0]["text"], f"{idx}:clip_{idx}.wav")
             self.assertTrue(words[1]["text"].startswith(f"{idx:03d}-"))
             self.assertGreater(len(words[1]["text"]), len(_LARGE_WORD_BODY))
+
+    def test_receive_transcription_result_terminates_worker_on_cancel(self):
+        class FakeProc:
+            sentinel = object()
+
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+
+            def is_alive(self):
+                return not self.terminated and not self.killed
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def join(self, timeout=0):
+                return None
+
+        proc = FakeProc()
+        with patch("transcriber._transcription_cancel_requested", return_value=True):
+            result = transcriber._receive_transcription_result(proc, object(), timeout=120)
+
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(proc.terminated)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,9 @@ def transcribe_clip(
     if payload.get("timeout"):
         print(f"[!] Transcription timed out after {timeout}s: {audio_path.name}")
         return []
+    if payload.get("cancelled"):
+        print(f"[!] Transcription cancelled: {audio_path.name}")
+        return []
     if payload.get("error"):
         print(f"[!] Transcription failed for {audio_path.name}: {payload['error']}")
         return []
@@ -92,7 +95,16 @@ def _run_transcription_process(audio_path: Path, model_size: str, language: str 
         daemon=True,
     )
     proc.start()
-    proc.join(timeout)
+    deadline = time.monotonic() + max(0, timeout)
+    while proc.is_alive():
+        if _transcription_cancel_requested():
+            _terminate_transcription_process(proc)
+            return {"cancelled": True}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_transcription_process(proc)
+            return {"timeout": True}
+        proc.join(min(0.25, remaining))
     if proc.is_alive():
         proc.terminate()
         proc.join(5)
@@ -132,15 +144,18 @@ def _run_transcription_batch_process(audio_paths: list[Path], model_size: str, l
 def _receive_transcription_result(proc, result_conn, timeout: int) -> dict:
     deadline = time.monotonic() + max(0, timeout)
     while True:
+        if _transcription_cancel_requested():
+            _terminate_transcription_process(proc)
+            return {"cancelled": True}
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _terminate_transcription_process(proc)
             return {"timeout": True}
 
-        ready = wait([result_conn, proc.sentinel], timeout=remaining)
+        ready = wait([result_conn, proc.sentinel], timeout=min(0.25, remaining))
         if not ready:
-            _terminate_transcription_process(proc)
-            return {"timeout": True}
+            continue
 
         if result_conn in ready:
             try:
@@ -172,6 +187,15 @@ def _receive_transcription_result(proc, result_conn, timeout: int) -> dict:
             except Exception as exc:
                 return {"error": str(exc)}
             return _missing_transcription_result(proc)
+
+
+def _transcription_cancel_requested() -> bool:
+    try:
+        from subprocess_utils import is_cancelled
+
+        return bool(is_cancelled())
+    except Exception:
+        return False
 
 
 def _terminate_transcription_process(proc):

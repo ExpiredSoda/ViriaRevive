@@ -73,7 +73,7 @@
                 <span class="version" id="app-version">v2.3.1</span>
                 <button class="ollama-status checking" id="ollama-status" onclick="refreshOllamaStatus()" title="Checking Ollama status">
                     <span class="ollama-dot"></span>
-                    <span class="ollama-label">Ollama</span>
+                    <span class="ollama-label">Local AI</span>
                 </button>
             </div>
         </nav>
@@ -105,6 +105,17 @@
                     </div>
 
                     <div class="url-input-card card card-glow">
+                        <div class="generation-mode-toggle" role="radiogroup" aria-label="Generation mode">
+                            <button type="button" class="generation-mode-card active" data-mode="clips" onclick="selectGenerationMode('clips')">
+                                <strong>Short Clips</strong>
+                                <span>Find standalone vertical moments</span>
+                            </button>
+                            <button type="button" class="generation-mode-card" data-mode="montage" onclick="selectGenerationMode('montage')">
+                                <strong>Montage</strong>
+                                <span>Stitch several beats into one Short</span>
+                            </button>
+                        </div>
+
                         <!-- Textarea for URLs -->
                         <div class="input-area-wrapper">
                             <svg class="input-area-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
@@ -138,7 +149,7 @@
 
                         <button class="btn-primary btn-generate" id="btn-generate" onclick="startProcessing()">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                            Generate Clips
+                            <span id="generate-button-label">Generate Clips</span>
                         </button>
                     </div>
 
@@ -421,7 +432,7 @@
                         </svg>
                     </div>
                     <p>No clips to upload</p>
-                    <span>Generate clips first, or drop video files into the clips folder</span>
+                    <span>Generate or import clips, then schedule them on the calendar</span>
                     <div class="empty-state-actions">
                         <button class="btn-primary btn-sm" onclick="refreshUploadClips()">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
@@ -692,15 +703,16 @@
                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
                                             Refresh Clips
                                         </button>
-                                        <button class="btn-secondary btn-sm" id="btn-gen-ai-titles" onclick="generateAITitlesManual()" title="Generate AI titles for all clips and rename files">
+                                        <button class="btn-secondary btn-sm" id="btn-gen-ai-titles" onclick="generateAITitlesManual()" title="Generate or reroll AI titles, descriptions, tags, filenames, and matching .txt files">
                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-                                            Generate AI Titles
+                                            Generate / Reroll AI Metadata
                                         </button>
                                         <button class="btn-secondary btn-sm" onclick="toggleGlobalConsole()" title="Show/hide log console">
                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
                                             Console
                                         </button>
                                     </div>
+                                    <span class="metadata-reroll-note">Batch AI metadata updates titles, descriptions, tags, clip filenames, and the matching .txt files.</span>
                                 </div>
                             </div>
                         </aside>
@@ -712,7 +724,7 @@
                             <span id="upload-action-detail">Schedule clips before sending them to YouTube.</span>
                         </div>
                         <div class="upload-action-controls">
-                            <button class="btn-secondary btn-preview-queue" onclick="focusUploadReadiness('schedule')" title="Jump to the calendar plan">Preview Queue</button>
+                            <button class="btn-secondary btn-preview-queue" id="btn-preview-queue" onclick="focusUploadReadiness('schedule')" title="Jump to the calendar plan">View Calendar Plan</button>
                             <button class="btn-primary btn-upload-go" id="btn-upload" onclick="startUpload()" title="Send pending clips to YouTube now with each clip's calendar publish time">
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -788,7 +800,7 @@
                         <div class="setting-row">
                             <label>Clip duration</label>
                             <div class="slider-group">
-                                <input type="range" id="set-clip-duration" min="10" max="3000" step="5" value="30" oninput="updateSliderLabel(this)">
+                                <input type="range" id="set-clip-duration" min="10" max="180" step="5" value="30" oninput="updateSliderLabel(this)">
                                 <span class="slider-val" id="val-clip-duration">30s</span>
                             </div>
                         </div>
@@ -870,13 +882,23 @@
                                 <span id="settings-ollama-detail">Ollama status</span>
                             </div>
                         </div>
+                        <div class="ollama-model-status-grid">
+                            <div class="ollama-model-status-row">
+                                <span>Text model</span>
+                                <strong id="settings-ollama-text-model">Checking</strong>
+                            </div>
+                            <div class="ollama-model-status-row">
+                                <span>Vision model</span>
+                                <strong id="settings-ollama-vision-model">Checking</strong>
+                            </div>
+                        </div>
                         <div class="data-privacy-actions">
                             <button class="btn-secondary btn-sm" id="btn-ollama-download" onclick="handleOllamaLocationAction()">Install Ollama</button>
-                            <button class="btn-secondary btn-sm" id="btn-ollama-install" onclick="installOllamaWithPowerShell()">Install via PowerShell</button>
-                            <button class="btn-secondary btn-sm" id="btn-ollama-model" onclick="downloadOllamaModel()">Download AI Model</button>
+                            <button class="btn-secondary btn-sm hidden" id="btn-ollama-model" onclick="downloadOllamaModel()">Download Text Model</button>
+                            <button class="btn-secondary btn-sm hidden" id="btn-ollama-vision-model" onclick="downloadOllamaVisionModel()">Download Vision Model</button>
                             <button class="btn-secondary btn-sm" onclick="refreshOllamaStatus()">Refresh</button>
                         </div>
-                        <p class="setting-hint">Optional and local. Powers AI titles, moment labels, and Deep Analysis AI ranking when enabled. PowerShell install asks first and runs Ollama's official Windows command in a new window.</p>
+                        <p class="setting-hint">Optional and local. The text model powers titles, descriptions, and moment labels; the vision model lets Deep Analysis inspect sampled gameplay frames.</p>
                     </div>
 
                     <div class="card settings-card">
@@ -990,7 +1012,7 @@
                         </h3>
                         <div class="privacy-card-hero">
                             <strong>Your data stays on this PC.</strong>
-                            <p>Ratings, learning signals, optional voice profile data, OAuth files, and generated clips are stored locally. ViriaRevive only contacts YouTube when you connect or upload, and Ollama runs through your local machine when enabled.</p>
+                            <p>Ratings, learning signals, optional voice profile data, OAuth files, and generated clips are stored locally. ViriaRevive contacts YouTube only when you connect or upload, may query Wikidata for compact game facts, and uses Ollama through your local machine when enabled.</p>
                         </div>
                         <div class="privacy-card-points">
                             <span>Local feedback</span>
@@ -1013,7 +1035,7 @@
                         <div class="setting-row">
                             <p style="color:var(--text-2);font-size:12.5px;line-height:1.6">
                                 <strong id="about-app-title">ViriaRevive v2.3.1</strong> turns long gameplay videos into short vertical clips.
-                                This fork focuses on transcript-aware detection, multi-track audio, optional subtitles, local learning, local Ollama titles and AI moment labels, and optional YouTube scheduling.
+                                This fork focuses on transcript-aware detection, multi-track audio, optional subtitles, local learning, local Ollama titles, descriptions, AI moment labels, vision analysis, and optional YouTube scheduling.
                             </p>
                         </div>
                         <div class="setting-row">
@@ -1133,7 +1155,7 @@
                             <span class="data-privacy-label">Feedback File</span>
                         </div>
                     </div>
-                    <p class="data-privacy-copy">ViriaRevive keeps clip feedback, app settings, optional voice profile features, and YouTube OAuth files in your local app data folder. Cloud services are not contacted for local learning.</p>
+                    <p class="data-privacy-copy">ViriaRevive keeps clip feedback, app settings, optional voice profile features, game-context cache, and YouTube OAuth files in your local app data folder. Local learning does not upload your clips; Game Knowledge may query Wikidata with compact title/context hints to identify the game.</p>
                 </div>
                 <div class="data-privacy-actions">
                     <button class="btn-secondary btn-sm" onclick="refreshDataPrivacyCard()">Refresh</button>
@@ -1281,7 +1303,7 @@
             <div class="data-privacy-tab-panel" data-privacy-panel="files">
                 <div class="privacy-modal-section">
                     <h3>Files, Exports, And Connections</h3>
-                    <p class="data-privacy-copy">Use these when you want to inspect, share, or remove local learning data. YouTube is contacted only when you connect or upload. Ollama stays local at <code>127.0.0.1:11434</code>.</p>
+                    <p class="data-privacy-copy">Use these when you want to inspect, share, or remove local learning data. YouTube is contacted only when you connect or upload. Wikidata may be contacted for compact game facts. Ollama stays local at <code>127.0.0.1:11434</code>.</p>
                     <ul class="privacy-explain-list">
                         <li><strong>Raw feedback</strong> opens your local <code>personalization.json</code>.</li>
                         <li><strong>Share-safe export</strong> removes transcripts, notes, filenames, exact times, and raw IDs.</li>
@@ -1308,15 +1330,16 @@
                 <div class="meta-field">
                     <label style="display:flex;align-items:center;justify-content:space-between">
                         Title
-                        <button class="btn-text btn-sm" onclick="regenerateTitle(state.editingScheduleIdx)" title="Generate AI title from transcript">
+                        <button class="btn-text btn-sm" onclick="regenerateTitle(state.editingScheduleIdx)" title="Reroll title, generated description, tags, and the clip .txt metadata file">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                            AI Title
+                            Reroll AI Metadata
                         </button>
                     </label>
                     <input type="text" class="form-input" id="modal-meta-title" maxlength="100" oninput="updateMetaDescriptionPreview()">
+                    <span class="setting-hint">Reroll updates this clip's title, generated description, tags, and .txt file. Custom description text stays.</span>
                 </div>
                 <div class="meta-field">
-                    <label>AI Context <span class="optional">(not uploaded)</span></label>
+                    <label>AI Notes <span class="optional">(not uploaded)</span></label>
                     <textarea class="form-input" id="modal-meta-creator-context" rows="2" maxlength="420" placeholder="Example: blind Alan Wake run in the nursing home chapter..." oninput="updateMetaDescriptionPreview()"></textarea>
                     <span class="setting-hint">Helps AI titles understand the session. It is stored locally and not copied into the description.</span>
                 </div>
@@ -1363,21 +1386,40 @@
         </div>
     </div>
 
-    <!-- Source AI context modal -->
+    <!-- Clip AI notes modal -->
     <div id="source-context-modal" class="modal hidden">
-        <div class="modal-content card meta-modal-body source-context-body">
+        <div class="modal-content card meta-modal-body">
             <div class="meta-modal-header">
-                <h2 id="source-context-title">AI Context</h2>
+                <h2 id="source-context-title">AI Notes</h2>
                 <button class="meta-modal-close" onclick="closeModal('source-context-modal')">&times;</button>
             </div>
-            <p class="source-context-copy">Give title generation a little local context about this source or session. These notes guide AI titles and metadata, but they are not uploaded or copied into descriptions.</p>
+            <p class="source-context-copy">Give AI metadata a little local context about this clip. These notes guide AI titles, descriptions, and tags, but they are not uploaded or copied into descriptions.</p>
             <div class="meta-field">
-                <label for="source-context-text">Session notes</label>
+                <label for="source-context-text">Clip notes</label>
                 <textarea class="form-input" id="source-context-text" rows="5" maxlength="420" placeholder="Example: blind Alan Wake run in the nursing home chapter, mostly exploring and getting jumped by Taken."></textarea>
             </div>
             <div class="meta-modal-actions">
                 <button class="btn-secondary btn-sm" onclick="closeModal('source-context-modal')">Cancel</button>
-                <button class="btn-primary btn-sm" onclick="saveSourceTitleContextModal()">Save Context</button>
+                <button class="btn-primary btn-sm" onclick="saveAiContextModal()">Save Notes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Clip game edit modal -->
+    <div id="game-title-modal" class="modal hidden">
+        <div class="modal-content card meta-modal-body">
+            <div class="meta-modal-header">
+                <h2 id="game-title-modal-title">Game</h2>
+                <button class="meta-modal-close" onclick="closeModal('game-title-modal')">&times;</button>
+            </div>
+            <p class="source-context-copy">Set the game for this clip. Leave it blank if the game is unknown.</p>
+            <div class="meta-field">
+                <label for="game-title-text">Game</label>
+                <input class="form-input" id="game-title-text" maxlength="120" placeholder="Unknown">
+            </div>
+            <div class="meta-modal-actions">
+                <button class="btn-secondary btn-sm" onclick="closeModal('game-title-modal')">Cancel</button>
+                <button class="btn-primary btn-sm" onclick="saveClipGameTitleModal()">Save Game</button>
             </div>
         </div>
     </div>
@@ -1479,14 +1521,14 @@
         </div>
     </div>
 
-    <!-- Pre-processing Wizard Modal (style → detection → audio → effects → music) -->
+    <!-- Pre-processing Wizard Modal (style → plan → audio → effects → music) -->
     <div id="style-picker-modal" class="modal hidden">
         <div class="modal-content card style-picker-body">
             <!-- Step indicators -->
             <div class="wizard-steps">
                 <div class="wizard-step active" data-step="1"><span class="wizard-step-num">1</span><span>Style</span></div>
                 <div class="wizard-step-line"></div>
-                <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span><span>Detection</span></div>
+                <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span><span id="wizard-step-2-label">Detection</span></div>
                 <div class="wizard-step-line"></div>
                 <div class="wizard-step" data-step="3"><span class="wizard-step-num">3</span><span>Audio</span></div>
                 <div class="wizard-step-line"></div>
@@ -1586,33 +1628,41 @@
                     </label>
                 </div>
                 <button class="btn-primary style-picker-go" onclick="wizardNext(2)">
-                    Next: Detection
+                    <span id="wizard-step-1-next-label">Next: Detection</span>
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
                 </button>
             </div>
 
-            <!-- STEP 2: Detection -->
+            <!-- STEP 2: Detection / Montage Plan -->
             <div class="wizard-page" id="wizard-step-2">
                 <div class="meta-modal-header">
-                    <h2>Detection</h2>
+                    <h2 id="wizard-step-2-title">Detection</h2>
                     <button class="meta-modal-close" onclick="closeModal('style-picker-modal')">&times;</button>
                 </div>
-                <p class="style-picker-hint">Choose how deeply ViriaRevive should inspect the video before rendering final clips.</p>
-                <div class="depth-preset-grid" id="wizard-depth-presets">
-                    <button type="button" class="depth-preset" data-depth="fast" onclick="selectProcessingDepth('fast')">
-                        <strong>Fast</strong>
-                        <span>Fewer candidates and lighter analysis for quicker batches.</span>
-                    </button>
-                    <button type="button" class="depth-preset active" data-depth="balanced" onclick="selectProcessingDepth('balanced')">
-                        <strong>Balanced</strong>
-                        <span>Default quality path with sampled scene checks on long videos.</span>
-                    </button>
-                    <button type="button" class="depth-preset" data-depth="deep" onclick="selectProcessingDepth('deep')">
-                        <strong>Deep Analysis</strong>
-                        <span>More candidates, visual/category passes, and deeper targeted scene analysis.</span>
-                    </button>
+                <p class="style-picker-hint" id="wizard-step-2-hint">Choose how deeply ViriaRevive should inspect the video before rendering final clips.</p>
+                <div class="wizard-detection-grid wizard-source-context-grid">
+                    <div class="wizard-detection-row wizard-detection-row-wide">
+                        <label for="wizard-game-title-hint">Game <span class="muted">(optional)</span></label>
+                        <input type="text" id="wizard-game-title-hint" class="form-input" maxlength="120" placeholder="Leave blank for auto-detect">
+                        <small class="wizard-field-help">Leave blank for auto-detect. Add the game name if you want stronger titles, labels, and clip ranking. For mixed-game batches, leave this blank unless every queued video is the same game.</small>
+                    </div>
                 </div>
-                <div class="wizard-detection-grid">
+                <div id="wizard-clip-plan-panel">
+                    <div class="depth-preset-grid" id="wizard-depth-presets">
+                        <button type="button" class="depth-preset" data-depth="fast" onclick="selectProcessingDepth('fast')">
+                            <strong>Fast</strong>
+                            <span>Fewer candidates and lighter analysis for quicker batches.</span>
+                        </button>
+                        <button type="button" class="depth-preset active" data-depth="balanced" onclick="selectProcessingDepth('balanced')">
+                            <strong>Balanced</strong>
+                            <span>Default quality path with sampled scene checks on long videos.</span>
+                        </button>
+                        <button type="button" class="depth-preset" data-depth="deep" onclick="selectProcessingDepth('deep')">
+                            <strong>Deep Analysis</strong>
+                            <span>More candidates, visual/category passes, and deeper targeted scene analysis.</span>
+                        </button>
+                    </div>
+                    <div class="wizard-detection-grid">
                     <div class="wizard-detection-row">
                         <label for="wizard-detection-preference">Output preference</label>
                         <select id="wizard-detection-preference" class="form-select">
@@ -1636,7 +1686,7 @@
                     <div class="wizard-detection-row">
                         <label for="wizard-clip-duration">Clip duration</label>
                         <div class="slider-group">
-                            <input type="range" id="wizard-clip-duration" min="10" max="3000" step="5" value="30" oninput="document.getElementById('val-wizard-clip-duration').textContent = this.value + 's'; syncWizardEstimate()">
+                            <input type="range" id="wizard-clip-duration" min="10" max="180" step="5" value="30" oninput="document.getElementById('val-wizard-clip-duration').textContent = this.value + 's'; syncWizardEstimate()">
                             <span class="slider-val" id="val-wizard-clip-duration">30s</span>
                         </div>
                     </div>
@@ -1647,8 +1697,62 @@
                             <span class="slider-val" id="val-wizard-min-gap">15s</span>
                         </div>
                     </div>
+                    </div>
+                    <div class="wizard-estimate" id="wizard-estimate">Long recordings can take a while. Balanced is a good default.</div>
                 </div>
-                <div class="wizard-estimate" id="wizard-estimate">Long recordings can take a while. Balanced is a good default.</div>
+                <div id="wizard-montage-plan-panel" class="wizard-montage-panel hidden">
+                    <div class="montage-template-grid" id="montage-template-grid">
+                        <button type="button" class="montage-template-card active" data-template="panic" onclick="selectMontageTemplate('panic')">
+                            <strong>Chase / Panic</strong>
+                            <span>Escalation, close calls, reactions</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="funny" onclick="selectMontageTemplate('funny')">
+                            <strong>Funny Moments</strong>
+                            <span>Jokes, surprise lines, absurd timing</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="failure" onclick="selectMontageTemplate('failure')">
+                            <strong>Death / Failure</strong>
+                            <span>Setup, mistake, consequence, recovery</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="combat" onclick="selectMontageTemplate('combat')">
+                            <strong>Combat / Action</strong>
+                            <span>Pressure, weapons, wins, near misses</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="story" onclick="selectMontageTemplate('story')">
+                            <strong>Story / Lore</strong>
+                            <span>Dialogue, discovery, reaction</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="tutorial" onclick="selectMontageTemplate('tutorial')">
+                            <strong>Tutorial</strong>
+                            <span>Steps, explanation, useful payoff</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="atmosphere" onclick="selectMontageTemplate('atmosphere')">
+                            <strong>Atmosphere</strong>
+                            <span>Scenery, mood, tension, reveals</span>
+                        </button>
+                        <button type="button" class="montage-template-card" data-template="custom" onclick="selectMontageTemplate('custom')">
+                            <strong>Custom</strong>
+                            <span>Use your note as the creative target</span>
+                        </button>
+                    </div>
+                    <div class="wizard-detection-grid montage-plan-grid">
+                        <div class="wizard-detection-row">
+                            <label for="wizard-montage-duration">Target length</label>
+                            <select id="wizard-montage-duration" class="form-select" onchange="syncWizardEstimate()">
+                                <option value="30">30 seconds</option>
+                                <option value="45">45 seconds</option>
+                                <option value="60" selected>60 seconds</option>
+                                <option value="90">90 seconds</option>
+                            </select>
+                        </div>
+                        <div class="wizard-detection-row wizard-detection-row-wide wizard-textarea-row">
+                            <label for="wizard-montage-prompt">Montage note <span class="muted">(optional)</span></label>
+                            <textarea id="wizard-montage-prompt" class="form-input" rows="3" maxlength="500" placeholder="Example: make it feel like a scary chase recap with a funny ending"></textarea>
+                            <small class="wizard-field-help">Use this when you want a specific vibe, story shape, or moment type.</small>
+                        </div>
+                    </div>
+                    <div class="wizard-estimate" id="wizard-montage-estimate">Montage mode finds several short beats and prepares them for one story-style Short.</div>
+                </div>
                 <div class="wizard-nav">
                     <button class="btn-secondary" onclick="wizardNext(1)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
@@ -1818,7 +1922,7 @@
                     </button>
                     <button class="btn-primary style-picker-go" onclick="confirmStyleAndGenerate()">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                        Generate Clips
+                        <span id="wizard-generate-label">Generate Clips</span>
                     </button>
                 </div>
             </div>

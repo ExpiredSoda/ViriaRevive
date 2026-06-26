@@ -251,6 +251,75 @@ class SpeechStreamSelectorTests(unittest.TestCase):
         self.assertFalse(decision["accepted"])
         self.assertEqual(decision["reason"], "background_bed_suggests_game_audio")
 
+    def test_creator_policy_rejects_alternate_with_high_game_source_confidence(self):
+        profile = {
+            "ordinal": 1,
+            "title": "Microphone",
+            "words": 34,
+            "chars": 120,
+            "hits": 3,
+            "sampled_seconds": 40,
+            "creator_likeness_score": 0.30,
+            "natural_dialogue_score": 1.0,
+            "scripted_game_score": 1.1,
+            "acoustic_game_bed_score": 0.40,
+            "lyric_likelihood": 0.0,
+            "creator_exception_score": 0.0,
+            "voice_title_hints": ["microphone"],
+            "game_title_hints": [],
+            "selection_score": 40,
+            "speech_source": {
+                "policy": "creator",
+                "primary_source": "game",
+                "confidence": 0.70,
+                "creator_probability": 0.22,
+                "game_or_npc_probability": 0.58,
+                "music_or_lyrics_probability": 0.04,
+                "unknown_probability": 0.16,
+                "creator_safe": False,
+            },
+        }
+
+        decision = should_accept_alternate_stream(profile, subtitle_policy="creator")
+
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["reason"], "source_confidence_game_or_npc")
+        self.assertEqual(decision["speech_source"]["primary_source"], "game")
+
+    def test_creator_policy_rejects_unlabeled_alternate_with_weak_creator_confidence(self):
+        profile = {
+            "ordinal": 1,
+            "title": "Track3_vertical",
+            "words": 48,
+            "chars": 160,
+            "hits": 3,
+            "sampled_seconds": 40,
+            "creator_likeness_score": 0.50,
+            "natural_dialogue_score": 2.4,
+            "scripted_game_score": 0.5,
+            "acoustic_game_bed_score": 0.20,
+            "lyric_likelihood": 0.0,
+            "creator_exception_score": 0.0,
+            "voice_title_hints": [],
+            "game_title_hints": [],
+            "selection_score": 40,
+            "speech_source": {
+                "policy": "creator",
+                "primary_source": "creator",
+                "confidence": 0.42,
+                "creator_probability": 0.52,
+                "game_or_npc_probability": 0.22,
+                "music_or_lyrics_probability": 0.05,
+                "unknown_probability": 0.21,
+                "creator_safe": False,
+            },
+        }
+
+        decision = should_accept_alternate_stream(profile, subtitle_policy="creator")
+
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["reason"], "alternate_lacks_creator_confidence")
+
     def test_creator_policy_rejects_alternate_that_is_song_lyrics(self):
         profile = score_stream_profile(
             1,
@@ -299,6 +368,33 @@ class SpeechStreamSelectorTests(unittest.TestCase):
 
         self.assertTrue(decision["accepted"])
         self.assertIn(decision["reason"], {"creator_like_alternate", "mic_hint_and_natural_dialogue"})
+
+    def test_creator_source_confidence_can_beat_longer_game_stream(self):
+        creator = score_stream_profile(
+            0,
+            "Track 1",
+            "okay yeah i think this is where we try a different route",
+            words_total=24,
+            sample_hits=3,
+            sampled_seconds=40,
+            acoustic_profile={"status": "ok", "game_bed_score": 0.10},
+        )
+        game = score_stream_profile(
+            1,
+            "Track 2",
+            "you are required to continue through the corridor now",
+            words_total=32,
+            sample_hits=3,
+            sampled_seconds=40,
+            acoustic_profile={"status": "ok", "game_bed_score": 0.80},
+        )
+
+        selected = choose_stream_from_profiles([game, creator])
+        selected_profile = next(row for row in selected["stream_profiles"] if row["ordinal"] == selected["selected_stream"])
+
+        self.assertEqual(selected["selected_stream"], 0)
+        self.assertEqual(selected["selected_reason"], "creator_source_confidence_over_more_words")
+        self.assertTrue(selected_profile["speech_source"]["creator_safe"])
 
 
 if __name__ == "__main__":

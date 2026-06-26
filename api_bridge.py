@@ -14,7 +14,6 @@ import math
 import os
 import re
 import shutil
-import socket
 import subprocess
 import threading
 import time
@@ -54,6 +53,14 @@ from config import (
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
 )
+
+MIN_CLIP_DURATION_SECONDS = 10
+MAX_CLIP_DURATION_SECONDS = 180
+MIN_MIN_GAP_SECONDS = 5
+MAX_MIN_GAP_SECONDS = 60
+CANDIDATE_TRANSCRIPT_PROBE_MAX_SECONDS = 90
+CANDIDATE_TRANSCRIPT_CHUNK_MAX_SECONDS = 180
+CANDIDATE_TRANSCRIPT_CHUNK_MAX_FILES = 8
 from detector import find_viral_moments, get_last_scene_detection_diagnostics
 from transcriber import transcribe_clip, transcribe_clips, find_sentence_boundary
 from subtitler import (
@@ -78,11 +85,14 @@ from candidate_ranker import (
     apply_ai_moment_scoring,
     apply_learned_scoring,
     apply_moment_category_scoring,
+    apply_multi_signal_ai_scoring,
     apply_voice_profile_scoring,
     build_learning_terms,
+    build_learning_prompt_context,
     build_learning_status,
     build_ai_moment_ranking_report,
     build_moment_category_ranking_report,
+    build_multi_signal_ai_ranking_report,
     build_shadow_scoring_report,
     build_voice_profile_ranking_report,
     build_voice_profile_shadow_report,
@@ -93,9 +103,13 @@ from candidate_ranker import (
     normalize_detection_preference,
     quality_floor_for_preference,
     select_best_candidates,
+    select_near_quality_fallback_candidates,
     LEARNED_SELECTION_MAX_ADJUSTMENT,
     AI_MOMENT_SELECTION_MAX_ADJUSTMENT,
     MOMENT_CATEGORY_SELECTION_MAX_ADJUSTMENT,
+    GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT,
+    MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT,
+    MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT,
     VOICE_PROFILE_SELECTION_MAX_ADJUSTMENT,
     write_debug_report,
 )
@@ -112,6 +126,7 @@ from title_generator import (
     DEFAULT_VIDEO_CATEGORY_ID,
     classify_moment_ai,
     compose_description,
+    generate_ai_description_body,
     generated_description_body,
     generate_title,
     generate_tags,
@@ -125,16 +140,11 @@ from title_generator import (
     sanitize_creator_title_context,
     OLLAMA_DOWNLOAD_URL,
     OLLAMA_WINDOWS_DOCS_URL,
-    OLLAMA_INSTALL_SCRIPT_URL,
 )
 from uploader import (
     upload_to_youtube,
-    build_schedule,
-    get_youtube_service,
-    is_connected,
     disconnect,
     list_channels,
-    list_categories,
     add_account,
     list_accounts,
 )
@@ -154,6 +164,16 @@ from visual_diagnostics import (
     analyze_candidate_visuals,
     disabled_visual_diagnostics,
 )
+from multimodal_analysis import (
+    DEFAULT_VISION_MODEL,
+    MULTIMODAL_SELECTION_MAX_ADJUSTMENT,
+    analyze_candidate_frames_with_ollama,
+    apply_multimodal_scoring,
+    build_multimodal_ranking_report,
+    ollama_vision_status,
+)
+from game_context import get_game_context, compact_game_context_for_prompt, normalize_game_title
+from game_identity import resolve_game_identity
 
 
 YOUTUBE_CREDENTIALS_URL = "https://console.cloud.google.com/apis/credentials"
@@ -161,6 +181,9 @@ FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
 SCHEDULER_MISSED_GRACE = timedelta(minutes=10)
 SCHEDULE_PUBLISH_BUFFER = timedelta(minutes=10)
 PROCESSING_DEPTHS = {"fast", "balanced", "deep"}
+GENERATION_MODES = {"clips", "montage"}
+MONTAGE_TEMPLATES = {"panic", "funny", "failure", "combat", "story", "tutorial", "atmosphere", "custom"}
+VIDEO_FILE_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 VOICE_ENROLLMENT_MIN_WORDS = 12
 VOICE_ENROLLMENT_MIN_CREATOR_RATIO = 0.70
 VOICE_ENROLLMENT_MIN_CREATOR_CONFIDENCE = 0.65
@@ -189,6 +212,7 @@ SCHEDULE_BACKEND_STATUS_FIELDS = {
     "retry_after",
     "missed_at",
     "upload_attempt_id",
+    "upload_attempt_fingerprint",
     "upload_attempt_started_at",
     "upload_attempt_trigger",
     "upload_unknown_at",
@@ -200,6 +224,8 @@ def _normalize_bool_setting(value, default: bool = False) -> bool:
         return value
     if value is None:
         return default
+    if isinstance(value, dict):
+        return _normalize_bool_setting(value.get("enabled"), default)
     if isinstance(value, (int, float)):
         return bool(value)
     text = str(value).strip().lower()
@@ -215,6 +241,23 @@ def _safe_int_value(value, default: int = 0) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_clip_duration(value, default: int = CLIP_DURATION) -> int:
+    duration = _safe_int_value(value, default)
+    if duration <= 0:
+        duration = int(default or CLIP_DURATION)
+    return max(MIN_CLIP_DURATION_SECONDS, min(MAX_CLIP_DURATION_SECONDS, duration))
+
+
+def _normalize_min_gap(value, default: int = MIN_GAP) -> int:
+    try:
+        gap = int(value)
+    except (TypeError, ValueError):
+        gap = int(default or MIN_GAP)
+    if gap <= 0:
+        gap = int(default or MIN_GAP)
+    return max(MIN_MIN_GAP_SECONDS, min(MAX_MIN_GAP_SECONDS, gap))
 
 
 def _local_naive_datetime(value: datetime) -> datetime:
@@ -250,6 +293,40 @@ def _normalize_processing_depth(value) -> str:
     }
     depth = aliases.get(depth, depth)
     return depth if depth in PROCESSING_DEPTHS else "balanced"
+
+
+def _normalize_generation_mode(value) -> str:
+    mode = str(value or "clips").strip().lower().replace("_", "-")
+    return mode if mode in GENERATION_MODES else "clips"
+
+
+def _sanitize_montage_prompt(value) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:500]
+
+
+def _normalize_montage_template(value) -> str:
+    template = str(value or "panic").strip().lower()
+    template = re.sub(r"[\s_]+", "-", template)
+    return template if template in MONTAGE_TEMPLATES else "panic"
+
+
+def _normalize_montage_duration(value) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 60
+    return seconds if seconds in {30, 45, 60, 90} else 60
+
+
+def _normalize_montage_settings(value) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "template": _normalize_montage_template(raw.get("template")),
+        "target_duration": _normalize_montage_duration(raw.get("target_duration")),
+        "prompt": _sanitize_montage_prompt(raw.get("prompt")),
+    }
 
 
 def _category_snapshot_from_selection(item: dict, moment: dict) -> tuple[str | None, dict | None]:
@@ -289,10 +366,12 @@ def _processing_depth_profile(depth: str, detection_preference: str, video_durat
             "scene_mode": scene_mode,
             "candidate_pool_cap": 36,
             "visual_diagnostics": False,
+            "multimodal_analysis": False,
             "moment_category_ranking": False,
             "ai_moment_classification": False,
             "voice_profile_ranking": False,
             "visual_max_candidates": 24,
+            "multimodal_max_candidates": 0,
         }
     if depth == "deep":
         multiplier = 8 if preference == "quality" else 7
@@ -304,10 +383,12 @@ def _processing_depth_profile(depth: str, detection_preference: str, video_durat
             "scene_mode": "targeted" if duration >= 1800 else "full",
             "candidate_pool_cap": 72,
             "visual_diagnostics": True,
+            "multimodal_analysis": True,
             "moment_category_ranking": True,
             "ai_moment_classification": True,
             "voice_profile_ranking": None,
             "visual_max_candidates": 64,
+            "multimodal_max_candidates": 12,
         }
     multiplier = 6 if preference == "quality" else 5
     return {
@@ -316,10 +397,12 @@ def _processing_depth_profile(depth: str, detection_preference: str, video_durat
         "scene_mode": "sampled" if duration >= 1200 else "full",
         "candidate_pool_cap": 56,
         "visual_diagnostics": None,
+        "multimodal_analysis": False,
         "moment_category_ranking": True,
         "ai_moment_classification": None,
         "voice_profile_ranking": None,
         "visual_max_candidates": 48,
+        "multimodal_max_candidates": 0,
     }
 
 
@@ -358,10 +441,12 @@ def _shortlist_candidates_for_transcription(
         return list(candidates)
 
     def candidate_score(row: dict) -> float:
-        return _safe_float_value(row.get("score"), 0.0) + 0.08 * _safe_float_value(row.get("scene"), 0.0)
+        detector_scores = row.get("detector_scores") if isinstance(row.get("detector_scores"), dict) else {}
+        scene_score = detector_scores.get("scene", row.get("scene", row.get("scene_score", 0.0)))
+        return _safe_float_value(row.get("score"), 0.0) + 0.08 * _safe_float_value(scene_score, 0.0)
 
     selected: list[dict] = []
-    min_distance = max(8, int(min_gap or 0))
+    min_distance = max(MIN_MIN_GAP_SECONDS, int(min_gap or MIN_GAP))
     for row in sorted(candidates, key=candidate_score, reverse=True):
         peak = _safe_float_value(row.get("peak_time", row.get("start")), 0.0)
         if all(abs(peak - _safe_float_value(other.get("peak_time", other.get("start")), 0.0)) >= min_distance for other in selected):
@@ -378,6 +463,69 @@ def _shortlist_candidates_for_transcription(
                 break
     selected_ids = {id(row) for row in selected}
     return [row for row in candidates if id(row) in selected_ids]
+
+
+def _candidate_transcription_chunks(
+    paths: list[Path],
+    durations_by_path: dict[str, float] | None = None,
+    *,
+    max_seconds: float = CANDIDATE_TRANSCRIPT_CHUNK_MAX_SECONDS,
+    max_files: int = CANDIDATE_TRANSCRIPT_CHUNK_MAX_FILES,
+) -> list[list[Path]]:
+    """Group candidate probe WAVs into bounded Whisper batches."""
+    clean_paths = [Path(path) for path in paths or []]
+    if not clean_paths:
+        return []
+    durations_by_path = durations_by_path or {}
+    max_seconds = max(1.0, float(max_seconds or CANDIDATE_TRANSCRIPT_CHUNK_MAX_SECONDS))
+    max_files = max(1, int(max_files or CANDIDATE_TRANSCRIPT_CHUNK_MAX_FILES))
+
+    chunks: list[list[Path]] = []
+    current: list[Path] = []
+    current_seconds = 0.0
+
+    for path in clean_paths:
+        raw_duration = durations_by_path.get(str(path))
+        duration = _safe_float_value(raw_duration, CANDIDATE_TRANSCRIPT_PROBE_MAX_SECONDS)
+        duration = max(1.0, min(float(duration), float(CANDIDATE_TRANSCRIPT_PROBE_MAX_SECONDS)))
+        if current and (
+            len(current) >= max_files
+            or current_seconds + duration > max_seconds
+        ):
+            chunks.append(current)
+            current = []
+            current_seconds = 0.0
+        current.append(path)
+        current_seconds += duration
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _transcribe_candidate_wav_chunks(
+    paths: list[Path],
+    durations_by_path: dict[str, float] | None = None,
+    *,
+    model_size: str,
+    language: str | None,
+    cancel_check=None,
+    progress_callback=None,
+) -> tuple[dict[str, list], int]:
+    """Transcribe candidate probe WAVs in bounded batches and preserve partials."""
+    chunks = _candidate_transcription_chunks(paths, durations_by_path)
+    words_by_path: dict[str, list] = {}
+    total_chunks = len(chunks)
+    for chunk_index, chunk in enumerate(chunks, 1):
+        if cancel_check and cancel_check():
+            raise CancelledError("Pipeline cancelled")
+        chunk_seconds = sum(float((durations_by_path or {}).get(str(path), 0.0) or 0.0) for path in chunk)
+        if progress_callback:
+            progress_callback(chunk_index, total_chunks, chunk, chunk_seconds)
+        chunk_words = transcribe_clips(chunk, model_size=model_size, language=language)
+        for path, words in zip(chunk, chunk_words):
+            words_by_path[str(path)] = words
+    return words_by_path, total_chunks
 
 
 def _crop_tracking_profile(depth: str) -> dict:
@@ -405,6 +553,7 @@ def _depth_feature_statuses(
     ai_requested: bool,
     category_requested: bool,
     voice_requested: bool,
+    multimodal_requested: bool = False,
     voice_status: dict | None = None,
 ) -> dict:
     depth = _normalize_processing_depth(depth)
@@ -470,6 +619,13 @@ def _depth_feature_statuses(
             depth_profile.get("visual_diagnostics"),
             "Visual analysis samples frames to help local labels understand the clip.",
             "Visual analysis is off in settings.",
+        ),
+        "vision_context": status(
+            "vision_context",
+            multimodal_requested,
+            depth_profile.get("multimodal_analysis"),
+            "Deep Analysis can ask a local Ollama vision model what the sampled frames show.",
+            "Vision context is only automatic in Deep Analysis when a local vision model is installed.",
         ),
         "ai_moment_labels": status(
             "ai_moment_labels",
@@ -567,19 +723,173 @@ def _public_audio_stream(stream: dict) -> dict:
     }
 
 
-def _audio_stream_selection_summary(audio_source_debug: dict | None, selected_stream=None) -> dict:
+def _selected_audio_stream_profile(
+    audio_source_debug: dict | None,
+    selected_stream=None,
+    retry_report: dict | None = None,
+) -> dict | None:
+    audio_source_debug = audio_source_debug if isinstance(audio_source_debug, dict) else {}
+    try:
+        selected_ordinal = int(selected_stream)
+    except (TypeError, ValueError):
+        selected_ordinal = None
+
+    retry_report = retry_report if isinstance(retry_report, dict) else {}
+    accepted_stream = retry_report.get("accepted_stream")
+    try:
+        accepted_ordinal = int(accepted_stream)
+    except (TypeError, ValueError):
+        accepted_ordinal = None
+    if selected_ordinal is not None and accepted_ordinal == selected_ordinal:
+        for attempt in retry_report.get("attempts") or []:
+            if not isinstance(attempt, dict):
+                continue
+            try:
+                attempt_stream = int(attempt.get("stream"))
+            except (TypeError, ValueError):
+                continue
+            if attempt_stream == selected_ordinal:
+                profile = copy.deepcopy(attempt)
+                profile["ordinal"] = selected_ordinal
+                profile["title"] = profile.get("title") or f"0:a:{selected_ordinal}"
+                return profile
+
+    selection = audio_source_debug.get("stream_selection")
+    selection = selection if isinstance(selection, dict) else {}
+    for profile in selection.get("stream_profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        try:
+            ordinal = int(profile.get("ordinal"))
+        except (TypeError, ValueError):
+            continue
+        if selected_ordinal is not None and ordinal == selected_ordinal:
+            enriched = copy.deepcopy(profile)
+            selected_reason = selection.get("selected_reason") or audio_source_debug.get("selected_reason")
+            selected_confidence = selection.get("confidence", audio_source_debug.get("selected_confidence"))
+            if selected_reason and not enriched.get("selected_reason"):
+                enriched["selected_reason"] = str(selected_reason)
+            if selected_confidence is not None and enriched.get("selected_confidence") is None:
+                try:
+                    enriched["selected_confidence"] = round(
+                        max(0.0, min(1.0, float(selected_confidence))),
+                        4,
+                    )
+                except (TypeError, ValueError):
+                    pass
+            return enriched
+
+    try:
+        selection_stream = int(selection.get("selected_stream"))
+    except (TypeError, ValueError):
+        selection_stream = None
+    if selected_ordinal is not None and selection_stream == selected_ordinal:
+        title = selection.get("selected_title")
+        if not title:
+            for stream in audio_source_debug.get("streams") or []:
+                if not isinstance(stream, dict):
+                    continue
+                try:
+                    stream_ordinal = int(stream.get("ordinal"))
+                except (TypeError, ValueError):
+                    continue
+                if stream_ordinal == selected_ordinal:
+                    title = str(stream.get("title") or "")
+                    break
+        title = str(title or f"0:a:{selected_ordinal}")
+        title_lower = title.lower()
+        voice_hints = [
+            hint for hint in ("mic", "microphone", "voice", "commentary", "narration")
+            if hint in title_lower
+        ]
+        game_hints = [
+            hint for hint in ("game", "desktop", "system", "capture")
+            if hint in title_lower
+        ]
+        selected_reason = str(
+            selection.get("selected_reason") or audio_source_debug.get("selected_reason") or ""
+        )
+        try:
+            selected_confidence = float(
+                selection.get("confidence", audio_source_debug.get("selected_confidence", 0.0)) or 0.0
+            )
+        except (TypeError, ValueError):
+            selected_confidence = 0.0
+        creator_selected = "creator" in selected_reason.lower() and selected_confidence >= 0.55
+        return {
+            "ordinal": selected_ordinal,
+            "title": title,
+            "words": selection.get("selected_words", 0),
+            "selected_reason": selected_reason,
+            "selected_confidence": round(max(0.0, min(1.0, selected_confidence)), 4),
+            "voice_title_hints": voice_hints,
+            "game_title_hints": game_hints,
+            "creator_likeness_score": 0.62 if creator_selected else 0.0,
+            "natural_dialogue_score": 3.6 if creator_selected else 0.0,
+            "scripted_game_score": 0.0,
+            "acoustic_game_bed_score": 0.0,
+            "lyric_likelihood": 0.0,
+            "creator_exception_score": 0.0,
+        }
+
+    for stream in audio_source_debug.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        try:
+            ordinal = int(stream.get("ordinal"))
+        except (TypeError, ValueError):
+            continue
+        if selected_ordinal is not None and ordinal == selected_ordinal:
+            title = str(stream.get("title") or f"Track {ordinal + 1}")
+            title_lower = title.lower()
+            voice_hints = [
+                hint for hint in ("mic", "microphone", "voice", "commentary", "narration")
+                if hint in title_lower
+            ]
+            game_hints = [
+                hint for hint in ("game", "desktop", "system", "capture")
+                if hint in title_lower
+            ]
+            likely_role = str(stream.get("likely_role") or "")
+            return {
+                "ordinal": ordinal,
+                "title": title,
+                "words": 0,
+                "voice_title_hints": voice_hints,
+                "game_title_hints": game_hints,
+                "creator_likeness_score": 0.66 if likely_role == "commentary" or voice_hints else 0.0,
+                "natural_dialogue_score": 0.0,
+                "scripted_game_score": 0.0,
+                "acoustic_game_bed_score": 0.0,
+                "lyric_likelihood": 0.0,
+                "creator_exception_score": 0.0,
+            }
+    return None
+
+
+def _audio_stream_selection_summary(
+    audio_source_debug: dict | None,
+    selected_stream=None,
+    retry_report: dict | None = None,
+) -> dict:
     audio_source_debug = audio_source_debug if isinstance(audio_source_debug, dict) else {}
     selection = audio_source_debug.get("stream_selection")
     selection = selection if isinstance(selection, dict) else {}
     resolved_stream = selected_stream
     if resolved_stream is None:
         resolved_stream = audio_source_debug.get("selected_stream")
+    selected_profile = _selected_audio_stream_profile(
+        audio_source_debug,
+        selected_stream=resolved_stream,
+        retry_report=retry_report,
+    )
     summary = {
         "schema_version": selection.get("schema_version", 1),
         "status": selection.get("status") or ("manual" if audio_source_debug.get("mode") == "stream" else "unknown"),
         "mode": selection.get("mode") or audio_source_debug.get("mode") or "auto",
         "selected_stream": resolved_stream,
-        "selected_title": selection.get("selected_title"),
+        "selected_title": (selected_profile or {}).get("title") or selection.get("selected_title"),
+        "selected_words": (selected_profile or {}).get("words") or selection.get("selected_words"),
         "selected_reason": (
             selection.get("selected_reason")
             or audio_source_debug.get("selected_reason")
@@ -683,8 +993,6 @@ def _allowed_media_origin(origin: str | None) -> str | None:
     if not origin:
         return None
     text = str(origin).strip()
-    if text == "null":
-        return text
     try:
         parsed = urlparse(text)
     except Exception:
@@ -778,10 +1086,11 @@ class ApiBridge:
         self._scheduler_running = False
         self._delete_after_upload = False   # auto-delete clips after YouTube upload
         self._user_settings: dict = {}      # user settings persisted to disk
+        self._download_info_by_path: dict = {}
+        self._source_context: dict = {}
         self._pending_js: list[str] = []    # JS calls queued while window was hidden
         self._state_lock = threading.RLock()
         self._upload_lock = threading.Lock()
-        self._ollama_install_token: tuple[str, float] | None = None
         self._personalization_lock = threading.RLock()
         self._personalization: dict = self._empty_personalization()
         self._voice_profile_lock = threading.RLock()
@@ -825,9 +1134,16 @@ class ApiBridge:
     def get_settings(self):
         """Return user settings (persisted overrides merged with defaults)."""
         defaults = {
+            "generation_mode": "clips",
             "num_clips": NUM_CLIPS,
             "processing_depth": "balanced",
             "detection_preference": "auto",
+            "game_title_hint": "",
+            "montage": {
+                "template": "panic",
+                "target_duration": 60,
+                "prompt": "",
+            },
             "clip_duration": CLIP_DURATION,
             "min_gap": MIN_GAP,
             "whisper_model": WHISPER_MODEL,
@@ -855,6 +1171,10 @@ class ApiBridge:
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
             defaults.update(self._user_settings)
+        defaults["generation_mode"] = _normalize_generation_mode(defaults.get("generation_mode"))
+        defaults["montage"] = _normalize_montage_settings(defaults.get("montage"))
+        defaults["clip_duration"] = _normalize_clip_duration(defaults.get("clip_duration"))
+        defaults["min_gap"] = _normalize_min_gap(defaults.get("min_gap"))
         return defaults
 
     def get_app_metadata(self):
@@ -879,6 +1199,14 @@ class ApiBridge:
     def save_settings(self, settings):
         """Persist user settings to disk so they survive restarts."""
         cleaned = dict(settings or {})
+        if "generation_mode" in cleaned:
+            cleaned["generation_mode"] = _normalize_generation_mode(
+                cleaned.get("generation_mode")
+            )
+        if "montage" in cleaned:
+            cleaned["montage"] = _normalize_montage_settings(
+                cleaned.get("montage")
+            )
         if "detection_preference" in cleaned:
             cleaned["detection_preference"] = normalize_detection_preference(
                 cleaned.get("detection_preference")
@@ -886,6 +1214,18 @@ class ApiBridge:
         if "processing_depth" in cleaned:
             cleaned["processing_depth"] = _normalize_processing_depth(
                 cleaned.get("processing_depth")
+            )
+        if "game_title_hint" in cleaned:
+            cleaned["game_title_hint"] = self._sanitize_game_title_hint(
+                cleaned.get("game_title_hint")
+            )
+        if "clip_duration" in cleaned:
+            cleaned["clip_duration"] = _normalize_clip_duration(
+                cleaned.get("clip_duration")
+            )
+        if "min_gap" in cleaned:
+            cleaned["min_gap"] = _normalize_min_gap(
+                cleaned.get("min_gap")
             )
         if "subtitle_placement" in cleaned:
             cleaned["subtitle_placement"] = normalize_subtitle_placement(
@@ -1086,6 +1426,488 @@ class ApiBridge:
             return self._infer_game_title_from_path(self._results[clip_index])
         return ""
 
+    @staticmethod
+    def _sanitize_game_title_hint(value) -> str:
+        cleaned = normalize_game_title(str(value or ""))
+        cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned[:120]
+
+    @staticmethod
+    def _compact_game_context_for_state(context: dict | None) -> dict:
+        context = context if isinstance(context, dict) else {}
+        if not context:
+            return {}
+        facts = context.get("facts") if isinstance(context.get("facts"), dict) else {}
+        return {
+            "schema_version": context.get("schema_version", 1),
+            "status": str(context.get("status") or "")[:40],
+            "provider": str(context.get("provider") or "")[:40],
+            "qid": str(context.get("qid") or "")[:40],
+            "label": str(context.get("label") or "")[:140],
+            "description": str(context.get("description") or "")[:220],
+            "aliases": [str(item)[:100] for item in (context.get("aliases") or [])[:10]],
+            "source_url": str(context.get("source_url") or "")[:240],
+            "license": str(context.get("license") or "")[:80],
+            "facts": copy.deepcopy(facts),
+        }
+
+    def _compact_game_identity_for_state(self, identity: dict | None) -> dict:
+        identity = identity if isinstance(identity, dict) else {}
+        if not identity:
+            return {}
+        context = self._compact_game_context_for_state(identity.get("game_context"))
+        return {
+            "schema_version": identity.get("schema_version", 1),
+            "status": str(identity.get("status") or "")[:40],
+            "provider": str(identity.get("provider") or "")[:40],
+            "selection_impact": str(identity.get("selection_impact") or "game_context_lookup")[:80],
+            "confidence": self._game_identity_confidence(identity),
+            "title": str(identity.get("title") or context.get("label") or "")[:140],
+            "qid": str(identity.get("qid") or context.get("qid") or "")[:40],
+            "matched_via": str(identity.get("matched_via") or "")[:80],
+            "matched_candidate": copy.deepcopy(identity.get("matched_candidate")) if isinstance(identity.get("matched_candidate"), dict) else None,
+            "evidence": [copy.deepcopy(item) for item in (identity.get("evidence") or [])[:8] if isinstance(item, dict)],
+            "candidates": [copy.deepcopy(item) for item in (identity.get("candidates") or [])[:8] if isinstance(item, dict)],
+            "game_context": context,
+            "game_context_prompt": compact_game_context_for_prompt(context),
+        }
+
+    @staticmethod
+    def _compact_youtube_context_for_state(context: dict | None) -> dict:
+        context = context if isinstance(context, dict) else {}
+        if not context:
+            return {}
+        return {
+            "title": str(context.get("title") or "")[:180],
+            "uploader": str(context.get("uploader") or "")[:140],
+            "webpage_url": str(context.get("webpage_url") or "")[:300],
+            "categories": [str(item)[:80] for item in (context.get("categories") or [])[:8]],
+            "tags": [str(item)[:60] for item in (context.get("tags") or [])[:20]],
+            "context_text": str(context.get("context_text") or "")[:1400],
+        }
+
+    @staticmethod
+    def _safe_int(value, default: int = 1) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _normalize_download_info_store(store) -> dict:
+        if not isinstance(store, dict):
+            return {}
+        clean = {}
+        for path, info in store.items():
+            if not isinstance(info, dict):
+                continue
+            key = str(path or "").strip()
+            if not key:
+                continue
+            clean[key[:500]] = {
+                "schema_version": ApiBridge._safe_int(info.get("schema_version"), 1),
+                "source": str(info.get("source") or "")[:40],
+                "title": str(info.get("title") or "")[:180],
+                "uploader": str(info.get("uploader") or "")[:140],
+                "channel": str(info.get("channel") or "")[:140],
+                "webpage_url": str(info.get("webpage_url") or "")[:300],
+                "original_url": str(info.get("original_url") or "")[:300],
+                "categories": [str(item)[:80] for item in (info.get("categories") or [])[:8]],
+                "tags": [str(item)[:60] for item in (info.get("tags") or [])[:20]],
+                "description": str(info.get("description") or "")[:1000],
+            }
+        return clean
+
+    def _normalize_source_context_store(self, store) -> dict:
+        if not isinstance(store, dict):
+            return {}
+        sources = store.get("sources") if isinstance(store.get("sources"), dict) else store
+        clean = {}
+        for source_id, record in sources.items():
+            if not isinstance(record, dict):
+                continue
+            key = str(source_id or record.get("source_id") or "").strip()
+            if not key:
+                continue
+            identity = self._compact_game_identity_for_state(record.get("game_identity"))
+            context = self._compact_game_context_for_state(
+                record.get("game_context")
+                or (identity.get("game_context") if isinstance(identity, dict) else {})
+            )
+            clean[key[:80]] = {
+                "schema_version": self._safe_int(record.get("schema_version"), 1),
+                "source_id": key[:80],
+                "source_path": str(record.get("source_path") or "")[:500],
+                "source_name": str(record.get("source_name") or "")[:220],
+                "game_title_hint": self._sanitize_game_title_hint(record.get("game_title_hint")),
+                "game_title": str(record.get("game_title") or identity.get("title") or context.get("label") or "")[:140],
+                "game_identity": identity,
+                "game_context": context,
+                "youtube_context": self._compact_youtube_context_for_state(record.get("youtube_context")),
+                "updated_at": str(record.get("updated_at") or "")[:40],
+            }
+        return clean
+
+    def _source_record_for(self, video_path: Path | str | None = None, source_id: str = "") -> dict:
+        store = getattr(self, "_source_context", {})
+        if not isinstance(store, dict):
+            self._source_context = {}
+            return {}
+        key = str(source_id or "").strip()
+        if not key and video_path:
+            try:
+                key = self._source_id_for(video_path)
+            except Exception:
+                key = ""
+        if key and isinstance(store.get(key), dict):
+            return store[key]
+        if video_path:
+            try:
+                resolved = str(Path(video_path).resolve())
+            except Exception:
+                resolved = str(video_path or "")
+            for record in store.values():
+                if isinstance(record, dict) and str(record.get("source_path") or "") == resolved:
+                    return record
+        return {}
+
+    def _remember_source_context(
+        self,
+        video_path: Path | str | None,
+        *,
+        source_id: str = "",
+        game_title_hint: str = "",
+        game_identity: dict | None = None,
+        game_context: dict | None = None,
+        youtube_context: dict | None = None,
+        force: bool = False,
+        persist: bool = False,
+    ) -> dict:
+        if not hasattr(self, "_source_context") or not isinstance(self._source_context, dict):
+            self._source_context = {}
+        if not video_path and not source_id:
+            return {}
+        try:
+            resolved_path = str(Path(video_path).resolve()) if video_path else ""
+            source_name = Path(video_path).name if video_path else ""
+        except Exception:
+            resolved_path = str(video_path or "")
+            source_name = Path(str(video_path or "")).name if video_path else ""
+        key = str(source_id or "").strip() or self._source_id_for(resolved_path)
+        existing = self._source_context.get(key) if isinstance(self._source_context.get(key), dict) else {}
+        identity = self._compact_game_identity_for_state(game_identity)
+        context = self._compact_game_context_for_state(
+            game_context
+            or identity.get("game_context")
+            or existing.get("game_context")
+        )
+        old_identity = existing.get("game_identity") if isinstance(existing.get("game_identity"), dict) else {}
+        old_confidence = self._game_identity_confidence(old_identity)
+        new_confidence = self._game_identity_confidence(identity)
+        hint = self._sanitize_game_title_hint(game_title_hint or existing.get("game_title_hint"))
+        has_verified_new_identity = bool(
+            identity.get("qid")
+            and context.get("status") in {"ok", "cache_hit"}
+            and new_confidence > 0
+        )
+        should_replace_identity = bool(
+            not old_identity
+            or (
+                has_verified_new_identity
+                and (
+                    force
+                    or not old_identity.get("qid")
+                    or new_confidence >= old_confidence
+                )
+            )
+        )
+        if not should_replace_identity and old_identity:
+            identity = old_identity
+            context = self._compact_game_context_for_state(existing.get("game_context") or old_identity.get("game_context"))
+        record = {
+            "schema_version": 1,
+            "source_id": key,
+            "source_path": resolved_path,
+            "source_name": source_name,
+            "game_title_hint": hint,
+            "game_title": (
+                identity.get("title")
+                or context.get("label")
+                or existing.get("game_title")
+                or hint
+                or ""
+            ),
+            "game_identity": identity,
+            "game_context": context,
+            "youtube_context": self._compact_youtube_context_for_state(youtube_context or existing.get("youtube_context")),
+            "updated_at": self._utc_now_label(),
+        }
+        self._source_context[key] = record
+        if persist:
+            ready_for_state_save = all(
+                hasattr(self, attr)
+                for attr in ("_results", "_moments", "_scheduled", "_delete_after_upload", "_user_settings")
+            )
+            if ready_for_state_save:
+                try:
+                    self._save_state()
+                except Exception as exc:
+                    print(f"[game-context] Failed to persist source memory: {exc}")
+        return record
+
+    def _remembered_game_identity_for_source(
+        self,
+        video_path: Path | str | None,
+        *,
+        source_id: str = "",
+        explicit_title: str = "",
+    ) -> dict:
+        record = self._source_record_for(video_path, source_id)
+        identity = record.get("game_identity") if isinstance(record.get("game_identity"), dict) else {}
+        if not identity:
+            return {}
+        confidence = self._game_identity_confidence(identity)
+        has_verified_context = bool(
+            identity.get("qid")
+            and isinstance(identity.get("game_context"), dict)
+            and identity["game_context"].get("status") in {"ok", "cache_hit"}
+            and confidence >= 0.72
+        )
+        if not has_verified_context:
+            return {}
+        explicit = self._sanitize_game_title_hint(explicit_title)
+        remembered_title = self._sanitize_game_title_hint(
+            record.get("game_title_hint") or identity.get("title") or record.get("game_title")
+        )
+        if explicit and remembered_title and explicit.lower() != remembered_title.lower():
+            return {}
+        return identity
+
+    def _game_context_for_title(self, game_title: str, *, allow_network: bool = False) -> dict:
+        try:
+            return get_game_context(
+                game_title,
+                allow_network=allow_network,
+                timeout=8,
+            )
+        except Exception as exc:
+            return {
+                "schema_version": 1,
+                "status": "query_error",
+                "provider": "wikidata",
+                "game_title": str(game_title or "")[:120],
+                "available": False,
+                "error": str(exc)[:180],
+            }
+
+    def _game_identity_for_source(
+        self,
+        video_path: Path,
+        *,
+        allow_network: bool = False,
+        explicit_title: str | None = None,
+        creator_context: str | None = None,
+        transcript: str | None = None,
+    ) -> dict:
+        explicit_title = self._sanitize_game_title_hint(explicit_title)
+        remembered = self._remembered_game_identity_for_source(
+            video_path,
+            explicit_title=explicit_title,
+        )
+        if remembered and not creator_context and not transcript:
+            return remembered
+        youtube_context = self._youtube_context_for_source(video_path)
+        if youtube_context:
+            explicit_title = explicit_title or youtube_context.get("title") or ""
+            creator_context = " ".join(
+                part
+                for part in (
+                    creator_context or "",
+                    youtube_context.get("context_text") or "",
+                )
+                if str(part or "").strip()
+            )
+        try:
+            identity = resolve_game_identity(
+                source_path=video_path,
+                explicit_title=explicit_title or self._infer_game_title_from_path(video_path),
+                creator_context=creator_context,
+                transcript=transcript,
+                allow_network=allow_network,
+                timeout=8,
+            )
+            self._remember_source_context(
+                video_path,
+                game_title_hint=explicit_title,
+                game_identity=identity,
+                game_context=identity.get("game_context") if isinstance(identity, dict) else {},
+                youtube_context=youtube_context,
+                force=bool(explicit_title),
+                persist=True,
+            )
+            return identity
+        except Exception as exc:
+            fallback_title = explicit_title or self._infer_game_title_from_path(video_path)
+            identity = {
+                "schema_version": 1,
+                "status": "query_error",
+                "provider": "wikidata",
+                "selection_impact": "game_context_lookup",
+                "title": str(fallback_title or "")[:120],
+                "qid": "",
+                "confidence": 0.0,
+                "evidence": [],
+                "game_context": self._game_context_for_title(fallback_title, allow_network=False),
+                "error": str(exc)[:180],
+            }
+            self._remember_source_context(
+                video_path,
+                game_title_hint=explicit_title,
+                game_identity=identity,
+                game_context=identity.get("game_context"),
+                youtube_context=youtube_context,
+                persist=True,
+            )
+            return identity
+
+    @staticmethod
+    def _game_identity_confidence(identity: dict | None) -> float:
+        identity = identity if isinstance(identity, dict) else {}
+        try:
+            return max(0.0, min(1.0, float(identity.get("confidence") or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _refresh_clip_game_identity_for_metadata(
+        self,
+        clip_index: int,
+        *,
+        allow_network: bool = False,
+        force: bool = False,
+    ) -> dict:
+        """Refresh weak/missing game identity before AI metadata generation."""
+        if clip_index < 0 or clip_index >= len(self._results):
+            return {}
+        while len(self._moments) <= clip_index:
+            self._moments.append({})
+        moment = self._moments[clip_index] if isinstance(self._moments[clip_index], dict) else {}
+        existing_identity = moment.get("game_identity") if isinstance(moment.get("game_identity"), dict) else {}
+        existing_context = moment.get("game_context") if isinstance(moment.get("game_context"), dict) else {}
+        existing_confidence = self._game_identity_confidence(existing_identity)
+        has_verified_context = bool(
+            existing_identity.get("qid")
+            and existing_context.get("status") in {"ok", "cache_hit"}
+            and existing_confidence >= 0.72
+        )
+        creator_context = sanitize_creator_title_context(moment.get("creator_title_context"))
+        if has_verified_context and not force:
+            return existing_identity
+        if has_verified_context and force and not creator_context:
+            return existing_identity
+
+        try:
+            video_path = Path(moment.get("source_path") or self._results[clip_index])
+        except Exception:
+            video_path = Path(self._results[clip_index])
+        source_record = self._source_record_for(video_path, moment.get("source_id", ""))
+        game_title_hint = self._sanitize_game_title_hint(
+            moment.get("game_title_hint") or source_record.get("game_title_hint")
+        )
+        explicit_title = game_title_hint or str(moment.get("game_title") or source_record.get("game_title") or "").strip()
+        if existing_confidence < 0.55 and not game_title_hint:
+            explicit_title = ""
+        identity = self._game_identity_for_source(
+            video_path,
+            allow_network=allow_network,
+            explicit_title=explicit_title,
+            creator_context=creator_context,
+            transcript=str(moment.get("transcript") or "")[:1200],
+        )
+        if not isinstance(identity, dict):
+            return existing_identity
+        new_confidence = self._game_identity_confidence(identity)
+        game_context = identity.get("game_context") if isinstance(identity.get("game_context"), dict) else {}
+        should_apply = bool(
+            identity.get("qid")
+            and game_context.get("status") in {"ok", "cache_hit"}
+            and (
+                not existing_identity.get("qid")
+                or new_confidence >= existing_confidence
+                or (force and existing_confidence < 0.72)
+            )
+        )
+        if not should_apply:
+            return existing_identity
+        if game_title_hint:
+            moment["game_title_hint"] = game_title_hint
+        moment["game_title"] = identity.get("title") or game_context.get("label") or moment.get("game_title") or ""
+        moment["game_identity"] = identity
+        moment["game_context"] = game_context
+        self._moments[clip_index] = moment
+        return identity
+
+    def _youtube_context_for_source(self, video_path: Path | str | None) -> dict:
+        info_by_path = getattr(self, "_download_info_by_path", {})
+        if not isinstance(info_by_path, dict) or not video_path:
+            return {}
+        try:
+            resolved = str(Path(video_path).resolve())
+        except Exception:
+            resolved = str(video_path or "")
+        info = info_by_path.get(resolved)
+        if not isinstance(info, dict):
+            return {}
+        title = str(info.get("title") or "").strip()
+        uploader = str(info.get("uploader") or info.get("channel") or "").strip()
+        webpage_url = str(info.get("webpage_url") or info.get("original_url") or "").strip()
+        categories = [
+            str(item).strip()
+            for item in (info.get("categories") or [])
+            if str(item or "").strip()
+        ][:6]
+        tags = [
+            str(item).strip()
+            for item in (info.get("tags") or [])
+            if str(item or "").strip()
+        ][:12]
+        description = re.sub(r"\s+", " ", str(info.get("description") or "")).strip()[:700]
+        context_text = " ".join(
+            part
+            for part in (
+                f"YouTube title: {title}" if title else "",
+                f"Channel: {uploader}" if uploader else "",
+                f"Categories: {', '.join(categories)}" if categories else "",
+                f"Tags: {', '.join(tags)}" if tags else "",
+                f"Description: {description}" if description else "",
+            )
+            if part
+        )
+        return {
+            "title": title,
+            "uploader": uploader,
+            "webpage_url": webpage_url,
+            "categories": categories,
+            "tags": tags,
+            "context_text": context_text[:1400],
+        }
+
+    def _game_context_for_source(self, video_path: Path, *, allow_network: bool = False) -> dict:
+        identity = self._game_identity_for_source(video_path, allow_network=allow_network)
+        context = identity.get("game_context") if isinstance(identity.get("game_context"), dict) else {}
+        if context:
+            return context
+        return self._game_context_for_title(identity.get("title") or self._infer_game_title_from_path(video_path), allow_network=allow_network)
+
+    def _feedback_learning_prompt_context(self) -> dict:
+        lock = getattr(self, "_personalization_lock", threading.RLock())
+        personalization = getattr(self, "_personalization", self._empty_personalization())
+        if not isinstance(personalization, dict):
+            personalization = self._empty_personalization()
+        with lock:
+            personalization_snapshot = json.loads(json.dumps(personalization))
+        return build_learning_prompt_context(personalization_snapshot)
+
     def _title_context_for_clip(self, clip_index: int) -> dict:
         if clip_index < 0 or clip_index >= len(self._moments):
             return {}
@@ -1093,14 +1915,39 @@ class ApiBridge:
         if not isinstance(moment, dict):
             return {}
         ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+        multi_signal_ai = (
+            moment.get("multi_signal_ai_scoring")
+            if isinstance(moment.get("multi_signal_ai_scoring"), dict)
+            else {}
+        )
+        source_record = self._source_record_for(moment.get("source_path"), moment.get("source_id"))
+        source_identity = source_record.get("game_identity") if isinstance(source_record.get("game_identity"), dict) else {}
+        source_context = source_record.get("game_context") if isinstance(source_record.get("game_context"), dict) else {}
+        game_identity = moment.get("game_identity") if isinstance(moment.get("game_identity"), dict) else source_identity
+        game_context = moment.get("game_context") if isinstance(moment.get("game_context"), dict) else source_context
+        game_title_hint = self._sanitize_game_title_hint(
+            moment.get("game_title_hint") or source_record.get("game_title_hint")
+        )
+        game_title = (
+            str(moment.get("game_title") or "").strip()
+            or source_record.get("game_title")
+            or source_context.get("label")
+            or game_title_hint
+            or self._game_title_for_clip(clip_index)
+            or ""
+        )
         context = {
             "schema_version": 1,
             "clip_id": moment.get("clip_id"),
             "source_id": moment.get("source_id"),
             "source_path": moment.get("source_path"),
             "source_stem": moment.get("source_stem"),
+            "source_context": source_record,
             "creator_title_context": sanitize_creator_title_context(moment.get("creator_title_context")),
-            "game_title": self._game_title_for_clip(clip_index),
+            "game_title_hint": game_title_hint,
+            "game_title": game_title,
+            "game_identity": game_identity,
+            "game_context": game_context,
             "start": moment.get("start"),
             "end": moment.get("end"),
             "duration": moment.get("duration"),
@@ -1125,6 +1972,10 @@ class ApiBridge:
             "primary_category": moment.get("primary_category"),
             "ai_moment_classification": moment.get("ai_moment_classification"),
             "visual_diagnostics": moment.get("visual_diagnostics"),
+            "multimodal_analysis": moment.get("multimodal_analysis"),
+            "multi_signal_ai_quality_score": moment.get("multi_signal_ai_quality_score"),
+            "multi_signal_ai_adjustment": moment.get("multi_signal_ai_adjustment"),
+            "multi_signal_ai_scoring": multi_signal_ai,
             "commentary_guard": moment.get("commentary_guard"),
             "voice_profile": moment.get("voice_profile"),
             "word_count": moment.get("word_count"),
@@ -1139,6 +1990,7 @@ class ApiBridge:
             "transcript_source": moment.get("transcript_source"),
             "transcript_backfilled": moment.get("transcript_backfilled"),
             "transcript": str(moment.get("transcript") or "")[:4000],
+            "truth_summary": self._clip_truth_summary(moment, moment.get("source_path")),
             "ranker": {
                 "hook_points": ranker.get("hook_points"),
                 "weak_points": ranker.get("weak_points"),
@@ -1148,9 +2000,90 @@ class ApiBridge:
                 "reject_reason": ranker.get("reject_reason"),
             },
         }
+        if not context["game_context"] and context.get("game_title"):
+            context["game_context"] = self._game_context_for_title(context["game_title"], allow_network=False)
+        context["feedback_learning_context"] = self._feedback_learning_prompt_context()
         if 0 <= clip_index < len(self._results):
             context["clip_filename"] = self._results[clip_index].name
         return context
+
+    def _ensure_metadata_vision_context(self, clip_index: int, clip_context: dict | None = None) -> dict:
+        """Backfill local vision context from the rendered clip when metadata needs it."""
+        context = dict(clip_context or {})
+        if clip_index < 0 or clip_index >= len(self._results) or clip_index >= len(self._moments):
+            return context
+        moment = self._moments[clip_index]
+        if not isinstance(moment, dict):
+            return context
+        existing = moment.get("multimodal_analysis")
+        if isinstance(existing, dict) and existing.get("status") == "ok":
+            context["multimodal_analysis"] = existing
+            return context
+
+        clip_path = Path(self._results[clip_index])
+        if not clip_path.exists():
+            return context
+        try:
+            vision_status = ollama_vision_status()
+        except Exception:
+            return context
+        if not vision_status.get("model_ready"):
+            return context
+
+        duration = self._probe_media_duration(
+            clip_path,
+            default=_safe_float_value(context.get("duration"), 30.0) or 30.0,
+        )
+        duration = max(1.0, float(duration or 0.0))
+        candidate = {
+            "start": 0.0,
+            "end": duration,
+            "duration": duration,
+            "peak_time": duration / 2.0,
+            "candidate_rank": context.get("candidate_rank"),
+            "candidate_kind": "rendered_clip_metadata",
+            "quality_score": context.get("quality_score"),
+            "primary_category": context.get("primary_category"),
+            "moment_categories": context.get("moment_categories"),
+            "visual_diagnostics": context.get("visual_diagnostics"),
+        }
+        analysis = analyze_candidate_frames_with_ollama(
+            clip_path,
+            candidate,
+            transcript=str(context.get("transcript") or moment.get("transcript") or ""),
+            game_title=str(context.get("game_title") or ""),
+            game_context=context.get("game_context") if isinstance(context.get("game_context"), dict) else {},
+            learning_context=context.get("feedback_learning_context"),
+            video_duration=duration,
+            enabled=True,
+            model=str(vision_status.get("model") or DEFAULT_VISION_MODEL),
+            max_frames=3,
+            timeout=45,
+        )
+        if isinstance(analysis, dict):
+            moment["multimodal_analysis"] = analysis
+            ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+            ranker["multimodal_analysis"] = analysis
+            moment["ranker"] = ranker
+            context["multimodal_analysis"] = analysis
+        return context
+
+    def _generated_description_for_clip(
+        self,
+        title: str,
+        transcript: str,
+        game_title: str,
+        clip_context: dict | None,
+    ) -> str:
+        ai_body = generate_ai_description_body(
+            title,
+            transcript=transcript,
+            game_title=game_title,
+            clip_context=clip_context,
+        )
+        if ai_body:
+            return ai_body
+        return generated_description_body(title, game_title, clip_context)
 
     def _tags_for_game(self, game_title: str, transcript: str = "", clip_context: dict | None = None) -> str:
         return generate_tags(game_title, transcript, clip_context=clip_context)
@@ -1235,6 +2168,26 @@ class ApiBridge:
         ]
         if context_summary.get("creator_title_context"):
             lines.append(f"Creator Context: {context_summary['creator_title_context']}")
+        game_knowledge = context_summary.get("game_knowledge") if isinstance(context_summary.get("game_knowledge"), dict) else {}
+        if game_knowledge.get("available"):
+            game_bits = [str(game_knowledge.get("label") or game_title or "Unknown")]
+            if game_knowledge.get("release_year"):
+                game_bits.append(str(game_knowledge.get("release_year")))
+            if game_knowledge.get("genres"):
+                game_bits.append(", ".join(game_knowledge.get("genres")[:3]))
+            if game_knowledge.get("series"):
+                game_bits.append("series: " + ", ".join(game_knowledge.get("series")[:2]))
+            lines.append(f"Game Knowledge: {' | '.join(bit for bit in game_bits if bit)}")
+        vision = context_summary.get("multimodal_analysis")
+        if isinstance(vision, dict) and vision.get("status"):
+            vision_bits = [str(vision.get("status") or "unknown")]
+            if vision.get("model"):
+                vision_bits.append(str(vision.get("model")))
+            if vision.get("primary_visual_label"):
+                vision_bits.append(str(vision.get("primary_visual_label")).replace("_", " "))
+            if vision.get("visible_summary"):
+                vision_bits.append(str(vision.get("visible_summary")))
+            lines.append(f"Vision Context: {' | '.join(bit for bit in vision_bits if bit)}")
         sidecar = clip_path.with_suffix(".txt")
         try:
             sidecar.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1242,6 +2195,50 @@ class ApiBridge:
         except Exception as exc:
             print(f"[metadata] Failed to write sidecar for {clip_path.name}: {exc}")
             return ""
+
+    def _delete_metadata_sidecar_path(
+        self,
+        sidecar_path,
+        *,
+        keep_path=None,
+        reason: str = "",
+    ) -> bool:
+        """Delete a generated metadata .txt file after validating it is local app data."""
+        sidecar = self._safe_path_under(CLIPS_DIR, sidecar_path)
+        if not sidecar or sidecar.suffix.lower() != ".txt" or not sidecar.exists() or not sidecar.is_file():
+            return False
+        keep = self._safe_path_under(CLIPS_DIR, keep_path) if keep_path else None
+        if keep and sidecar.resolve() == keep.resolve():
+            return False
+        try:
+            sidecar.unlink()
+            suffix = f" ({reason})" if reason else ""
+            print(f"[cleanup] Deleted clip metadata sidecar: {sidecar.name}{suffix}")
+            return True
+        except Exception as exc:
+            print(f"[cleanup] Failed to delete metadata sidecar {sidecar.name}: {exc}")
+            return False
+
+    def _delete_stale_metadata_sidecars(
+        self,
+        sidecar_paths,
+        *,
+        keep_path=None,
+        reason: str = "",
+    ) -> int:
+        deleted = 0
+        seen: set[str] = set()
+        for sidecar_path in sidecar_paths or []:
+            sidecar = self._safe_path_under(CLIPS_DIR, sidecar_path)
+            if not sidecar:
+                continue
+            key = str(sidecar)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._delete_metadata_sidecar_path(sidecar, keep_path=keep_path, reason=reason):
+                deleted += 1
+        return deleted
 
     def _store_generated_metadata(
         self,
@@ -1292,8 +2289,6 @@ class ApiBridge:
         If transcripts are missing (e.g. clips from a previous session where
         moments were lost), auto-transcribe the clip audio first.
         """
-        from title_generator import DEFAULT_MODEL
-
         num_clips = len(self._results)
         # Sync moments to match results count exactly
         if len(self._moments) > num_clips:
@@ -1310,7 +2305,12 @@ class ApiBridge:
             self._save_state()
 
         transcripts = [m.get("transcript", "") for m in self._moments]
-        title_contexts = [self._title_context_for_clip(i) for i in range(num_clips)]
+        for i in range(num_clips):
+            self._refresh_clip_game_identity_for_metadata(i, allow_network=True)
+        title_contexts = [
+            self._ensure_metadata_vision_context(i, self._title_context_for_clip(i))
+            for i in range(num_clips)
+        ]
         game_titles = [context.get("game_title", "") for context in title_contexts]
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
@@ -1327,7 +2327,18 @@ class ApiBridge:
                 continue
             game_title = game_titles[i] if i < len(game_titles) else ""
             clip_context = title_contexts[i] if i < len(title_contexts) else {}
-            desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+            generated_description = self._generated_description_for_clip(
+                title,
+                transcripts[i] if i < len(transcripts) else "",
+                game_title,
+                clip_context,
+            )
+            desc_parts = self._compose_clip_description(
+                title,
+                game_title,
+                clip_context=clip_context,
+                generated_text=generated_description,
+            )
             description = desc_parts["description"]
             tags = self._tags_for_game(
                 game_title,
@@ -1365,7 +2376,7 @@ class ApiBridge:
         self._save_state()
         return {"titles": titles, "metadata": metadata, "llm": llm_available}
 
-    def generate_title_for_clip(self, clip_index):
+    def generate_title_for_clip(self, clip_index, save=True, creator_title_context=None):
         """Generate a title for a single clip."""
         # Ensure moments list matches results length
         while len(self._moments) < len(self._results):
@@ -1373,6 +2384,15 @@ class ApiBridge:
 
         if clip_index < 0 or clip_index >= len(self._moments):
             return {"title": "", "error": "Invalid clip index"}
+
+        if creator_title_context is not None:
+            context = sanitize_creator_title_context(creator_title_context)
+            moment = self._moments[clip_index] if isinstance(self._moments[clip_index], dict) else {}
+            if context:
+                moment["creator_title_context"] = context
+            else:
+                moment.pop("creator_title_context", None)
+            self._moments[clip_index] = moment
 
         transcript = self._moments[clip_index].get("transcript", "")
 
@@ -1383,10 +2403,29 @@ class ApiBridge:
 
         if not transcript:
             return {"title": "", "error": "No transcript for this clip"}
-        clip_context = self._title_context_for_clip(clip_index)
+        self._refresh_clip_game_identity_for_metadata(
+            clip_index,
+            allow_network=True,
+            force=creator_title_context is not None,
+        )
+        clip_context = self._ensure_metadata_vision_context(
+            clip_index,
+            self._title_context_for_clip(clip_index),
+        )
         game_title = clip_context.get("game_title") or self._game_title_for_clip(clip_index)
         title = generate_title(transcript, game_title=game_title, clip_context=clip_context)
-        desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+        generated_description = self._generated_description_for_clip(
+            title,
+            transcript,
+            game_title,
+            clip_context,
+        )
+        desc_parts = self._compose_clip_description(
+            title,
+            game_title,
+            clip_context=clip_context,
+            generated_text=generated_description,
+        )
         description = desc_parts["description"]
         tags = self._tags_for_game(game_title, transcript, clip_context=clip_context)
         metadata_file = self._write_metadata_sidecar(clip_index, title, game_title, description, tags, clip_context)
@@ -1402,7 +2441,8 @@ class ApiBridge:
             custom_text=desc_parts["description_custom_text"],
             auto_hashtags=desc_parts["description_auto_hashtags"],
         )
-        self._save_state()
+        if save:
+            self._save_state()
         return {
             "title": title,
             "description": description,
@@ -1418,15 +2458,111 @@ class ApiBridge:
             "metadata_file": metadata_file,
         }
 
-    def rename_clip(self, clip_index, new_title):
+    def _generate_auto_metadata_for_results(
+        self,
+        first_clip_index: int,
+        clip_count: int,
+        final_clip_debug: list[dict] | None = None,
+        run_warnings: list[str] | None = None,
+    ) -> list[dict]:
+        """Write metadata and rename freshly rendered clips to their AI titles."""
+        auto_metadata: list[dict] = []
+        total = max(0, int(clip_count or 0))
+        for offset in range(total):
+            if self._cancel:
+                raise CancelledError()
+            clip_index = int(first_clip_index) + offset
+            try:
+                self._push(
+                    "render",
+                    96,
+                    f"Clip {offset + 1}/{total}: Writing AI title and description...",
+                )
+                metadata = self.generate_title_for_clip(clip_index, save=False)
+                if metadata and not metadata.get("error"):
+                    old_metadata_file = metadata.get("metadata_file")
+                    original_path = str(self._results[clip_index]) if 0 <= clip_index < len(self._results) else ""
+                    rename_result = self.rename_clip(clip_index, metadata.get("title", ""), save=False)
+                    current_path = str(self._results[clip_index]) if 0 <= clip_index < len(self._results) else ""
+                    renamed = (
+                        "filename" in rename_result
+                        or ("path" in rename_result and not rename_result.get("error"))
+                        or (current_path and original_path and current_path != original_path)
+                    )
+                    if renamed:
+                        clip_context = self._title_context_for_clip(clip_index)
+                        metadata_file = self._write_metadata_sidecar(
+                            clip_index,
+                            metadata.get("title", ""),
+                            metadata.get("game_title", ""),
+                            metadata.get("description", ""),
+                            metadata.get("tags", ""),
+                            clip_context,
+                        )
+                        self._delete_stale_metadata_sidecars(
+                            [
+                                old_metadata_file,
+                                Path(original_path).with_suffix(".txt") if original_path else "",
+                            ],
+                            keep_path=metadata_file,
+                            reason="title_reroll",
+                        )
+                        metadata["metadata_file"] = metadata_file
+                        self._store_generated_metadata(
+                            clip_index,
+                            metadata.get("title", ""),
+                            metadata.get("description", ""),
+                            metadata.get("tags", ""),
+                            metadata.get("game_title", ""),
+                            metadata_file,
+                            clip_context,
+                            generated_description=metadata.get("generated_description"),
+                            custom_text=metadata.get("description_custom_text"),
+                            auto_hashtags=metadata.get("description_auto_hashtags"),
+                        )
+                    metadata["renamed"] = bool(renamed)
+                    metadata["filename"] = rename_result.get(
+                        "filename",
+                        self._results[clip_index].name if 0 <= clip_index < len(self._results) else "",
+                    )
+                    metadata["path"] = rename_result.get(
+                        "path",
+                        str(self._results[clip_index]) if 0 <= clip_index < len(self._results) else "",
+                    )
+                    auto_metadata.append({"clip_index": clip_index, **metadata})
+                    if final_clip_debug is not None and offset < len(final_clip_debug):
+                        if renamed:
+                            final_clip_debug[offset]["path"] = metadata.get("path")
+                            final_clip_debug[offset]["filename"] = metadata.get("filename")
+                        final_clip_debug[offset]["generated_metadata"] = {
+                            "title": metadata.get("title"),
+                            "description": metadata.get("description"),
+                            "final_description": metadata.get("final_description"),
+                            "generated_description": metadata.get("generated_description"),
+                            "tags": metadata.get("tags"),
+                            "game_title": metadata.get("game_title"),
+                            "creator_title_context": metadata.get("creator_title_context"),
+                            "metadata_file": metadata.get("metadata_file"),
+                            "renamed": metadata.get("renamed"),
+                            "filename": metadata.get("filename"),
+                        }
+            except CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[metadata] Auto metadata failed for clip {clip_index}: {exc}")
+                if run_warnings is not None:
+                    run_warnings.append(f"clip_{offset + 1}_auto_metadata_failed")
+        return auto_metadata
+
+    def rename_clip(self, clip_index, new_title, save=True):
         """Rename a clip file on disk to match a new title.
 
         Returns the new filename, or error.
         """
         if clip_index < 0 or clip_index >= len(self._results):
             return {"error": "Invalid clip index"}
-        old_path = self._results[clip_index]
-        if not old_path.exists():
+        old_path = self._safe_clip_path(self._results[clip_index])
+        if not old_path:
             return {"error": "File not found"}
 
         # Sanitize title for filesystem
@@ -1441,19 +2577,27 @@ class ApiBridge:
         ext = old_path.suffix
         new_name = f"{safe}{ext}"
         new_path = old_path.parent / new_name
+        safe_new_path = self._safe_path_under(CLIPS_DIR, new_path)
+        if not safe_new_path:
+            return {"error": "Unsafe output path"}
+        new_path = safe_new_path
 
         # Avoid collisions
         if new_path.exists() and new_path != old_path:
             counter = 2
             while new_path.exists():
                 new_name = f"{safe} ({counter}){ext}"
-                new_path = old_path.parent / new_name
+                safe_new_path = self._safe_path_under(CLIPS_DIR, old_path.parent / new_name)
+                if not safe_new_path:
+                    return {"error": "Unsafe output path"}
+                new_path = safe_new_path
                 counter += 1
 
         try:
             old_path.rename(new_path)
             self._results[clip_index] = new_path
-            self._save_state()
+            if save:
+                self._save_state()
             print(f"[rename] {old_path.name} → {new_path.name}")
             return {"filename": new_path.name, "path": str(new_path)}
         except Exception as e:
@@ -1486,8 +2630,6 @@ class ApiBridge:
         are transcribed and titled. Otherwise all clips are processed.
         """
         try:
-            from title_generator import DEFAULT_MODEL
-
             num_clips = len(self._results)
             print(f"[title-gen] {num_clips} clips, {len(self._moments)} moments in state")
 
@@ -1525,7 +2667,11 @@ class ApiBridge:
             title_contexts = [{} for _ in range(num_clips)]
             for i in target_indices:
                 transcripts[i] = self._moments[i].get("transcript", "")
-                title_contexts[i] = self._title_context_for_clip(i)
+                self._refresh_clip_game_identity_for_metadata(i, allow_network=True)
+                title_contexts[i] = self._ensure_metadata_vision_context(
+                    i,
+                    self._title_context_for_clip(i),
+                )
                 game_titles[i] = title_contexts[i].get("game_title") or self._game_title_for_clip(i)
             if not any(transcripts[i] for i in target_indices):
                 self._js("window.onTitlesDone && window.onTitlesDone({error: 'No transcripts available'})")
@@ -1557,13 +2703,30 @@ class ApiBridge:
                 if not title:
                     results.append({"index": i, "title": "", "renamed": False})
                     continue
-                r = self.rename_clip(i, title)
+                original_path = self._results[i] if i < len(self._results) else None
+                old_metadata_file = ""
+                if i < len(self._moments) and isinstance(self._moments[i], dict):
+                    generated_metadata = self._moments[i].get("generated_metadata")
+                    if isinstance(generated_metadata, dict):
+                        old_metadata_file = str(generated_metadata.get("metadata_file") or "")
+                r = self.rename_clip(i, title, save=False)
                 ok = "filename" in r
                 if ok:
                     renamed += 1
                 game_title = game_titles[i] if i < len(game_titles) else ""
                 clip_context = title_contexts[i] if i < len(title_contexts) else {}
-                desc_parts = self._compose_clip_description(title, game_title, clip_context=clip_context)
+                generated_description = self._generated_description_for_clip(
+                    title,
+                    transcripts[i] if i < len(transcripts) else "",
+                    game_title,
+                    clip_context,
+                )
+                desc_parts = self._compose_clip_description(
+                    title,
+                    game_title,
+                    clip_context=clip_context,
+                    generated_text=generated_description,
+                )
                 description = desc_parts["description"]
                 tags = self._tags_for_game(
                     game_title,
@@ -1571,6 +2734,14 @@ class ApiBridge:
                     clip_context=clip_context,
                 )
                 metadata_file = self._write_metadata_sidecar(i, title, game_title, description, tags, clip_context)
+                self._delete_stale_metadata_sidecars(
+                    [
+                        old_metadata_file,
+                        Path(original_path).with_suffix(".txt") if original_path else "",
+                    ],
+                    keep_path=metadata_file,
+                    reason="title_reroll",
+                )
                 self._store_generated_metadata(
                     i,
                     title,
@@ -1660,12 +2831,31 @@ class ApiBridge:
         return {"models": models, "available": len(models) > 0}
 
     def get_ollama_status(self):
-        """Return whether Ollama is running and ready for title generation."""
+        """Return whether Ollama is running and ready for text and vision AI."""
         status = ollama_status()
+        vision = ollama_vision_status(status.get("models") if status.get("running") else [])
+        status["text_model"] = {
+            "model": status.get("model", DEFAULT_MODEL),
+            "model_ready": bool(status.get("model_ready")),
+            "using_ollama": bool(status.get("using_ollama")),
+        }
+        status["vision"] = {
+            "running": bool(status.get("running")),
+            "preferred_model": DEFAULT_VISION_MODEL,
+            "model": vision.get("model") or "",
+            "model_ready": bool(vision.get("model_ready")),
+            "using_vision": bool(status.get("running") and vision.get("model_ready")),
+            "supported_model_hints": vision.get("supported_model_hints", []),
+        }
+        status["vision_model"] = status["vision"]["model"]
+        status["vision_model_ready"] = status["vision"]["model_ready"]
+        status["using_ollama_vision"] = status["vision"]["using_vision"]
         install_path = shutil.which("ollama.exe") or shutil.which("ollama")
         if install_path:
             status["install_path"] = str(Path(install_path))
-        status["installed"] = bool(status.get("running") or install_path)
+        status["service_running"] = bool(status.get("running"))
+        status["binary_on_path"] = bool(install_path)
+        status["installed"] = bool(install_path)
         return status
 
     def open_ollama_folder(self):
@@ -1692,41 +2882,6 @@ class ApiBridge:
             "docs_url": OLLAMA_WINDOWS_DOCS_URL,
         }
 
-    def prepare_ollama_install(self):
-        """Create a short-lived token after the UI asks for install confirmation."""
-        token = uuid.uuid4().hex
-        self._ollama_install_token = (token, time.time())
-        return {
-            "ok": True,
-            "token": token,
-            "command": "irm https://ollama.com/install.ps1 | iex",
-            "url": OLLAMA_DOWNLOAD_URL,
-        }
-
-    def install_ollama_with_powershell(self, token=None):
-        """Start Ollama's official Windows install script after UI confirmation."""
-        expected, created_at = self._ollama_install_token or ("", 0)
-        self._ollama_install_token = None
-        if not token or token != expected or time.time() - created_at > 120:
-            return {"error": "Ollama install confirmation expired. Try again from the app UI."}
-        command = [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            f"irm {OLLAMA_INSTALL_SCRIPT_URL} | iex",
-        ]
-        try:
-            subprocess.Popen(command, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-        except Exception as e:
-            return {"error": str(e), "url": OLLAMA_DOWNLOAD_URL}
-        return {
-            "ok": True,
-            "command": "irm https://ollama.com/install.ps1 | iex",
-            "url": OLLAMA_DOWNLOAD_URL,
-        }
-
     def open_youtube_oauth_console(self):
         """Open Google Cloud credentials page for YouTube OAuth setup."""
         try:
@@ -1745,8 +2900,17 @@ class ApiBridge:
 
     def ensure_ollama_model(self, model=None):
         """Ensure the title generation model is downloaded. Auto-pulls if needed."""
-        from title_generator import DEFAULT_MODEL
-        model = model or DEFAULT_MODEL
+        if model and str(model).strip() != DEFAULT_MODEL:
+            return {"ready": False, "model": DEFAULT_MODEL, "error": "Only the approved ViriaRevive text model can be downloaded from the app."}
+        model = DEFAULT_MODEL
+        ready = ensure_model(model)
+        return {"ready": ready, "model": model}
+
+    def ensure_ollama_vision_model(self, model=None):
+        """Ensure the local vision model is downloaded. Auto-pulls if needed."""
+        if model and str(model).strip() != DEFAULT_VISION_MODEL:
+            return {"ready": False, "model": DEFAULT_VISION_MODEL, "error": "Only the approved ViriaRevive vision model can be downloaded from the app."}
+        model = DEFAULT_VISION_MODEL
         ready = ensure_model(model)
         return {"ready": ready, "model": model}
 
@@ -1793,22 +2957,19 @@ class ApiBridge:
         return {"ok": True}
 
     def youtube_status(self):
-        return {"connected": is_connected(), "accounts": list_accounts()}
+        accounts = list_accounts(validate=True)
+        return {
+            "connected": any(bool(account.get("usable")) for account in accounts),
+            "configured_account_count": len(accounts),
+            "usable_account_count": sum(1 for account in accounts if account.get("usable")),
+            "accounts": accounts,
+        }
 
     def get_channels(self):
         try:
             return {"channels": list_channels()}
         except Exception as e:
             return {"error": str(e), "channels": []}
-
-    def get_categories(self):
-        try:
-            return {"categories": list_categories()}
-        except Exception as e:
-            return {
-                "error": str(e),
-                "categories": [{"id": DEFAULT_VIDEO_CATEGORY_ID, "title": "Gaming"}],
-            }
 
     def get_subtitle_styles(self):
         """Return available subtitle styles for the UI picker."""
@@ -1868,9 +3029,77 @@ class ApiBridge:
     def _safe_clip_path(self, path) -> Path | None:
         """Return an existing clip path only when it is inside CLIPS_DIR."""
         resolved = self._safe_path_under(CLIPS_DIR, path)
-        if resolved and resolved.exists() and resolved.is_file():
+        if (
+            resolved
+            and resolved.exists()
+            and resolved.is_file()
+            and resolved.suffix.lower() in VIDEO_FILE_EXTS
+        ):
             return resolved
         return None
+
+    @staticmethod
+    def _is_windows_file_lock_error(exc: Exception) -> bool:
+        return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 32
+
+    def _unlink_clip_file(self, path: Path, *, attempts: int = 8, delay: float = 0.16) -> tuple[bool, str]:
+        """Delete a clip file, allowing the embedded video player a moment to release it."""
+        last_error: Exception | None = None
+        for attempt in range(max(1, int(attempts))):
+            try:
+                path.unlink()
+                return True, ""
+            except FileNotFoundError:
+                return True, ""
+            except Exception as exc:
+                last_error = exc
+                if not self._is_windows_file_lock_error(exc) or attempt >= attempts - 1:
+                    break
+                time.sleep(max(0.01, float(delay)))
+        if last_error and self._is_windows_file_lock_error(last_error):
+            return (
+                False,
+                "This video is still open in the preview/player or another app. Close or pause it, then try deleting again.",
+            )
+        return False, str(last_error or "Delete failed")
+
+    def _delete_clip_sidecar(self, clip_path, *, reason: str = "") -> bool:
+        """Delete the generated .txt metadata sidecar that belongs to a clip."""
+        video_path = self._safe_path_under(CLIPS_DIR, clip_path)
+        if not video_path or video_path.suffix.lower() not in VIDEO_FILE_EXTS:
+            return False
+        return self._delete_metadata_sidecar_path(video_path.with_suffix(".txt"), reason=reason)
+
+    @staticmethod
+    def _looks_like_generated_metadata_sidecar(sidecar_path: Path) -> bool:
+        try:
+            text = sidecar_path.read_text(encoding="utf-8", errors="ignore")[:4096]
+        except Exception:
+            return False
+        return (
+            text.startswith("Title:")
+            and "\nDescription:" in text
+            and "\nAnalysis Context:" in text
+        )
+
+    def _prune_orphan_metadata_sidecars(self) -> int:
+        """Remove app-generated .txt metadata files whose matching video is gone."""
+        if not CLIPS_DIR.exists():
+            return 0
+        deleted = 0
+        for path in CLIPS_DIR.glob("*.txt"):
+            sidecar = self._safe_path_under(CLIPS_DIR, path)
+            if not sidecar or not sidecar.is_file():
+                continue
+            has_matching_video = any(
+                (sidecar.parent / f"{sidecar.stem}{ext}").exists()
+                for ext in VIDEO_FILE_EXTS
+            )
+            if has_matching_video or not self._looks_like_generated_metadata_sidecar(sidecar):
+                continue
+            if self._delete_metadata_sidecar_path(sidecar, reason="orphan_metadata"):
+                deleted += 1
+        return deleted
 
     def _unique_clip_output_path(self, stem: str, clip_num: int) -> Path:
         """Return a clip output path without deleting an existing rendered clip."""
@@ -1996,6 +3225,8 @@ class ApiBridge:
 
     def resume_latest_candidate_render(self):
         """Render clips from the newest saved candidate debug without reanalysis."""
+        if os.environ.get("VIRIAREVIVE_ENABLE_DEBUG_RECOVERY") != "1":
+            return {"error": "Candidate debug recovery is disabled outside developer sessions"}
         if self._processing:
             return {"error": "Already processing"}
         debug_path = self._latest_candidate_debug_path()
@@ -2028,6 +3259,7 @@ class ApiBridge:
         enabled: bool,
         max_ollama: int = 8,
         classification_cache: dict | None = None,
+        game_context: dict | None = None,
     ) -> dict:
         """Add optional local AI labels to selected moments without changing output."""
         selected = [item for item in (selected or []) if isinstance(item, dict)]
@@ -2040,7 +3272,7 @@ class ApiBridge:
             "model": DEFAULT_MODEL,
             "selection_impact": "none",
             "output_changed": False,
-            "prompt_scope": "selected_clips_compact_transcript_ranker_visual_metadata",
+            "prompt_scope": "selected_clips_compact_transcript_ranker_visual_metadata_creator_learning",
             "selected_count": len(selected),
             "classified_count": 0,
             "ollama_ready": False,
@@ -2070,7 +3302,11 @@ class ApiBridge:
         except Exception:
             ollama_ready = False
         report["ollama_ready"] = bool(ollama_ready)
-        game_title = self._infer_game_title_from_path(video_path)
+        game_context = game_context if isinstance(game_context, dict) else self._game_context_for_source(video_path, allow_network=False)
+        game_title = game_context.get("label") or self._infer_game_title_from_path(video_path)
+        report["game_context"] = compact_game_context_for_prompt(game_context)
+        learning_prompt_context = self._feedback_learning_prompt_context()
+        report["learning_context_enabled"] = bool(learning_prompt_context.get("enabled"))
         viral_scores: list[int] = []
 
         for item in selected:
@@ -2088,7 +3324,7 @@ class ApiBridge:
                 classification = classify_moment_ai(
                     transcript,
                     game_title=game_title,
-                    clip_context=moment,
+                    clip_context={**moment, "game_context": game_context, "feedback_learning_context": learning_prompt_context},
                     enabled=True,
                     model=DEFAULT_MODEL,
                     ollama_ready=use_ollama,
@@ -2134,12 +3370,73 @@ class ApiBridge:
             )
         )
 
+    @staticmethod
+    def _creator_safe_near_miss_candidate(
+        item: dict,
+        *,
+        min_quality: float,
+        min_words: int = 8,
+    ) -> bool:
+        """Return True when a rejected candidate is safe to inspect as a best-available option."""
+        if not isinstance(item, dict) or item.get("accepted"):
+            return False
+        if str(item.get("reject_reason") or "") != "low_transcript_quality":
+            return False
+        quality = _safe_float_value(item.get("quality_score"), 0.0)
+        if quality < min_quality:
+            return False
+        word_count = int(item.get("subtitle_word_count") or item.get("word_count") or 0)
+        if word_count < min_words:
+            return False
+        music_guard = item.get("music_lyrics_guard") if isinstance(item.get("music_lyrics_guard"), dict) else {}
+        if music_guard.get("reject_candidate"):
+            return False
+        speech_source = item.get("speech_source") if isinstance(item.get("speech_source"), dict) else {}
+        primary_source = str(speech_source.get("primary_source") or "").lower()
+        if primary_source in {"game", "game_or_npc", "npc", "music", "music_or_lyrics"}:
+            return False
+        if speech_source:
+            creator_safe = bool(speech_source.get("creator_safe"))
+            game_prob = _safe_float_value(speech_source.get("game_or_npc_probability"), 0.0)
+            music_prob = _safe_float_value(speech_source.get("music_or_lyrics_probability"), 0.0)
+            if not creator_safe and max(game_prob, music_prob) >= 0.45:
+                return False
+        commentary_guard = item.get("commentary_guard") if isinstance(item.get("commentary_guard"), dict) else {}
+        commentary_summary = (
+            commentary_guard.get("summary")
+            if isinstance(commentary_guard.get("summary"), dict)
+            else {}
+        )
+        if str(commentary_summary.get("primary_label") or "").lower() == "game_narration":
+            return False
+        commentary_penalty = _safe_float_value(item.get("commentary_guard_selection_penalty"), 0.0)
+        speech_penalty = _safe_float_value(item.get("speech_source_penalty"), 0.0)
+        if commentary_penalty >= 0.15 or speech_penalty >= 0.15:
+            return False
+        return True
+
+    @staticmethod
+    def _relative_near_miss_floor(evaluations: list[dict], *, max_count: int, floor_cap: float = 0.45) -> float:
+        qualities = sorted(
+            (
+                _safe_float_value(item.get("quality_score"), 0.0)
+                for item in (evaluations or [])
+                if isinstance(item, dict) and str(item.get("reject_reason") or "") == "low_transcript_quality"
+            ),
+            reverse=True,
+        )
+        if not qualities:
+            return 0.34
+        idx = min(len(qualities) - 1, max(0, int(max(1, max_count or 1) * 2) - 1))
+        return max(0.30, min(float(floor_cap), qualities[idx]))
+
     def _ai_shadow_shortlist(
         self,
         evaluations: list[dict],
         *,
         max_count: int,
         score_key: str,
+        include_near_misses: bool = False,
     ) -> list[dict]:
         def _score(item: dict, key: str, default: float = 0.0) -> float:
             try:
@@ -2158,11 +3455,108 @@ class ApiBridge:
             item for item in (evaluations or [])
             if isinstance(item, dict) and item.get("accepted")
         ]
-        ordered = sorted(
+        ordered_accepted = sorted(
             accepted,
             key=lambda item: (
                 _score(item, score_key, _score(item, "learned_quality_score", _score(item, "quality_score", 0.0))),
                 _score(item, "learned_quality_score", _score(item, "quality_score", 0.0)),
+                _score(item, "quality_score", 0.0),
+                -_score(item.get("candidate") if isinstance(item.get("candidate"), dict) else {}, "candidate_rank", 9999),
+            ),
+            reverse=True,
+        )
+        near_miss_budget = max(0, max_count - len(ordered_accepted)) if include_near_misses else 0
+        near_misses: list[dict] = []
+        if near_miss_budget:
+            relative_floor = self._relative_near_miss_floor(evaluations, max_count=max_count, floor_cap=0.44)
+            for item in evaluations or []:
+                if not self._creator_safe_near_miss_candidate(item, min_quality=relative_floor):
+                    continue
+                moment = item.get("moment") if isinstance(item.get("moment"), dict) else {}
+                ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+                item["ai_rescue_candidate"] = True
+                item["ai_rescue_reason"] = "creator_safe_near_miss"
+                item["ai_rescue_relative_floor"] = round(float(relative_floor), 4)
+                moment["ai_rescue_candidate"] = True
+                moment["ai_rescue_reason"] = "creator_safe_near_miss"
+                ranker["ai_rescue_candidate"] = True
+                ranker["ai_rescue_reason"] = "creator_safe_near_miss"
+                ranker["ai_rescue_relative_floor"] = round(float(relative_floor), 4)
+                moment["ranker"] = ranker
+                near_misses.append(item)
+        ordered_near_misses = sorted(
+            near_misses,
+            key=lambda item: (
+                _score(item, score_key, _score(item, "learned_quality_score", _score(item, "quality_score", 0.0))),
+                _score(item, "learned_quality_score", _score(item, "quality_score", 0.0)),
+                _score(item, "quality_score", 0.0),
+                -_score(item.get("candidate") if isinstance(item.get("candidate"), dict) else {}, "candidate_rank", 9999),
+            ),
+            reverse=True,
+        )
+        if include_near_misses:
+            return (ordered_accepted[:max_count] + ordered_near_misses[:near_miss_budget])[:max_count]
+        return ordered_accepted[:max_count]
+
+    def _multimodal_near_miss_shortlist(
+        self,
+        evaluations: list[dict],
+        *,
+        max_count: int,
+        exclude_ids: set[int] | None = None,
+        score_key: str,
+    ) -> list[dict]:
+        """Return close rejected candidates that local vision may be able to rescue."""
+        def _score(item: dict, key: str, default: float = 0.0) -> float:
+            try:
+                value = item.get(key, default) if isinstance(item, dict) else default
+                if value is None:
+                    value = default
+                score = float(value)
+                return score if math.isfinite(score) else default
+            except (TypeError, ValueError):
+                return default
+
+        max_count = max(0, int(max_count or 0))
+        if max_count <= 0:
+            return []
+        excluded = set(exclude_ids or set())
+        near_misses: list[dict] = []
+        relative_floor = self._relative_near_miss_floor(evaluations, max_count=max_count, floor_cap=0.45)
+        for item in evaluations or []:
+            if not isinstance(item, dict) or id(item) in excluded or item.get("accepted"):
+                continue
+            reject_reason = str(item.get("reject_reason") or "")
+            if reject_reason != "low_transcript_quality":
+                continue
+            quality = _score(item, "quality_score", 0.0)
+            floor = _score(item, "quality_floor", 0.60)
+            relaxed_floor = min(max(0.30, floor - 0.18), relative_floor)
+            if not self._creator_safe_near_miss_candidate(item, min_quality=relaxed_floor):
+                continue
+            music_guard = item.get("music_lyrics_guard") if isinstance(item.get("music_lyrics_guard"), dict) else {}
+            if music_guard.get("reject_candidate"):
+                continue
+            moment = item.get("moment") if isinstance(item.get("moment"), dict) else {}
+            ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+            item["multimodal_rescue_candidate"] = True
+            item["multimodal_rescue_reason"] = "near_quality_floor"
+            item["multimodal_rescue_relative_floor"] = round(float(relaxed_floor), 4)
+            item["original_reject_reason"] = reject_reason
+            if isinstance(moment, dict):
+                moment["multimodal_rescue_candidate"] = True
+                moment["multimodal_rescue_reason"] = "near_quality_floor"
+                ranker["multimodal_rescue_candidate"] = True
+                ranker["multimodal_rescue_reason"] = "near_quality_floor"
+                ranker["multimodal_rescue_relative_floor"] = round(float(relaxed_floor), 4)
+                ranker["original_reject_reason"] = reject_reason
+                moment["ranker"] = ranker
+            near_misses.append(item)
+
+        ordered = sorted(
+            near_misses,
+            key=lambda item: (
+                _score(item, score_key, _score(item, "learned_quality_score", _score(item, "quality_score", 0.0))),
                 _score(item, "quality_score", 0.0),
                 -_score(item.get("candidate") if isinstance(item.get("candidate"), dict) else {}, "candidate_rank", 9999),
             ),
@@ -2181,6 +3575,7 @@ class ApiBridge:
         max_count: int = 12,
         max_ollama: int = 4,
         attach_to_evaluations: bool = False,
+        game_context: dict | None = None,
     ) -> tuple[dict, dict]:
         """Classify a Deep-only pre-final shortlist for diagnostics without changing output."""
         evaluations = [item for item in (evaluations or []) if isinstance(item, dict)]
@@ -2195,7 +3590,7 @@ class ApiBridge:
             "diagnostic_only": True,
             "selection_impact": "none",
             "output_changed": False,
-            "prompt_scope": "deep_pre_final_shadow_shortlist_compact_transcript_ranker_visual_metadata",
+            "prompt_scope": "deep_pre_final_shadow_shortlist_compact_transcript_ranker_visual_metadata_creator_learning",
             "score_key": score_key,
             "candidate_count": len(evaluations),
             "accepted_count": sum(1 for item in evaluations if item.get("accepted")),
@@ -2229,6 +3624,7 @@ class ApiBridge:
             evaluations,
             max_count=max_count,
             score_key=score_key,
+            include_near_misses=True,
         )
         report["shortlist_count"] = len(shortlist)
         if not shortlist:
@@ -2240,7 +3636,11 @@ class ApiBridge:
         except Exception:
             ollama_ready = False
         report["ollama_ready"] = bool(ollama_ready)
-        game_title = self._infer_game_title_from_path(video_path)
+        game_context = game_context if isinstance(game_context, dict) else self._game_context_for_source(video_path, allow_network=False)
+        game_title = game_context.get("label") or self._infer_game_title_from_path(video_path)
+        report["game_context"] = compact_game_context_for_prompt(game_context)
+        learning_prompt_context = self._feedback_learning_prompt_context()
+        report["learning_context_enabled"] = bool(learning_prompt_context.get("enabled"))
         selected_keys = {
             self._ai_moment_cache_key(item)
             for item in selected
@@ -2258,7 +3658,7 @@ class ApiBridge:
             classification = classify_moment_ai(
                 transcript,
                 game_title=game_title,
-                clip_context=moment,
+                clip_context={**moment, "game_context": game_context, "feedback_learning_context": learning_prompt_context},
                 enabled=True,
                 model=DEFAULT_MODEL,
                 ollama_ready=use_ollama,
@@ -2305,6 +3705,184 @@ class ApiBridge:
             report["ai_viral_potential"]["average_score"] = round(sum(viral_scores) / len(viral_scores), 2)
         report["status"] = "ok" if report["classified_count"] else "no_classifications"
         return report, cache
+
+    def _analyze_multimodal_candidate_shortlist(
+        self,
+        evaluations: list[dict],
+        selected: list[dict],
+        video_path: Path,
+        *,
+        enabled: bool,
+        score_key: str,
+        video_duration: float,
+        max_count: int = 8,
+        game_context: dict | None = None,
+    ) -> dict:
+        """Ask a local vision model about a Deep-only candidate shortlist."""
+        evaluations = [item for item in (evaluations or []) if isinstance(item, dict)]
+        selected = [item for item in (selected or []) if isinstance(item, dict)]
+        max_count = max(0, int(max_count or 0))
+        started = time.monotonic()
+        report = {
+            "schema_version": 1,
+            "enabled": bool(enabled),
+            "status": "disabled" if not enabled else "not_started",
+            "provider": "ollama",
+            "model": "",
+            "selection_impact": "capped_rank_adjustment" if enabled else "none",
+            "prompt_scope": "deep_pre_final_vision_shortlist_frames_transcript_ranker_visual_metadata_creator_learning",
+            "score_key": score_key,
+            "candidate_count": len(evaluations),
+            "accepted_count": sum(1 for item in evaluations if item.get("accepted")),
+            "selected_count": len(selected),
+            "max_shortlist_candidates": max_count,
+            "shortlist_count": 0,
+            "accepted_shortlist_count": 0,
+            "near_miss_shortlist_count": 0,
+            "analyzed_count": 0,
+            "frame_count": 0,
+            "statuses": {},
+            "vision_status": {},
+            "learning_context_enabled": False,
+            "rows": [],
+            "elapsed_seconds": 0.0,
+        }
+        if not enabled or not evaluations:
+            if enabled and not evaluations:
+                report["status"] = "no_candidates"
+            return report
+
+        vision_status = ollama_vision_status()
+        report["vision_status"] = vision_status
+        report["model"] = vision_status.get("model", "")
+        if not vision_status.get("model_ready"):
+            report["status"] = "vision_model_missing"
+            report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            return report
+
+        near_miss_reserve = min(3, max(1, math.ceil(max_count * 0.25))) if max_count >= 2 else 0
+        accepted_cap = max(0, max_count - near_miss_reserve)
+        accepted_shortlist = self._ai_shadow_shortlist(
+            evaluations,
+            max_count=accepted_cap,
+            score_key=score_key,
+        )
+        near_miss_shortlist = self._multimodal_near_miss_shortlist(
+            evaluations,
+            max_count=max(0, max_count - len(accepted_shortlist)),
+            exclude_ids={id(item) for item in accepted_shortlist},
+            score_key=score_key,
+        )
+        if len(accepted_shortlist) + len(near_miss_shortlist) < max_count:
+            used_ids = {id(item) for item in accepted_shortlist + near_miss_shortlist}
+            accepted_backfill = [
+                item
+                for item in self._ai_shadow_shortlist(
+                    evaluations,
+                    max_count=max_count,
+                    score_key=score_key,
+                )
+                if id(item) not in used_ids
+            ]
+            remaining_slots = max_count - len(accepted_shortlist) - len(near_miss_shortlist)
+            accepted_shortlist.extend(accepted_backfill[:remaining_slots])
+        shortlist = accepted_shortlist + near_miss_shortlist
+        report["shortlist_count"] = len(shortlist)
+        report["accepted_shortlist_count"] = len(accepted_shortlist)
+        report["near_miss_shortlist_count"] = len(near_miss_shortlist)
+        if not shortlist:
+            report["status"] = "no_shortlist_candidates"
+            report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            return report
+
+        game_context = game_context if isinstance(game_context, dict) else self._game_context_for_source(video_path, allow_network=False)
+        game_title = game_context.get("label") or self._infer_game_title_from_path(video_path)
+        report["game_context"] = compact_game_context_for_prompt(game_context)
+        learning_prompt_context = self._feedback_learning_prompt_context()
+        report["learning_context_enabled"] = bool(learning_prompt_context.get("enabled"))
+        selected_ids = {id(item) for item in selected}
+        for index, item in enumerate(shortlist, 1):
+            if self._cancel:
+                break
+            moment = item.get("moment") if isinstance(item.get("moment"), dict) else {}
+            candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+            item["game_context"] = game_context
+            candidate["game_context"] = game_context
+            moment["game_context"] = game_context
+            frame_candidate = {
+                **candidate,
+                "start": moment.get("start", candidate.get("start")),
+                "end": moment.get("end", candidate.get("end")),
+                "duration": moment.get("duration", candidate.get("duration")),
+                "peak_time": moment.get("peak_time", candidate.get("peak_time")),
+                "visual_diagnostics": moment.get("visual_diagnostics") or candidate.get("visual_diagnostics"),
+            }
+            self._push(
+                "candidates",
+                82,
+                f"Inspecting clip visuals {index}/{len(shortlist)}...",
+            )
+            analysis = analyze_candidate_frames_with_ollama(
+                video_path,
+                frame_candidate,
+                transcript=moment.get("transcript") or item.get("transcript") or "",
+                game_title=game_title,
+                game_context=game_context,
+                learning_context=learning_prompt_context,
+                video_duration=video_duration,
+                enabled=True,
+                model=report["model"],
+                max_frames=3,
+            )
+            item["multimodal_analysis"] = analysis
+            candidate["multimodal_analysis"] = analysis
+            moment["multimodal_analysis"] = analysis
+            ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+            ranker["multimodal_analysis"] = analysis
+            moment["ranker"] = ranker
+            report["analyzed_count"] += 1
+            report["frame_count"] += int(analysis.get("frame_count") or 0)
+            status = str(analysis.get("status") or "unknown")
+            report["statuses"][status] = int(report["statuses"].get(status, 0)) + 1
+            report["rows"].append(
+                {
+                    "index": index,
+                    "candidate_rank": candidate.get("candidate_rank"),
+                    "candidate_kind": candidate.get("candidate_kind"),
+                    "selected_in_output_before_multimodal": id(item) in selected_ids,
+                    "rescue_candidate": bool(item.get("multimodal_rescue_candidate")),
+                    "rescue_reason": item.get("multimodal_rescue_reason", ""),
+                    "original_reject_reason": item.get("original_reject_reason") or item.get("reject_reason", ""),
+                    "quality_score": item.get("quality_score"),
+                    "quality_floor": item.get("quality_floor"),
+                    "score": self._ai_shadow_score(item, score_key),
+                    "score_key": score_key,
+                    "status": status,
+                    "model": analysis.get("model"),
+                    "frame_count": analysis.get("frame_count"),
+                    "sample_times": analysis.get("sample_times"),
+                    "primary_visual_label": analysis.get("primary_visual_label"),
+                    "visible_summary": analysis.get("visible_summary"),
+                    "visual_labels": analysis.get("visual_labels"),
+                    "detected_events": analysis.get("detected_events"),
+                    "confidence": analysis.get("confidence"),
+                    "ranking_adjustment": analysis.get("ranking_adjustment"),
+                    "reject_flags": analysis.get("reject_flags"),
+                }
+            )
+
+        if self._cancel:
+            report["status"] = "cancelled"
+        else:
+            ok_count = int(report["statuses"].get("ok", 0))
+            if ok_count:
+                report["status"] = "ok"
+            elif report["analyzed_count"]:
+                report["status"] = "no_usable_analysis"
+            else:
+                report["status"] = "no_analysis"
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return report
 
     @staticmethod
     def _ai_shadow_score(item: dict, score_key: str) -> float | None:
@@ -2450,8 +4028,35 @@ class ApiBridge:
                 return str(metadata.get("game_title") or "")
         return self._game_title_for_clip(idx)
 
+    def _generated_metadata_for_clip(self, idx: int) -> dict:
+        if 0 <= idx < len(self._moments) and isinstance(self._moments[idx], dict):
+            metadata = self._moments[idx].get("generated_metadata")
+            if isinstance(metadata, dict):
+                return metadata
+        return {}
+
+    def _default_schedule_title_for_clip(self, idx: int) -> str:
+        if 0 <= idx < len(self._results):
+            return self._results[idx].stem
+        return f"Clip {idx + 1}"
+
+    def _schedule_title_is_default(self, item: dict, idx: int) -> bool:
+        title = str(item.get("title") or "").strip()
+        if not title:
+            return True
+        default_title = self._default_schedule_title_for_clip(idx)
+        filename = self._results[idx].name if 0 <= idx < len(self._results) else ""
+        return title in {default_title, filename}
+
     def _ensure_schedule_description(self, item: dict, idx: int) -> dict:
         item = dict(item)
+        metadata = self._generated_metadata_for_clip(idx)
+        generated_title = str(metadata.get("title") or metadata.get("generated_title") or "").strip()
+        if generated_title and self._schedule_title_is_default(item, idx):
+            item["title"] = generated_title
+        generated_tags = str(metadata.get("tags") or "").strip()
+        if generated_tags and not str(item.get("tags") or "").strip():
+            item["tags"] = generated_tags
         structured = any(
             key in item
             for key in (
@@ -2465,7 +4070,7 @@ class ApiBridge:
         if item.get("description") and not structured:
             return item
 
-        title = str(item.get("title") or f"Clip {idx + 1}")
+        title = str(item.get("title") or generated_title or self._default_schedule_title_for_clip(idx))
         game_title = self._schedule_game_title(item, idx)
         clip_context = self._title_context_for_clip(idx)
         if "description_generated" in item or "generated_description" in item:
@@ -2474,9 +4079,10 @@ class ApiBridge:
                 generated_text = item.get("generated_description")
         else:
             generated_text = (
-                self._moments[idx].get("generated_metadata", {}).get("generated_description")
-                if idx < len(self._moments) and isinstance(self._moments[idx], dict)
-                else None
+                metadata.get("generated_description")
+                or metadata.get("description_generated")
+                or metadata.get("description")
+                or None
             )
         custom_text = item.get("description_custom_text")
         if custom_text is None and not structured:
@@ -2498,6 +4104,8 @@ class ApiBridge:
         item["description_auto_hashtags"] = desc_parts["description_auto_hashtags"]
         item["recommended_hashtags"] = desc_parts["recommended_hashtags"]
         item["game_title"] = game_title
+        if not str(item.get("tags") or "").strip():
+            item["tags"] = generated_tags or self._tags_for_game(game_title, clip_context=clip_context)
         return item
 
     def _normalize_scheduled_items(self, scheduled, legacy_index_map: dict | None = None) -> list[dict]:
@@ -2549,6 +4157,8 @@ class ApiBridge:
     def _reset_schedule_success_fields(item: dict) -> None:
         item["uploaded"] = False
         for key in SCHEDULE_SUCCESS_FIELDS - {"uploaded"}:
+            item.pop(key, None)
+        for key in SCHEDULE_BACKEND_STATUS_FIELDS:
             item.pop(key, None)
 
     def _merge_backend_schedule_fields(self, incoming: list[dict], existing: list[dict]) -> list[dict]:
@@ -2638,6 +4248,165 @@ class ApiBridge:
             "youtube_url": result.get("url"),
         }
 
+    @staticmethod
+    def _compact_truth_sources(identity: dict | None) -> list[str]:
+        identity = identity if isinstance(identity, dict) else {}
+        sources: list[str] = []
+        candidate = identity.get("matched_candidate") if isinstance(identity.get("matched_candidate"), dict) else {}
+        for source in candidate.get("sources") or []:
+            text = str(source or "").strip()
+            if text and text not in sources:
+                sources.append(text)
+        for evidence in identity.get("evidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            if evidence.get("type") == "title_candidate":
+                for source in evidence.get("sources") or []:
+                    text = str(source or "").strip()
+                    if text and text not in sources:
+                        sources.append(text)
+        return sources[:8]
+
+    def _game_truth_source(
+        self,
+        identity: dict | None,
+        source_record: dict | None,
+        *,
+        game_title_hint: str = "",
+    ) -> tuple[str, str]:
+        identity = identity if isinstance(identity, dict) else {}
+        source_record = source_record if isinstance(source_record, dict) else {}
+        sources = self._compact_truth_sources(identity)
+        matched_via = str(identity.get("matched_via") or "").strip()
+        youtube_context = source_record.get("youtube_context") if isinstance(source_record.get("youtube_context"), dict) else {}
+        youtube_title = self._sanitize_game_title_hint(youtube_context.get("title"))
+        hint = self._sanitize_game_title_hint(game_title_hint or source_record.get("game_title_hint"))
+        if hint and (not youtube_title or hint.lower() != youtube_title.lower()):
+            return "user_hint", "User hint"
+        if youtube_context and (
+            "explicit_title" in sources
+            or "creator_context" in sources
+            or (hint and youtube_title and hint.lower() == youtube_title.lower())
+        ):
+            return "youtube_metadata", "YouTube metadata"
+        if any(source.startswith("source_") for source in sources):
+            return "filename", "Filename"
+        if matched_via in {"wikidata_search", "local_cache"} or identity.get("qid"):
+            return "wikidata", "Wikidata"
+        return "auto", "Auto"
+
+    @staticmethod
+    def _visual_truth_payload(moment: dict | None) -> dict:
+        moment = moment if isinstance(moment, dict) else {}
+        visual = moment.get("visual_diagnostics") if isinstance(moment.get("visual_diagnostics"), dict) else {}
+        multimodal = moment.get("multimodal_analysis") if isinstance(moment.get("multimodal_analysis"), dict) else {}
+        multimodal_status = str(multimodal.get("status") or "").strip()
+        visual_status = str(visual.get("status") or "").strip()
+        model = str(multimodal.get("model") or multimodal.get("vision_model") or "").strip()
+        frame_count = _safe_int_value(
+            multimodal.get("frame_count")
+            or multimodal.get("sampled_frame_count")
+            or visual.get("sampled_frame_count")
+            or visual.get("frame_count"),
+            0,
+        )
+        used = bool(
+            multimodal_status == "ok"
+            or visual_status == "ok"
+            or frame_count > 0
+            or multimodal.get("metadata_keywords")
+            or multimodal.get("visual_labels")
+        )
+        source = ""
+        if multimodal_status == "ok" or model:
+            source = "ollama_vision"
+        elif visual_status:
+            source = "local_visual_analysis"
+        return {
+            "used": used,
+            "source": source,
+            "status": multimodal_status or visual_status or ("unused" if not used else "unknown"),
+            "model": model,
+            "frame_count": frame_count,
+        }
+
+    def _clip_truth_summary(self, moment: dict | None, path: Path | str | None = None) -> dict:
+        moment = moment if isinstance(moment, dict) else {}
+        source_record = self._source_record_for(moment.get("source_path") or path, moment.get("source_id"))
+        source_identity = source_record.get("game_identity") if isinstance(source_record.get("game_identity"), dict) else {}
+        source_context = source_record.get("game_context") if isinstance(source_record.get("game_context"), dict) else {}
+        identity = moment.get("game_identity") if isinstance(moment.get("game_identity"), dict) else source_identity
+        context = moment.get("game_context") if isinstance(moment.get("game_context"), dict) else source_context
+        game_title_hint = self._sanitize_game_title_hint(
+            moment.get("game_title_hint") or source_record.get("game_title_hint")
+        )
+        title = (
+            str(moment.get("game_title") or "").strip()
+            or str(identity.get("title") or "").strip()
+            or str(context.get("label") or "").strip()
+            or game_title_hint
+        )
+        confidence = self._game_identity_confidence(identity)
+        game_source, game_source_label = self._game_truth_source(
+            identity,
+            source_record,
+            game_title_hint=game_title_hint,
+        )
+        multi_signal = (
+            moment.get("multi_signal_ai_scoring")
+            if isinstance(moment.get("multi_signal_ai_scoring"), dict)
+            else {}
+        )
+        nudge = (
+            multi_signal.get("game_context_nudge")
+            if isinstance(multi_signal.get("game_context_nudge"), dict)
+            else {}
+        )
+        contributions = (
+            multi_signal.get("contributions")
+            if isinstance(multi_signal.get("contributions"), dict)
+            else {}
+        )
+        adjustment = _safe_float_value(
+            nudge.get("adjustment")
+            if nudge.get("adjustment") is not None
+            else contributions.get("game_context"),
+            0.0,
+        )
+        affected_ranking = bool(abs(adjustment) > 0.0001)
+        visual_truth = self._visual_truth_payload(moment)
+        return {
+            "schema_version": 1,
+            "game_title": title[:140],
+            "game_confidence": round(confidence, 4),
+            "game_source": game_source,
+            "game_source_label": game_source_label,
+            "game_matched_via": str(identity.get("matched_via") or "")[:80],
+            "game_qid": str(identity.get("qid") or context.get("qid") or "")[:40],
+            "game_context_status": str(context.get("status") or identity.get("status") or "")[:40],
+            "game_context_available": bool(context.get("qid") or identity.get("qid")),
+            "game_context_affected_ranking": affected_ranking,
+            "game_context_score_delta": round(adjustment, 4),
+            "game_context_nudge": {
+                key: nudge.get(key)
+                for key in (
+                    "status",
+                    "reason",
+                    "selection_impact",
+                    "primary_category",
+                    "context_families",
+                    "cue_hits",
+                    "max_adjustment",
+                )
+                if nudge.get(key) is not None
+            },
+            "visual_analysis_used": bool(visual_truth.get("used")),
+            "visual_analysis_status": visual_truth.get("status"),
+            "visual_analysis_source": visual_truth.get("source"),
+            "vision_model": visual_truth.get("model"),
+            "visual_frame_count": visual_truth.get("frame_count"),
+        }
+
     def _clip_payload(self, idx: int, path: Path, include_url: bool = True) -> dict:
         moment = self._ensure_moment_identity(
             self._moments[idx] if idx < len(self._moments) else {},
@@ -2665,6 +4434,7 @@ class ApiBridge:
             "subtitle_generated": moment.get("subtitle_generated"),
             "subtitles_burned": moment.get("subtitles_burned"),
             "subtitle_placement": moment.get("subtitle_placement"),
+            "truth_summary": self._clip_truth_summary(moment, path),
         }
         if include_url:
             clip["url"] = f"http://127.0.0.1:{self._video_port}/{quote(path.name)}"
@@ -3384,10 +5154,36 @@ class ApiBridge:
             if terms:
                 return terms
         return build_learning_terms(
-            str(snapshot.get("transcript") or ""),
+            cls._feedback_learning_text(snapshot),
             categories=snapshot.get("moment_categories") if isinstance(snapshot.get("moment_categories"), dict) else {},
             primary_category=str(snapshot.get("primary_category") or ""),
         )
+
+    @staticmethod
+    def _feedback_learning_text(snapshot: dict | None) -> str:
+        if not isinstance(snapshot, dict):
+            return ""
+        parts = [str(snapshot.get("transcript") or "")]
+        ai = snapshot.get("ai_moment_classification")
+        if isinstance(ai, dict):
+            parts.append(str(ai.get("primary_category") or ""))
+            for key in ("fine_labels", "supporting_labels"):
+                values = ai.get(key)
+                if isinstance(values, list):
+                    parts.extend(str(value or "") for value in values[:8])
+        visual = snapshot.get("visual_diagnostics")
+        if isinstance(visual, dict):
+            values = visual.get("labels")
+            if isinstance(values, list):
+                parts.extend(str(value or "") for value in values[:8])
+        multimodal = snapshot.get("multimodal_analysis")
+        if isinstance(multimodal, dict):
+            parts.append(str(multimodal.get("primary_visual_label") or ""))
+            for key in ("visual_labels", "detected_events", "title_hooks", "metadata_keywords"):
+                values = multimodal.get(key)
+                if isinstance(values, list):
+                    parts.extend(str(value or "") for value in values[:8])
+        return " ".join(part for part in parts if str(part or "").strip())
 
     def _feedback_clip_snapshot(self, clip_idx: int | None) -> dict:
         if clip_idx is None or clip_idx < 0 or clip_idx >= len(self._moments):
@@ -3402,7 +5198,12 @@ class ApiBridge:
             moment_categories = {}
         primary_category = moment.get("primary_category")
         learning_terms = build_learning_terms(
-            transcript,
+            self._feedback_learning_text({
+                "transcript": transcript,
+                "ai_moment_classification": moment.get("ai_moment_classification"),
+                "visual_diagnostics": moment.get("visual_diagnostics"),
+                "multimodal_analysis": moment.get("multimodal_analysis"),
+            }),
             categories=moment_categories,
             primary_category=str(primary_category or ""),
         )
@@ -3420,6 +5221,7 @@ class ApiBridge:
             "primary_category": primary_category,
             "ai_moment_classification": moment.get("ai_moment_classification"),
             "visual_diagnostics": moment.get("visual_diagnostics"),
+            "multimodal_analysis": moment.get("multimodal_analysis"),
             "commentary_guard": moment.get("commentary_guard"),
             "word_count": moment.get("word_count"),
             "analysis_word_count": moment.get("analysis_word_count"),
@@ -3431,6 +5233,8 @@ class ApiBridge:
             "learning_terms_count": len(learning_terms),
             "learning_basis": {
                 "has_transcript": bool(transcript),
+                "has_ai_labels": isinstance(moment.get("ai_moment_classification"), dict),
+                "has_multimodal_labels": isinstance(moment.get("multimodal_analysis"), dict),
                 "primary_category": primary_category or "",
                 "stores_media": False,
             },
@@ -3612,6 +5416,7 @@ class ApiBridge:
         ai_moment_labels_enabled = _normalize_bool_setting(settings.get("ai_moment_classification"), False)
         moment_label_ranking_enabled = _normalize_bool_setting(settings.get("moment_category_ranking"), False)
         voice_profile_ranking_enabled = _normalize_bool_setting(settings.get("voice_profile_ranking"), False)
+        vision_context_enabled = bool(depth_profile.get("multimodal_analysis"))
         voice_profile_summary = self._voice_profile_status_payload()
         feature_statuses = _depth_feature_statuses(
             depth,
@@ -3620,6 +5425,7 @@ class ApiBridge:
             ai_requested=ai_moment_labels_enabled,
             category_requested=moment_label_ranking_enabled,
             voice_requested=voice_profile_ranking_enabled,
+            multimodal_requested=vision_context_enabled,
             voice_status=voice_profile_summary,
         )
         return {
@@ -3652,8 +5458,10 @@ class ApiBridge:
                 "ai_moment_labels_enabled": ai_moment_labels_enabled,
                 "moment_label_ranking_enabled": moment_label_ranking_enabled,
                 "voice_profile_ranking_enabled": voice_profile_ranking_enabled,
+                "vision_context_enabled": vision_context_enabled,
                 "depth_preset_controls": {
                     "visual_analysis": depth_profile.get("visual_diagnostics"),
+                    "vision_context": depth_profile.get("multimodal_analysis"),
                     "ai_moment_labels": depth_profile.get("ai_moment_classification"),
                     "moment_label_ranking": depth_profile.get("moment_category_ranking"),
                     "voice_profile_ranking": depth_profile.get("voice_profile_ranking"),
@@ -3662,6 +5470,7 @@ class ApiBridge:
                 "selection_caps": {
                     "feedback_learning": round(LEARNED_SELECTION_MAX_ADJUSTMENT, 4),
                     "moment_label_ranking": round(MOMENT_CATEGORY_SELECTION_MAX_ADJUSTMENT, 4),
+                    "vision_context": round(MULTIMODAL_SELECTION_MAX_ADJUSTMENT, 4),
                     "voice_profile_ranking": round(VOICE_PROFILE_SELECTION_MAX_ADJUSTMENT, 4),
                 },
             },
@@ -3956,6 +5765,7 @@ class ApiBridge:
                     )
                 )
             else:
+                self._delete_clip_sidecar(path, reason="missing_video")
                 if old_idx < len(old_moments) and isinstance(old_moments[old_idx], dict):
                     clip_id = str(old_moments[old_idx].get("clip_id") or "").strip()
                     if clip_id:
@@ -3979,46 +5789,188 @@ class ApiBridge:
 
     def get_results(self):
         self._prune_missing_results()
+        self._prune_orphan_metadata_sidecars()
         clips = []
         for i, p in enumerate(self._results):
             clips.append(self._clip_payload(i, p, include_url=True))
         return {"clips": clips, "moments": self._moments}
 
-    def save_source_title_context(self, source_id=None, source_stem=None, text=""):
-        """Save optional creator notes used only for local title/metadata generation."""
-        source_id = str(source_id or "").strip()
-        source_stem = str(source_stem or "").strip()
-        if not source_id and not source_stem:
-            return {"error": "Missing source identity"}
-        context = sanitize_creator_title_context(text)
-        updated_indices = []
-        with self._get_state_lock():
+    def _resolve_clip_context_index(self, clip_id=None, clip_index=None, filename=None) -> int:
+        try:
+            idx = int(clip_index)
+            if 0 <= idx < len(self._results):
+                return idx
+        except Exception:
+            pass
+        target_id = str(clip_id or "").strip()
+        if target_id:
+            for idx, moment in enumerate(self._moments):
+                if isinstance(moment, dict) and str(moment.get("clip_id") or "").strip() == target_id:
+                    return idx
+        target_name = Path(str(filename or "")).name if filename else ""
+        if target_name:
             for idx, path in enumerate(self._results):
-                if idx >= len(self._moments):
+                try:
+                    if Path(path).name == target_name:
+                        return idx
+                except Exception:
                     continue
-                moment = self._ensure_moment_identity(self._moments[idx], path)
-                self._moments[idx] = moment
-                matches_source_id = source_id and str(moment.get("source_id") or "") == source_id
-                matches_source_stem = source_stem and str(moment.get("source_stem") or "") == source_stem
-                if not (matches_source_id or matches_source_stem):
-                    continue
-                if context:
-                    moment["creator_title_context"] = context
-                else:
-                    moment.pop("creator_title_context", None)
-                updated_indices.append(idx)
-            for item in self._scheduled:
-                matches_source_id = source_id and str(item.get("source_id") or "") == source_id
-                matches_source_stem = source_stem and str(item.get("source_stem") or "") == source_stem
-                if not (matches_source_id or matches_source_stem):
-                    continue
-                previous = sanitize_creator_title_context(item.get("creator_title_context"))
-                item["creator_title_context"] = context
-                if previous != context:
-                    item["description_generated"] = ""
-                    item["generated_description"] = ""
-            self._save_state()
-        return {"ok": True, "updated": len(updated_indices), "creator_title_context": context}
+            try:
+                safe_path = self._safe_clip_path(CLIPS_DIR / target_name)
+            except Exception:
+                safe_path = None
+            if safe_path and safe_path.exists():
+                self._results.append(safe_path)
+                self._moments.append(self._ensure_moment_identity({}, safe_path))
+                return len(self._results) - 1
+        return -1
+
+    def _set_clip_title_context(self, clip_index: int, text: str) -> dict:
+        if clip_index < 0 or clip_index >= len(self._results):
+            return {"error": "Clip not found"}
+        context = sanitize_creator_title_context(text)
+        try:
+            path = Path(self._results[clip_index])
+        except Exception:
+            return {"error": "Clip file is missing"}
+        if not path.exists():
+            return {"error": "Clip file is missing"}
+        original_moment = copy.deepcopy(self._moments[clip_index]) if clip_index < len(self._moments) and isinstance(self._moments[clip_index], dict) else {}
+        moment = self._ensure_moment_identity(
+            self._moments[clip_index] if clip_index < len(self._moments) else {},
+            path,
+        )
+        previous = sanitize_creator_title_context(moment.get("creator_title_context"))
+        if context:
+            moment["creator_title_context"] = context
+        else:
+            moment.pop("creator_title_context", None)
+        if previous != context:
+            moment.pop("generated_metadata", None)
+        self._moments[clip_index] = moment
+        changed = moment != original_moment
+        clip_id = str(moment.get("clip_id") or "").strip()
+        updated_scheduled = 0
+        for item in self._scheduled:
+            same_clip = False
+            if clip_id and str(item.get("clip_id") or "").strip() == clip_id:
+                same_clip = True
+            else:
+                try:
+                    same_clip = int(item.get("clipIdx")) == clip_index
+                except Exception:
+                    same_clip = False
+            if not same_clip:
+                continue
+            old_context = sanitize_creator_title_context(item.get("creator_title_context"))
+            if str(item.get("creator_title_context") or "") != context:
+                changed = True
+            item["creator_title_context"] = context
+            if old_context != context:
+                item["description_generated"] = ""
+                item["generated_description"] = ""
+                item["metadata_stale"] = True
+                changed = True
+            updated_scheduled += 1
+        return {
+            "ok": True,
+            "changed": changed,
+            "clip_index": clip_index,
+            "clip_id": clip_id,
+            "updated_scheduled": updated_scheduled,
+            "creator_title_context": context,
+        }
+
+    def save_clip_title_context(self, clip_id=None, clip_index=None, filename=None, text=""):
+        """Save optional AI notes for one clip only."""
+        with self._get_state_lock():
+            idx = self._resolve_clip_context_index(clip_id=clip_id, clip_index=clip_index, filename=filename)
+            result = self._set_clip_title_context(idx, text)
+            if result.get("ok") and result.get("changed"):
+                self._save_state()
+            return result
+
+    def _set_clip_game_title(self, clip_index: int, text: str) -> dict:
+        if clip_index < 0 or clip_index >= len(self._results):
+            return {"error": "Clip not found"}
+        game_title = self._sanitize_game_title_hint(text)
+        try:
+            path = Path(self._results[clip_index])
+        except Exception:
+            return {"error": "Clip file is missing"}
+        if not path.exists():
+            return {"error": "Clip file is missing"}
+
+        original_moment = copy.deepcopy(self._moments[clip_index]) if clip_index < len(self._moments) and isinstance(self._moments[clip_index], dict) else {}
+        moment = self._ensure_moment_identity(
+            self._moments[clip_index] if clip_index < len(self._moments) else {},
+            path,
+        )
+        previous = self._sanitize_game_title_hint(moment.get("game_title") or moment.get("game_title_hint"))
+        if game_title:
+            moment["game_title"] = game_title
+            moment["game_title_hint"] = game_title
+            truth = moment.get("truth_summary")
+            if not isinstance(truth, dict):
+                truth = {}
+            truth["game_title"] = game_title
+            truth["game_source_label"] = "Manual"
+            moment["truth_summary"] = truth
+            metadata = moment.get("generated_metadata")
+            if isinstance(metadata, dict):
+                metadata["game_title"] = game_title
+        else:
+            moment.pop("game_title", None)
+            moment.pop("game_title_hint", None)
+            truth = moment.get("truth_summary")
+            if isinstance(truth, dict):
+                truth["game_title"] = ""
+                truth["game_source_label"] = "Unknown"
+            metadata = moment.get("generated_metadata")
+            if isinstance(metadata, dict):
+                metadata["game_title"] = ""
+
+        while len(self._moments) <= clip_index:
+            self._moments.append({})
+        self._moments[clip_index] = moment
+        changed = moment != original_moment or previous != game_title
+        clip_id = str(moment.get("clip_id") or "").strip()
+        updated_scheduled = 0
+        for item in self._scheduled:
+            same_clip = False
+            if clip_id and str(item.get("clip_id") or "").strip() == clip_id:
+                same_clip = True
+            else:
+                try:
+                    same_clip = int(item.get("clipIdx")) == clip_index
+                except Exception:
+                    same_clip = False
+            if not same_clip:
+                continue
+            old_title = self._sanitize_game_title_hint(item.get("game_title"))
+            item["game_title"] = game_title
+            if old_title != game_title:
+                item["metadata_stale"] = True
+                changed = True
+            updated_scheduled += 1
+
+        return {
+            "ok": True,
+            "changed": changed,
+            "clip_index": clip_index,
+            "clip_id": clip_id,
+            "updated_scheduled": updated_scheduled,
+            "game_title": game_title,
+        }
+
+    def save_clip_game_title(self, clip_id=None, clip_index=None, filename=None, text=""):
+        """Save a user-corrected game title for one clip."""
+        with self._get_state_lock():
+            idx = self._resolve_clip_context_index(clip_id=clip_id, clip_index=clip_index, filename=filename)
+            result = self._set_clip_game_title(idx, text)
+            if result.get("ok") and result.get("changed"):
+                self._save_state()
+            return result
 
     def open_output_folder(self):
         try:
@@ -4091,7 +6043,10 @@ class ApiBridge:
                 clip_id = self._moments[clip_index].get("clip_id")
             try:
                 deleted_name = p.name
-                p.unlink()
+                deleted_ok, delete_error = self._unlink_clip_file(p)
+                if not deleted_ok:
+                    return {"error": delete_error}
+                sidecar_deleted = self._delete_clip_sidecar(p, reason="clip_deleted")
                 self._results.pop(clip_index)
                 # Remove matching moments entry
                 if clip_index < len(self._moments):
@@ -4103,7 +6058,7 @@ class ApiBridge:
                 self._scheduled = self._normalize_scheduled_items(self._scheduled)
                 self._mark_personalization_clips_deleted({clip_id} if clip_id else set(), {deleted_name})
                 self._save_state()
-                return {"ok": True}
+                return {"ok": True, "sidecar_deleted": sidecar_deleted}
             except Exception as e:
                 return {"error": str(e)}
         return {"error": "Invalid clip index"}
@@ -4111,7 +6066,7 @@ class ApiBridge:
     def delete_library_file(self, filename):
         """Delete a video file from the clips folder by filename."""
         result = self.delete_library_files([filename])
-        if result.get("deleted"):
+        if result.get("deleted") or result.get("missing_pruned"):
             return {"ok": True}
         failed = result.get("failed") or []
         if failed:
@@ -4127,6 +6082,7 @@ class ApiBridge:
         targets: list[tuple[str, Path]] = []
         failed = []
         seen = set()
+        missing_names: set[str] = set()
 
         for raw in filenames:
             name = str(raw or "").strip()
@@ -4138,6 +6094,7 @@ class ApiBridge:
                 continue
             target = self._safe_child_path(CLIPS_DIR, name)
             if not target or not target.exists() or not target.is_file():
+                missing_names.add(name)
                 failed.append({"filename": name, "error": "File not found"})
                 continue
             if target.suffix.lower() not in video_exts:
@@ -4147,12 +6104,19 @@ class ApiBridge:
 
         deleted = []
         deleted_names = set()
+        sidecars_deleted = []
+        missing_pruned = []
         removed_ids = set()
         lock = getattr(self, "_state_lock", threading.RLock())
         with lock:
             for name, target in targets:
                 try:
-                    target.unlink()
+                    deleted_ok, delete_error = self._unlink_clip_file(target)
+                    if not deleted_ok:
+                        failed.append({"filename": name, "error": delete_error})
+                        continue
+                    if self._delete_clip_sidecar(target, reason="library_delete"):
+                        sidecars_deleted.append(target.with_suffix(".txt").name)
                     deleted.append(name)
                     deleted_names.add(name)
                 except Exception as exc:
@@ -4177,13 +6141,40 @@ class ApiBridge:
                 self._mark_personalization_clips_deleted(removed_ids, deleted_names)
                 self._save_state()
 
-        return {"ok": bool(deleted), "deleted": deleted, "failed": failed}
+            if missing_names:
+                before_state = set()
+                for path in self._results:
+                    try:
+                        before_state.add(Path(path).name)
+                    except Exception:
+                        continue
+                state_missing = before_state.intersection(missing_names)
+                if state_missing:
+                    self._prune_missing_results()
+                    after_state = set()
+                    for path in self._results:
+                        try:
+                            after_state.add(Path(path).name)
+                        except Exception:
+                            continue
+                    missing_pruned = sorted(state_missing - after_state)
+                    if missing_pruned:
+                        failed = [item for item in failed if item.get("filename") not in set(missing_pruned)]
+
+        return {
+            "ok": bool(deleted or missing_pruned),
+            "deleted": deleted,
+            "sidecars_deleted": sidecars_deleted,
+            "missing_pruned": missing_pruned,
+            "failed": failed,
+        }
 
     # ── Exposed: library (all videos) ────────────────────────────────────
 
     def list_all_clips(self):
         """List all video files in the clips directory."""
         self._prune_missing_results()
+        self._prune_orphan_metadata_sidecars()
         clips = []
         total_size = 0
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
@@ -4234,6 +6225,7 @@ class ApiBridge:
                         "subtitle_generated": moment.get("subtitle_generated"),
                         "subtitles_burned": moment.get("subtitles_burned"),
                         "subtitle_placement": moment.get("subtitle_placement"),
+                        "truth_summary": self._clip_truth_summary(moment, p),
                     })
                 else:
                     moment = self._ensure_moment_identity({}, p)
@@ -4252,6 +6244,7 @@ class ApiBridge:
                         "subtitle_generated": moment.get("subtitle_generated"),
                         "subtitles_burned": moment.get("subtitles_burned"),
                         "subtitle_placement": moment.get("subtitle_placement"),
+                        "truth_summary": self._clip_truth_summary(moment, p),
                     })
                 clips.append(clip)
         return {
@@ -4268,6 +6261,7 @@ class ApiBridge:
         Returns the updated results list.
         """
         removed = self._prune_missing_results()
+        self._prune_orphan_metadata_sidecars()
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
         existing = {p.resolve() for p in self._results if p.exists()}
         added = 0
@@ -4308,9 +6302,8 @@ class ApiBridge:
         with self._state_lock:
             self._prune_missing_results()
             self._scheduled = self._normalize_scheduled_items(self._scheduled)
-            stale_attempts = self._reconcile_incomplete_upload_attempts()
-            missed = self._mark_overdue_public_schedules_missed()
-            if stale_attempts or missed:
+            missed = self._mark_overdue_schedules_missed()
+            if missed:
                 self._save_state()
             self._upload_history = self._normalize_upload_history(getattr(self, "_upload_history", []))
             return {"scheduled": self._scheduled, "upload_history": self._upload_history}
@@ -4399,10 +6392,11 @@ class ApiBridge:
         with self._get_state_lock():
             return bool(getattr(self, "_cancel", False))
 
-    def start_upload(self, clips_metadata, schedule_start, interval_hours, channel_id=None):
+    def start_upload(self, clips_metadata, channel_id=None):
         """Upload clips with per-clip metadata.
 
-        clips_metadata: list of {index, clip_id, source_id, title, description, tags, category_id, privacy, publish_at}
+        clips_metadata: list of {index, clip_id, source_id, title, description, tags, privacy, publish_at}
+        YouTube category is intentionally fixed to Gaming.
         channel_id: YouTube channel ID to upload to (from get_channels())
         """
         with self._get_state_lock():
@@ -4428,39 +6422,90 @@ class ApiBridge:
             self._cancel = False
         threading.Thread(
             target=self._run_upload,
-            args=(clips_metadata, schedule_start, interval_hours, channel_id, upload_lock),
+            args=(clips_metadata, channel_id, upload_lock),
             daemon=True,
         ).start()
         return {"ok": True}
 
     def upload_single_clip(self, clip_index, meta, channel_id=None):
-        """Upload a single clip immediately (used by background scheduler)."""
+        """Upload one clip through the same schedule-aware state path."""
         if clip_index >= len(self._results):
             return {"error": "Invalid clip index"}
         video_path = self._safe_clip_path(self._results[clip_index])
         if not video_path:
             return {"error": "Clip file not found"}
+        upload_lock = self._get_upload_lock()
+        if not upload_lock.acquire(blocking=False):
+            return {"error": "Upload already in progress"}
+        with self._get_state_lock():
+            if getattr(self, "_processing", False):
+                try:
+                    upload_lock.release()
+                except RuntimeError:
+                    pass
+                return {"error": "Processing in progress"}
+            self._processing = True
+            self._cancel = False
+        attempt_started = False
         try:
             normalized_meta = self._ensure_schedule_description(dict(meta or {}), clip_index)
+            if "index" not in normalized_meta and "clipIdx" not in normalized_meta:
+                normalized_meta["index"] = clip_index
+            try:
+                _original_index, normalized_meta, scheduled = self._validate_upload_metadata([normalized_meta])[0]
+            except Exception as exc:
+                return {"error": str(exc)}
+            scheduled_active = self._scheduled_upload_active(clip_index, normalized_meta, channel_id)
+            if scheduled_active:
+                attempt_id = self._begin_scheduled_upload_attempt(
+                    clip_index,
+                    normalized_meta,
+                    trigger="single",
+                    channel_id=channel_id,
+                )
+                attempt_started = bool(attempt_id)
+                if not attempt_started:
+                    return {"error": "Scheduled item changed before upload"}
+                self._js("window.onScheduleUpdated()")
+            else:
+                attempt_id = None
             result = upload_to_youtube(
                 video_path,
                 title=normalized_meta.get("title", f"Viral Clip #{clip_index + 1}"),
                 description=normalized_meta.get("final_description") or normalized_meta.get("description", ""),
                 tags=normalized_meta.get("tags", generate_tags()),
-                category_id=DEFAULT_VIDEO_CATEGORY_ID,
                 privacy=normalized_meta.get("privacy", "private"),
+                scheduled_time=scheduled,
                 channel_id=normalized_meta.get("channel_id") or channel_id,
                 account_id=normalized_meta.get("account_id"),
-                cancel_check=self._is_cancelled,
+                cancel_check=lambda: self._is_cancelled() or (
+                    bool(attempt_id)
+                    and not self._scheduled_upload_active(clip_index, normalized_meta, channel_id, attempt_id=attempt_id)
+                ),
             )
-            with self._get_state_lock():
+            if scheduled_active and self._mark_scheduled_uploaded(clip_index, normalized_meta, result, trigger="single", attempt_id=attempt_id):
+                self._js("window.onScheduleUpdated()")
+            else:
                 self._append_upload_history(
                     self._upload_history_record(normalized_meta, clip_index, normalized_meta, result, trigger="single")
                 )
                 self._save_state()
             return {"ok": True}
         except Exception as e:
+            if attempt_started:
+                if self._is_cancelled():
+                    self._clear_scheduled_upload_attempt(clip_index, normalized_meta, channel_id, attempt_id=attempt_id)
+                else:
+                    self._mark_scheduled_upload_failed_for_clip(clip_index, normalized_meta, e, attempt_id=attempt_id)
+                self._js("window.onScheduleUpdated()")
             return {"error": str(e)}
+        finally:
+            with self._get_state_lock():
+                self._processing = False
+            try:
+                upload_lock.release()
+            except RuntimeError:
+                pass
 
     # ── Exposed: background scheduler ────────────────────────────────────
 
@@ -4480,7 +6525,7 @@ class ApiBridge:
         """Return persisted results/moments/scheduled for frontend init."""
         self._prune_missing_results()
         with self._state_lock:
-            if self._mark_overdue_public_schedules_missed():
+            if self._mark_overdue_schedules_missed():
                 self._save_state()
         clips = []
         for i, p in enumerate(self._results):
@@ -4545,6 +6590,8 @@ class ApiBridge:
             moment["start"] = start
             moment["end"] = end
             moment["duration"] = end - start
+            moment.setdefault("ranker", row.get("ranker") if isinstance(row.get("ranker"), dict) else {})
+            moment.setdefault("transcript", row.get("transcript", ""))
             candidate.setdefault("start", start)
             candidate.setdefault("end", end)
             candidate.setdefault("duration", end - start)
@@ -4552,11 +6599,16 @@ class ApiBridge:
                 "candidate": candidate,
                 "moment": moment,
                 "words": [],
+                "accepted": True,
+                "word_count": row.get("word_count", 0),
                 "quality_score": row.get("base_quality_score", row.get("quality_score")),
                 "selection_rank_score": row.get("selection_rank_score"),
                 "selection_score_source": row.get("selection_score_source", "quality_score"),
                 "shadow_scoring": row.get("shadow_scoring") if isinstance(row.get("shadow_scoring"), dict) else {},
                 "moment_category_scoring": row.get("moment_category_scoring") if isinstance(row.get("moment_category_scoring"), dict) else {},
+                "ai_moment_scoring": row.get("ai_moment_scoring") if isinstance(row.get("ai_moment_scoring"), dict) else {},
+                "multimodal_scoring": row.get("multimodal_scoring") if isinstance(row.get("multimodal_scoring"), dict) else {},
+                "multi_signal_ai_scoring": row.get("multi_signal_ai_scoring") if isinstance(row.get("multi_signal_ai_scoring"), dict) else {},
                 "voice_scoring": row.get("voice_scoring") if isinstance(row.get("voice_scoring"), dict) else {},
                 "voice_profile": row.get("voice_profile") if isinstance(row.get("voice_profile"), dict) else None,
             }
@@ -4564,14 +6616,21 @@ class ApiBridge:
                 "primary_category",
                 "moment_categories",
                 "visual_diagnostics",
+                "multimodal_analysis",
                 "ai_moment_classification",
                 "commentary_guard",
                 "music_lyrics_guard",
                 "music_lyrics_penalty",
                 "learned_adjustment",
                 "learned_quality_score",
+                "ai_moment_quality_score",
+                "ai_adjustment",
                 "moment_category_quality_score",
                 "moment_category_adjustment",
+                "multimodal_quality_score",
+                "multimodal_adjustment",
+                "multi_signal_ai_quality_score",
+                "multi_signal_ai_adjustment",
                 "voice_profile_quality_score",
                 "voice_adjustment",
             ):
@@ -4581,6 +6640,54 @@ class ApiBridge:
             items.append(item)
         items.sort(key=lambda item: (int(item["moment"].get("start", 0)), int(item["moment"].get("end", 0))))
         return items
+
+    @staticmethod
+    def _merge_recovered_run_debug_payload(
+        payload: dict,
+        *,
+        debug_path: Path,
+        final_clip_debug: list[dict],
+        run_warnings: list[str],
+        stage_timings: dict,
+        auto_metadata_count: int,
+    ) -> dict:
+        """Preserve candidate-debug rows while adding recovered render metadata."""
+        recovered = dict(payload if isinstance(payload, dict) else {})
+        candidates = recovered.get("candidates")
+        if not isinstance(candidates, list):
+            candidates = []
+        selected_rows = [row for row in candidates if isinstance(row, dict) and row.get("selected")]
+        selected_rows.sort(key=lambda row: (int(row.get("start") or 0), int(row.get("end") or 0)))
+
+        for row, final_row in zip(selected_rows, final_clip_debug or []):
+            row["final_render"] = final_row
+            row["final_rendered"] = True
+            if isinstance(final_row, dict):
+                row["final_clip_path"] = final_row.get("path")
+                if final_row.get("transcript") and not row.get("transcript"):
+                    row["transcript"] = final_row.get("transcript")
+
+        timing = recovered.get("timing") if isinstance(recovered.get("timing"), dict) else {}
+        timing = dict(timing)
+        timing["status"] = "recovered_from_candidate_debug"
+        timing["rendered_clip_count"] = len(final_clip_debug or [])
+        timing["auto_metadata_count"] = int(auto_metadata_count or 0)
+        timing["stage_timings"] = dict(stage_timings or {})
+
+        recovered["debug_stage"] = "run_post_render"
+        recovered["final_render_metadata_included"] = True
+        recovered["recovered_from_candidate_debug"] = True
+        recovered["source_candidate_debug"] = str(debug_path)
+        recovered["final_clips"] = final_clip_debug or []
+        recovered["warnings"] = list(run_warnings or [])
+        recovered["rendered_clip_count"] = len(final_clip_debug or [])
+        recovered["auto_metadata_count"] = int(auto_metadata_count or 0)
+        recovered["stage_timings"] = dict(stage_timings or {})
+        recovered["timing"] = timing
+        recovered["candidate_count"] = len(candidates)
+        recovered["selected_count"] = len(selected_rows)
+        recovered["candidates"] = candidates
+        return recovered
 
     def _run_candidate_debug_recovery(self, debug_path: Path):
         """Render selected clips from a saved candidate debug report."""
@@ -4605,9 +6712,15 @@ class ApiBridge:
                 speech_stream = int(speech_stream) if speech_stream is not None else None
             except (TypeError, ValueError):
                 speech_stream = None
-            allow_stream_retry = bool(audio_source_debug.get("alternate_stream_retry", True))
-            commentary_guard_enabled = bool(audio_source_debug.get("single_track_commentary_guard"))
             commentary_guard_policy = normalize_commentary_subtitle_policy(audio_source_debug.get("subtitle_policy"))
+            allow_stream_retry = bool(audio_source_debug.get("alternate_stream_retry", True))
+            commentary_guard_enabled = bool(
+                audio_source_debug.get(
+                    "commentary_guard_enabled",
+                    audio_source_debug.get("single_track_commentary_guard"),
+                )
+                and commentary_guard_policy == "creator"
+            )
 
             source_id = self._source_id_for(video_path)
             source_stem = video_path.stem[:50]
@@ -4625,7 +6738,7 @@ class ApiBridge:
                 except Exception:
                     vid_duration = max(int(item["moment"].get("end", 0)) for item in selected)
 
-            clip_duration = int(settings.get("clip_duration", CLIP_DURATION))
+            clip_duration = _normalize_clip_duration(settings.get("clip_duration", CLIP_DURATION))
             detection_preference = normalize_detection_preference(settings.get("detection_preference"))
             processing_depth = _normalize_processing_depth(settings.get("processing_depth"))
             quality_floor = float(settings.get("quality_floor", quality_floor_for_preference(detection_preference)))
@@ -4653,6 +6766,19 @@ class ApiBridge:
 
             run_warnings = list(payload.get("warnings") or [])
             run_warnings.append("rendered_from_candidate_debug")
+            source_game_identity = self._game_identity_for_source(video_path, allow_network=False)
+            source_game_context = (
+                source_game_identity.get("game_context")
+                if isinstance(source_game_identity.get("game_context"), dict)
+                else {}
+            )
+            source_game_title = (
+                source_game_identity.get("title")
+                or source_game_context.get("label")
+                or self._infer_game_title_from_path(video_path)
+            )
+            if not source_game_context:
+                source_game_context = self._game_context_for_title(source_game_title, allow_network=False)
             self._push("candidates", 100, f"Loaded {len(selected)} selected clips from saved analysis")
 
             moments = [item["moment"] for item in selected]
@@ -4660,7 +6786,9 @@ class ApiBridge:
                 m["source_id"] = source_id
                 m["source_path"] = str(video_path)
                 m["source_stem"] = source_stem
-                m["game_title"] = self._infer_game_title_from_path(video_path)
+                m["game_title"] = source_game_context.get("label") or source_game_title
+                m["game_identity"] = source_game_identity
+                m["game_context"] = source_game_context
                 m["clip_id"] = self._clip_id_for(m)
                 m["audio_source"] = {
                     "mode": audio_source_debug.get("mode", "auto"),
@@ -4672,7 +6800,11 @@ class ApiBridge:
                     "render_audio": audio_source_debug.get("render_audio", "all_source_streams_mixed"),
                     "alternate_stream_retry": allow_stream_retry,
                     "subtitle_policy": commentary_guard_policy,
-                    "single_track_commentary_guard": commentary_guard_enabled,
+                    "commentary_guard_enabled": commentary_guard_enabled,
+                    "single_track_commentary_guard": audio_source_debug.get(
+                        "single_track_commentary_guard",
+                        commentary_guard_enabled,
+                    ),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
                         selected_stream=m.get("speech_stream", speech_stream),
@@ -4733,7 +6865,12 @@ class ApiBridge:
                 final_retry_report = None
                 if extract_audio_clip(video_path, start, final_probe_end, wav, audio_stream=final_stream):
                     final_words = transcribe_clip(wav, model_size=model, language=language)
-                if allow_stream_retry and needs_stream_retry(final_words, final_probe_end - start):
+                if allow_stream_retry and needs_stream_retry(
+                    final_words,
+                    final_probe_end - start,
+                    subtitle_policy=commentary_guard_policy,
+                    commentary_guard=commentary_guard_enabled,
+                ):
                     retry_words, retry_stream = self._try_alternate_audio_streams(
                         video_path, start, final_probe_end, wav, model, language,
                         idx, total, final_stream, return_stream=True,
@@ -4750,6 +6887,11 @@ class ApiBridge:
                 )
                 words = final_words
                 if final_words:
+                    final_stream_profile = _selected_audio_stream_profile(
+                        audio_source_debug,
+                        selected_stream=final_stream,
+                        retry_report=final_retry_report,
+                    )
                     final_candidate = {
                         **item["candidate"],
                         "start": start,
@@ -4768,6 +6910,8 @@ class ApiBridge:
                         detection_preference=detection_preference,
                         commentary_guard=commentary_guard_enabled,
                         commentary_guard_policy=commentary_guard_policy,
+                        voice_profile=final_voice_profile_score,
+                        stream_profile=final_stream_profile,
                     )
                     refined_moment = final_eval.get("moment") or {}
                     try:
@@ -4775,11 +6919,13 @@ class ApiBridge:
                         trim_end = int(refined_moment.get("end", end))
                     except (TypeError, ValueError):
                         trim_start, trim_end = start, end
+                    filtered_words = final_eval.get("words")
                     words = (
-                        _subtitle_words_for_render_start(final_eval.get("words") or [], trim_start, selected_start)
-                        if final_eval.get("words")
+                        _subtitle_words_for_render_start(filtered_words, trim_start, trim_start)
+                        if isinstance(filtered_words, list)
                         else final_words
                     )
+                    start, end = trim_start, trim_end
                     for key in (
                         "primary_category",
                         "moment_categories",
@@ -4790,6 +6936,12 @@ class ApiBridge:
                     ):
                         if refined_moment.get(key) is not None:
                             m[key] = refined_moment.get(key)
+                    m["start"] = start
+                    m["end"] = end
+                    m["duration"] = end - start
+                    m["render_start"] = start
+                    m["render_end"] = end
+                    m["render_duration"] = end - start
                     m["trim_adjusted_start"] = trim_start
                     m["trim_adjusted_end"] = trim_end
                     m["trim_adjusted_duration"] = max(0, trim_end - trim_start)
@@ -4801,7 +6953,7 @@ class ApiBridge:
                 m["speech_stream"] = final_stream
                 m["word_count"] = len(words)
                 m["subtitle_word_count"] = len(words)
-                m["transcript"] = transcript or m.get("transcript", "")
+                m["transcript"] = transcript
                 m["voice_profile"] = final_voice_profile_score
                 if final_retry_report:
                     m["stream_retry"] = final_retry_report
@@ -4815,10 +6967,15 @@ class ApiBridge:
                     "render_audio": audio_source_debug.get("render_audio", "all_source_streams_mixed"),
                     "alternate_stream_retry": allow_stream_retry,
                     "subtitle_policy": commentary_guard_policy,
-                    "single_track_commentary_guard": commentary_guard_enabled,
+                    "commentary_guard_enabled": commentary_guard_enabled,
+                    "single_track_commentary_guard": audio_source_debug.get(
+                        "single_track_commentary_guard",
+                        commentary_guard_enabled,
+                    ),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
                         selected_stream=final_stream,
+                        retry_report=final_retry_report,
                     ),
                 }
                 m["stream_selection"] = m["audio_source"]["stream_selection"]
@@ -4881,11 +7038,14 @@ class ApiBridge:
                     m["source_id"] = source_id
                     m["source_path"] = str(video_path)
                     m["source_stem"] = source_stem
-                    m["game_title"] = self._infer_game_title_from_path(video_path)
+                    m["game_title"] = source_game_context.get("label") or source_game_title
+                    m["game_identity"] = source_game_identity
+                    m["game_context"] = source_game_context
                     m["clip_id"] = self._clip_id_for(m, clip_result.path)
                     if clip_result.warning:
                         m["render_warning"] = clip_result.warning
                         run_warnings.append(f"clip_{idx}_{clip_result.warning}")
+                    m["truth_summary"] = self._clip_truth_summary(m, clip_result.path)
                     done.append(clip_result.path)
                     done_moments.append(m)
                     final_primary_category = m.get("primary_category") or item.get("primary_category")
@@ -4927,6 +7087,14 @@ class ApiBridge:
                         "ai_scoring_eligible": (item.get("ai_moment_scoring") or {}).get("ai_scoring_eligible"),
                         "ai_ineligible_reason": (item.get("ai_moment_scoring") or {}).get("ai_ineligible_reason"),
                         "ai_moment_scoring": item.get("ai_moment_scoring") or m.get("ai_moment_scoring"),
+                        "multimodal_quality_score": (item.get("multimodal_scoring") or {}).get("multimodal_quality_score"),
+                        "multimodal_ranking_enabled": (item.get("multimodal_scoring") or {}).get("ranking_enabled"),
+                        "multimodal_adjustment": (item.get("multimodal_scoring") or {}).get("multimodal_adjustment"),
+                        "multimodal_selection_delta": (item.get("multimodal_scoring") or {}).get("selection_delta", ""),
+                        "multimodal_rank_delta": (item.get("multimodal_scoring") or {}).get("rank_delta"),
+                        "multimodal_scoring_eligible": (item.get("multimodal_scoring") or {}).get("scoring_eligible"),
+                        "multimodal_ineligible_reason": (item.get("multimodal_scoring") or {}).get("ineligible_reason"),
+                        "multimodal_scoring": item.get("multimodal_scoring") or m.get("multimodal_scoring"),
                         "selection_primary_category": selection_primary_category,
                         "selection_moment_categories": selection_moment_categories,
                         "ranking_primary_category": ranking_primary_category,
@@ -4936,6 +7104,8 @@ class ApiBridge:
                         "primary_category": final_primary_category,
                         "moment_categories": final_moment_categories,
                         "visual_diagnostics": m.get("visual_diagnostics") or item.get("visual_diagnostics"),
+                        "multimodal_analysis": m.get("multimodal_analysis") or item.get("multimodal_analysis"),
+                        "truth_summary": m.get("truth_summary"),
                         "selection_ai_moment_classification": m.get("selection_ai_moment_classification") or item.get("ai_moment_classification"),
                         "ai_moment_classification_stage": m.get("ai_moment_classification_stage"),
                         "ai_moment_classification": m.get("ai_moment_classification") or item.get("ai_moment_classification"),
@@ -4966,23 +7136,41 @@ class ApiBridge:
                     pass
             stage_timings["final_render"] = round(time.monotonic() - render_started, 3)
 
+            run_debug_path = debug_path.with_name(debug_path.name.replace("_candidate_debug.json", "_run_debug.json"))
+            first_new_clip_index = len(self._results)
             self._results.extend(done)
             self._moments.extend(done_moments)
-            recovered = dict(payload)
-            recovered["debug_stage"] = "run_post_render"
-            recovered["final_render_metadata_included"] = True
-            recovered["recovered_from_candidate_debug"] = True
-            recovered["source_candidate_debug"] = str(debug_path)
-            recovered["final_clips"] = final_clip_debug
-            recovered["warnings"] = run_warnings
-            recovered["rendered_clip_count"] = len(done)
-            recovered["stage_timings"] = dict(stage_timings)
-            run_debug_path = debug_path.with_name(debug_path.name.replace("_candidate_debug.json", "_run_debug.json"))
+            auto_metadata = self._generate_auto_metadata_for_results(
+                first_new_clip_index,
+                len(done),
+                final_clip_debug,
+                run_warnings,
+            ) if done else []
             try:
+                recovered = self._merge_recovered_run_debug_payload(
+                    payload,
+                    debug_path=debug_path,
+                    final_clip_debug=final_clip_debug,
+                    run_warnings=run_warnings,
+                    stage_timings=stage_timings,
+                    auto_metadata_count=len(auto_metadata),
+                )
                 self._write_json_atomic(run_debug_path, recovered)
                 print(f"[rank] Recovered run debug saved: {run_debug_path}")
             except Exception as e:
                 print(f"[rank] Failed to save recovered run debug: {e}")
+                try:
+                    recovered = self._merge_recovered_run_debug_payload(
+                        payload,
+                        debug_path=debug_path,
+                        final_clip_debug=final_clip_debug,
+                        run_warnings=run_warnings,
+                        stage_timings=stage_timings,
+                        auto_metadata_count=len(auto_metadata),
+                    )
+                    self._write_json_atomic(run_debug_path, recovered)
+                except Exception as fallback_exc:
+                    print(f"[rank] Failed to save recovered fallback debug: {fallback_exc}")
             self._save_state()
             self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null)")
         except CancelledError:
@@ -4996,6 +7184,7 @@ class ApiBridge:
     # ── Pipeline orchestrator (background thread) ────────────────────────
 
     def _run_pipeline(self, url, settings):
+        settings = dict(settings or {})
         pipeline_started_monotonic = time.monotonic()
         pipeline_started_at = self._utc_now_label()
         stage_timings: dict[str, float] = {}
@@ -5003,20 +7192,35 @@ class ApiBridge:
         estimate_source = "not_estimated"
         self._active_progress_context = self._progress_context_from_settings(settings)
         try:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_warnings: list[str] = []
+            generation_mode = _normalize_generation_mode(settings.get("generation_mode"))
+            montage_settings = _normalize_montage_settings(settings.get("montage"))
             num_clips_raw = settings.get("num_clips", NUM_CLIPS)
             auto_clips = num_clips_raw == "auto"
             num_clips = NUM_CLIPS if auto_clips else int(num_clips_raw)
             processing_depth = _normalize_processing_depth(settings.get("processing_depth"))
             detection_preference = normalize_detection_preference(settings.get("detection_preference"))
+            game_title_hint = self._sanitize_game_title_hint(settings.get("game_title_hint"))
             quality_floor = quality_floor_for_preference(detection_preference)
             print(
-                f"[*] Pipeline settings: num_clips_raw={num_clips_raw!r}, "
+                f"[*] Pipeline settings: generation_mode={generation_mode}, "
+                f"num_clips_raw={num_clips_raw!r}, "
                 f"auto_clips={auto_clips}, num_clips={num_clips}, "
                 f"processing_depth={processing_depth}, "
-                f"detection_preference={detection_preference}, quality_floor={quality_floor:.2f}"
+                f"detection_preference={detection_preference}, quality_floor={quality_floor:.2f}, "
+                f"game_hint={'set' if game_title_hint else 'auto'}"
             )
-            clip_duration = int(settings.get("clip_duration", CLIP_DURATION))
-            min_gap = int(settings.get("min_gap", MIN_GAP))
+            if generation_mode == "montage":
+                run_warnings.append("montage_renderer_pending")
+                print(
+                    "[montage] Montage intent received "
+                    f"(template={montage_settings.get('template')}, "
+                    f"target={montage_settings.get('target_duration')}s). "
+                    "Current build records the plan settings; montage rendering lands in a follow-up pass."
+                )
+            clip_duration = _normalize_clip_duration(settings.get("clip_duration", CLIP_DURATION))
+            min_gap = _normalize_min_gap(settings.get("min_gap", MIN_GAP))
             style = _normalize_subtitle_style(settings.get("subtitle_style", SUBTITLE_STYLE))
             subtitle_enabled = subtitles_are_enabled(style)
             subtitle_placement = normalize_subtitle_placement(
@@ -5053,8 +7257,7 @@ class ApiBridge:
             ai_moment_classification_requested = ai_moment_classification_enabled
             moment_category_ranking_requested = moment_category_ranking_enabled
             voice_profile_ranking_requested = voice_profile_ranking_enabled
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_warnings: list[str] = []
+            multimodal_analysis_requested = False
 
             # ── 1. Download ──────────────────────────────────────────
             if self._cancel:
@@ -5066,6 +7269,48 @@ class ApiBridge:
             stage_timings["download"] = round(time.monotonic() - download_started, 3)
             source_id = self._source_id_for(video_path)
             source_stem = video_path.stem[:50]
+            game_context_started = time.monotonic()
+            source_game_identity = self._game_identity_for_source(
+                video_path,
+                allow_network=True,
+                explicit_title=game_title_hint,
+            )
+            source_game_context = (
+                source_game_identity.get("game_context")
+                if isinstance(source_game_identity.get("game_context"), dict)
+                else {}
+            )
+            source_game_title = (
+                source_game_identity.get("title")
+                or source_game_context.get("label")
+                or self._infer_game_title_from_path(video_path)
+            )
+            if not source_game_context:
+                source_game_context = self._game_context_for_title(source_game_title, allow_network=True)
+            self._remember_source_context(
+                video_path,
+                source_id=source_id,
+                game_title_hint=game_title_hint,
+                game_identity=source_game_identity,
+                game_context=source_game_context,
+                youtube_context=self._youtube_context_for_source(video_path),
+                force=bool(game_title_hint),
+            )
+            stage_timings["game_context"] = round(time.monotonic() - game_context_started, 3)
+            source_game_context_prompt = compact_game_context_for_prompt(source_game_context)
+            if source_game_context.get("status") in {"ok", "cache_hit"}:
+                print(
+                    "[game-context] "
+                    f"{source_game_context.get('label') or source_game_title or 'Unknown'} "
+                    f"({source_game_context.get('qid') or 'no qid'}) via "
+                    f"{source_game_identity.get('matched_via') or source_game_context.get('status')}"
+                )
+            elif source_game_title:
+                run_warnings.append(f"game_context_{source_game_context.get('status', 'unknown')}")
+                print(
+                    "[game-context] "
+                    f"{source_game_title}: {source_game_context.get('status', 'unknown')}"
+                )
             self._active_progress_context = self._progress_context_from_settings(
                 settings,
                 source_name=video_path.name,
@@ -5084,6 +7329,13 @@ class ApiBridge:
                         f"0:a:{requested_stream} is unavailable; falling back to auto"
                     )
             allow_stream_retry = forced_speech_stream is None
+            commentary_guard_policy = normalize_commentary_subtitle_policy(
+                audio_source.get("subtitle_policy", "creator")
+            )
+            commentary_guard_enabled = bool(
+                audio_source.get("commentary_guard")
+                and commentary_guard_policy == "creator"
+            )
             audio_source_debug = {
                 "mode": audio_source["mode"],
                 "requested_stream": requested_stream,
@@ -5092,13 +7344,12 @@ class ApiBridge:
                 "streams": source_audio_streams,
                 "render_audio": "all_source_streams_mixed",
                 "alternate_stream_retry": allow_stream_retry,
-                "subtitle_policy": audio_source.get("subtitle_policy", "creator"),
+                "subtitle_policy": commentary_guard_policy,
+                "commentary_guard_enabled": commentary_guard_enabled,
                 "single_track_commentary_guard": bool(
                     audio_source.get("commentary_guard") and len(source_audio_streams) == 1
                 ),
             }
-            commentary_guard_enabled = bool(audio_source_debug["single_track_commentary_guard"])
-            commentary_guard_policy = audio_source_debug["subtitle_policy"]
             with self._voice_profile_lock:
                 voice_profile_snapshot = json.loads(json.dumps(self._voice_profile))
             voice_profile_debug = voice_profile_status(
@@ -5196,6 +7447,8 @@ class ApiBridge:
                 visual_diagnostics_enabled = bool(depth_profile["visual_diagnostics"])
             if depth_profile["ai_moment_classification"] is not None:
                 ai_moment_classification_enabled = bool(depth_profile["ai_moment_classification"])
+            multimodal_analysis_enabled = bool(depth_profile.get("multimodal_analysis"))
+            multimodal_analysis_requested = multimodal_analysis_enabled
             if depth_profile["moment_category_ranking"] is not None:
                 moment_category_ranking_enabled = bool(depth_profile["moment_category_ranking"])
             if depth_profile["voice_profile_ranking"] is not None:
@@ -5214,6 +7467,7 @@ class ApiBridge:
                 ai_requested=ai_moment_classification_requested,
                 category_requested=moment_category_ranking_requested,
                 voice_requested=voice_profile_ranking_requested,
+                multimodal_requested=multimodal_analysis_requested,
                 voice_status=voice_profile_debug,
             )
             print(
@@ -5375,11 +7629,17 @@ class ApiBridge:
             candidate_analysis_started = time.monotonic()
             candidate_rows: list[dict] = []
             extracted_wavs: list[Path] = []
+            candidate_probe_durations: dict[str, float] = {}
             for idx, candidate in enumerate(analysis_candidates, 1):
                 if self._cancel:
                     return self._cancelled()
                 start = int(candidate["start"])
-                extended_end = min(int(candidate["end"]) + probe_buffer, int(vid_duration))
+                candidate_end = int(candidate["end"])
+                extended_end = min(
+                    candidate_end + probe_buffer,
+                    start + CANDIDATE_TRANSCRIPT_PROBE_MAX_SECONDS,
+                    int(vid_duration),
+                )
                 wav = SUBTITLES_DIR / f"{stem}_probe_{idx}.wav"
                 wav.unlink(missing_ok=True)
 
@@ -5395,19 +7655,48 @@ class ApiBridge:
                     "wav": wav,
                     "pct": pct,
                     "extracted": bool(extracted),
+                    "probe_duration": max(0, extended_end - start),
                 }
                 candidate_rows.append(row)
                 if extracted:
                     extracted_wavs.append(wav)
+                    candidate_probe_durations[str(wav)] = float(row["probe_duration"])
 
             batch_words_by_path: dict[str, list] = {}
             if extracted_wavs:
-                self._push("candidates", 35, f"Batch transcribing {len(extracted_wavs)} candidates...")
-                batch_words = transcribe_clips(extracted_wavs, model_size=candidate_model, language=language)
-                batch_words_by_path = {
-                    str(path): words
-                    for path, words in zip(extracted_wavs, batch_words)
-                }
+                transcription_chunks = _candidate_transcription_chunks(
+                    extracted_wavs,
+                    candidate_probe_durations,
+                )
+                if len(transcription_chunks) > 1:
+                    run_warnings.append("candidate_transcription_chunked")
+                    print(
+                        "[perf] Candidate transcription chunked: "
+                        f"{len(extracted_wavs)} probes across {len(transcription_chunks)} batches"
+                    )
+
+                def _candidate_transcription_progress(chunk_index, total_chunks, chunk, chunk_seconds):
+                    pct = 35 + int(((chunk_index - 1) / total_chunks) * 25)
+                    self._push(
+                        "candidates",
+                        pct,
+                        (
+                            f"Transcribing candidate batch {chunk_index}/{total_chunks} "
+                            f"({len(chunk)} clips, {int(round(chunk_seconds))}s audio)..."
+                        ),
+                    )
+
+                try:
+                    batch_words_by_path, _ = _transcribe_candidate_wav_chunks(
+                        extracted_wavs,
+                        candidate_probe_durations,
+                        model_size=candidate_model,
+                        language=language,
+                        cancel_check=lambda: bool(self._cancel),
+                        progress_callback=_candidate_transcription_progress,
+                    )
+                except CancelledError:
+                    return self._cancelled()
 
             voice_scoring_active = bool(voice_profile_debug.get("ranking_active"))
             for row in candidate_rows:
@@ -5425,7 +7714,12 @@ class ApiBridge:
                 used_stream = speech_stream
                 retry_report = None
 
-                if allow_stream_retry and needs_stream_retry(words, extended_end - start):
+                if allow_stream_retry and needs_stream_retry(
+                    words,
+                    extended_end - start,
+                    subtitle_policy=commentary_guard_policy,
+                    commentary_guard=commentary_guard_enabled,
+                ):
                     words, alt_stream = self._try_alternate_audio_streams(
                         video_path, start, extended_end, wav, candidate_model, language,
                         idx, candidate_total, speech_stream, return_stream=True,
@@ -5452,10 +7746,22 @@ class ApiBridge:
                     detection_preference=detection_preference,
                     commentary_guard=commentary_guard_enabled,
                     commentary_guard_policy=commentary_guard_policy,
+                    voice_profile=voice_profile_score,
+                    stream_profile=_selected_audio_stream_profile(
+                        audio_source_debug,
+                        selected_stream=used_stream,
+                        retry_report=retry_report,
+                    ),
                 )
                 if retry_report:
                     evaluation["stream_retry"] = retry_report
                     evaluation["moment"]["stream_retry"] = retry_report
+                evaluation["game_context"] = source_game_context
+                if isinstance(evaluation.get("candidate"), dict):
+                    evaluation["candidate"]["game_context"] = source_game_context
+                evaluation["moment"]["game_context"] = source_game_context
+                evaluation["moment"]["game_title"] = source_game_context.get("label") or source_game_title
+                evaluation["moment"]["game_title_hint"] = game_title_hint
                 evaluation["voice_profile"] = voice_profile_score
                 evaluation["moment"]["voice_profile"] = voice_profile_score
                 evaluations.append(evaluation)
@@ -5476,7 +7782,7 @@ class ApiBridge:
             learned_selected = select_best_candidates(
                 evaluations,
                 num_clips,
-                min_gap=max(8, min_gap),
+                min_gap=min_gap,
                 score_key="learned_quality_score",
             )
             shadow_scoring = build_shadow_scoring_report(
@@ -5486,14 +7792,14 @@ class ApiBridge:
                 source_id=source_id,
                 source_stem=source_stem,
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
+                min_gap=min_gap,
             )
             category_scoring = apply_moment_category_scoring(
                 evaluations,
                 enabled=moment_category_ranking_enabled,
                 score_key="learned_quality_score",
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
+                min_gap=min_gap,
             )
             category_score_key = (
                 "moment_category_quality_score"
@@ -5505,7 +7811,7 @@ class ApiBridge:
                 category_selected = select_best_candidates(
                     evaluations,
                     num_clips,
-                    min_gap=max(8, min_gap),
+                    min_gap=min_gap,
                     score_key=category_score_key,
                 )
             moment_category_ranking = build_moment_category_ranking_report(
@@ -5514,7 +7820,7 @@ class ApiBridge:
                 category_selected,
                 enabled=moment_category_ranking_enabled,
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
+                min_gap=min_gap,
                 score_key="learned_quality_score",
                 category_score_key="moment_category_quality_score",
             )
@@ -5522,7 +7828,7 @@ class ApiBridge:
             ai_shadow_max_count = min(
                 16,
                 max(8, int(num_clips or 0) * 2),
-                sum(1 for item in evaluations if item.get("accepted")),
+                len(evaluations),
             )
             ai_moment_classification_shadow, ai_shadow_cache = self._classify_ai_moment_shadow(
                 evaluations,
@@ -5533,6 +7839,7 @@ class ApiBridge:
                 max_count=ai_shadow_max_count,
                 max_ollama=min(8, ai_shadow_max_count),
                 attach_to_evaluations=True,
+                game_context=source_game_context,
             )
             ai_scoring = apply_ai_moment_scoring(
                 evaluations,
@@ -5549,7 +7856,7 @@ class ApiBridge:
                 ai_selected = select_best_candidates(
                     evaluations,
                     num_clips,
-                    min_gap=max(8, min_gap),
+                    min_gap=min_gap,
                     score_key=ai_score_key,
                 )
             ai_moment_ranking = build_ai_moment_ranking_report(
@@ -5558,45 +7865,175 @@ class ApiBridge:
                 ai_selected,
                 enabled=ai_shadow_enabled,
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
+                min_gap=min_gap,
                 score_key=category_score_key,
                 ai_score_key="ai_moment_quality_score",
+            )
+            multimodal_analysis_report = self._analyze_multimodal_candidate_shortlist(
+                evaluations,
+                ai_selected,
+                video_path,
+                enabled=bool(processing_depth == "deep" and multimodal_analysis_enabled),
+                score_key=ai_score_key,
+                video_duration=float(vid_duration),
+                max_count=int(depth_profile.get("multimodal_max_candidates") or 0),
+                game_context=source_game_context,
+            )
+            multimodal_scoring = apply_multimodal_scoring(
+                evaluations,
+                enabled=bool(processing_depth == "deep" and multimodal_analysis_enabled),
+                score_key=ai_score_key,
+            )
+            multimodal_score_key = (
+                "multimodal_quality_score"
+                if multimodal_scoring.get("ranking_enabled") and multimodal_scoring.get("has_multimodal_scores")
+                else ai_score_key
+            )
+            multimodal_selected = ai_selected
+            if multimodal_score_key == "multimodal_quality_score":
+                multimodal_selected = select_best_candidates(
+                    evaluations,
+                    num_clips,
+                    min_gap=min_gap,
+                    score_key=multimodal_score_key,
+                )
+            multimodal_ranking = build_multimodal_ranking_report(
+                evaluations,
+                ai_selected,
+                multimodal_selected,
+                enabled=bool(processing_depth == "deep" and multimodal_analysis_enabled),
+                max_count=num_clips,
+                min_gap=min_gap,
+                score_key=ai_score_key,
+                multimodal_score_key="multimodal_quality_score",
             )
             voice_scoring = apply_voice_profile_scoring(
                 evaluations,
                 voice_profile_debug,
-                score_key=ai_score_key,
+                score_key=multimodal_score_key,
             )
             selection_score_key = (
                 "voice_profile_quality_score"
                 if voice_scoring.get("ranking_enabled") and voice_scoring.get("has_voice_profile_scores")
-                else ai_score_key
+                else multimodal_score_key
             )
-            selected = ai_selected
+            selected = multimodal_selected
             if selection_score_key == "voice_profile_quality_score":
                 selected = select_best_candidates(
                     evaluations,
                     num_clips,
-                    min_gap=max(8, min_gap),
+                    min_gap=min_gap,
                     score_key=selection_score_key,
                 )
             voice_profile_ranking = build_voice_profile_ranking_report(
                 evaluations,
-                ai_selected,
+                multimodal_selected,
                 selected,
                 voice_profile_debug,
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
-                score_key=ai_score_key,
+                min_gap=min_gap,
+                score_key=multimodal_score_key,
                 voice_score_key="voice_profile_quality_score",
             )
             voice_profile_shadow = build_voice_profile_shadow_report(
                 evaluations,
-                ai_selected,
+                multimodal_selected,
                 max_count=num_clips,
-                min_gap=max(8, min_gap),
-                score_key=ai_score_key,
+                min_gap=min_gap,
+                score_key=multimodal_score_key,
             )
+            multi_signal_baseline_score_key = selection_score_key
+            multi_signal_ai_scoring = apply_multi_signal_ai_scoring(
+                evaluations,
+                enabled=bool(processing_depth == "deep"),
+                score_key=multi_signal_baseline_score_key,
+            )
+            multi_signal_ai_score_key = (
+                "multi_signal_ai_quality_score"
+                if multi_signal_ai_scoring.get("ranking_enabled")
+                and multi_signal_ai_scoring.get("has_multi_signal_scores")
+                else selection_score_key
+            )
+            multi_signal_baseline_selected = selected
+            if multi_signal_ai_score_key == "multi_signal_ai_quality_score":
+                selected = select_best_candidates(
+                    evaluations,
+                    num_clips,
+                    min_gap=min_gap,
+                    score_key=multi_signal_ai_score_key,
+                )
+                selection_score_key = multi_signal_ai_score_key
+            multi_signal_ai_ranking = build_multi_signal_ai_ranking_report(
+                evaluations,
+                multi_signal_baseline_selected,
+                selected,
+                enabled=bool(processing_depth == "deep"),
+                max_count=num_clips,
+                min_gap=min_gap,
+                baseline_score_key=multi_signal_baseline_score_key,
+                multi_signal_score_key="multi_signal_ai_quality_score",
+            )
+            near_quality_fallback = {
+                "schema_version": 1,
+                "applied": False,
+                "reason": "",
+                "selected_count": 0,
+                "added_count": 0,
+                "target_count": num_clips,
+                "selection_mode": "strict",
+                "score_key": selection_score_key,
+            }
+            should_fill_partial = bool(
+                selected
+                and processing_depth == "deep"
+                and detection_preference != "quality"
+                and len(selected) < num_clips
+            )
+            if (not selected or should_fill_partial) and evaluations:
+                fallback_reason = (
+                    "deep_auto_best_available_fill"
+                    if should_fill_partial
+                    else "strict_quality_selected_zero"
+                )
+                selected_before_fallback = len(selected)
+                fallback_selected = select_near_quality_fallback_candidates(
+                    evaluations,
+                    num_clips,
+                    min_gap=min_gap,
+                    score_key=selection_score_key,
+                    existing_selected=selected,
+                    allow_partial=should_fill_partial,
+                    reason=fallback_reason,
+                )
+                if fallback_selected:
+                    selected = fallback_selected
+                    added_count = max(0, len(selected) - selected_before_fallback)
+                    near_quality_fallback.update(
+                        {
+                            "applied": True,
+                            "reason": fallback_reason,
+                            "selected_count": len(selected),
+                            "added_count": added_count,
+                            "selection_mode": "partial_fill" if should_fill_partial else "zero_clip_rescue",
+                            "score_key": selection_score_key,
+                        }
+                    )
+                    run_warnings.append(
+                        "deep_best_available_fill_used"
+                        if should_fill_partial
+                        else "near_quality_fallback_used"
+                    )
+                    if should_fill_partial:
+                        print(
+                            "[rank] Deep Analysis under-filled target; "
+                            f"added {added_count} best-available candidate(s) "
+                            f"for {len(selected)}/{num_clips} clips."
+                        )
+                    else:
+                        print(
+                            "[rank] Strict quality selected zero clips; "
+                            f"using {len(selected)} near-quality fallback candidate(s)."
+                        )
             remaining_ai_ollama = max(
                 0,
                 min(8, len(selected)) - int(ai_moment_classification_shadow.get("ollama_attempted_count") or 0),
@@ -5607,9 +8044,15 @@ class ApiBridge:
                 enabled=ai_moment_classification_enabled,
                 max_ollama=remaining_ai_ollama,
                 classification_cache=ai_shadow_cache,
+                game_context=source_game_context,
             )
+            multimodal_status = multimodal_analysis_report.get("status", "unknown")
+            stage_timings["multimodal_analysis"] = float(multimodal_analysis_report.get("elapsed_seconds") or 0.0)
+            if multimodal_status not in {"ok", "disabled", "no_candidates", "no_shortlist_candidates"}:
+                run_warnings.append(f"multimodal_analysis_{multimodal_status}")
             scene_feature_status = local_analysis_feature_statuses.get("scene_detection", {})
             visual_feature_status = local_analysis_feature_statuses.get("visual_analysis", {})
+            multimodal_feature_status = local_analysis_feature_statuses.get("vision_context", {})
             ai_feature_status = local_analysis_feature_statuses.get("ai_moment_labels", {})
             category_feature_status = local_analysis_feature_statuses.get("moment_label_ranking", {})
             voice_feature_status = local_analysis_feature_statuses.get("voice_profile_ranking", {})
@@ -5619,6 +8062,11 @@ class ApiBridge:
             if visual_feature_status.get("inactive_reason"):
                 visual_diagnostics_report["disabled_reason"] = visual_feature_status.get("inactive_reason")
                 visual_diagnostics_report["reason"] = visual_feature_status.get("reason")
+            if multimodal_feature_status.get("inactive_reason"):
+                multimodal_analysis_report["disabled_reason"] = multimodal_feature_status.get("inactive_reason")
+                multimodal_analysis_report["reason"] = multimodal_feature_status.get("reason")
+                multimodal_ranking["disabled_reason"] = multimodal_feature_status.get("inactive_reason")
+                multimodal_ranking["reason"] = multimodal_feature_status.get("reason")
             if ai_feature_status.get("inactive_reason"):
                 ai_moment_classification_report["disabled_reason"] = ai_feature_status.get("inactive_reason")
                 ai_moment_classification_report["reason"] = ai_feature_status.get("reason")
@@ -5637,12 +8085,38 @@ class ApiBridge:
             debug_path = SUBTITLES_DIR / f"{stem}_candidate_debug.json"
             run_debug_path = SUBTITLES_DIR / f"{stem}_run_debug.json"
             debug_settings = {
+                "generation": {
+                    "mode": generation_mode,
+                    "montage": montage_settings,
+                    "montage_renderer_ready": False,
+                    "selection_impact": "none_currently_records_intent_only",
+                },
                 "num_clips": num_clips,
                 "detection_preference": detection_preference,
                 "quality_floor": quality_floor,
                 "processing_depth": processing_depth,
                 "processing_depth_profile": depth_profile,
                 "local_analysis_feature_statuses": local_analysis_feature_statuses,
+                "game_title_hint": game_title_hint,
+                "game_identity": {
+                    "enabled": True,
+                    "status": source_game_identity.get("status"),
+                    "title": source_game_identity.get("title"),
+                    "qid": source_game_identity.get("qid"),
+                    "confidence": source_game_identity.get("confidence"),
+                    "matched_via": source_game_identity.get("matched_via"),
+                    "evidence": source_game_identity.get("evidence", [])[:8],
+                    "candidates": source_game_identity.get("candidates", [])[:8],
+                    "selection_impact": source_game_identity.get("selection_impact", "game_context_lookup"),
+                },
+                "game_context": {
+                    "enabled": True,
+                    "status": source_game_context.get("status"),
+                    "prompt_context": source_game_context_prompt,
+                    "selection_impact": "ai_label_vision_heuristic_context_and_capped_deep_ranking_nudge",
+                    "game_context_nudge_max_adjustment": round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+                },
+                "source_context": self._source_record_for(video_path, source_id),
                 "clip_duration": clip_duration,
                 "min_gap": min_gap,
                 "whisper_model": model,
@@ -5660,6 +8134,14 @@ class ApiBridge:
                     "enabled": visual_diagnostics_enabled,
                     "max_candidates": visual_diagnostics_report.get("max_candidates"),
                     "status": visual_feature_status,
+                },
+                "multimodal_analysis": {
+                    "enabled": multimodal_analysis_enabled,
+                    "model": multimodal_analysis_report.get("model"),
+                    "feature_status": multimodal_feature_status,
+                    "selection_impact": multimodal_ranking.get("selection_impact", "none"),
+                    "max_adjustment": round(MULTIMODAL_SELECTION_MAX_ADJUSTMENT, 4),
+                    "max_shortlist_candidates": multimodal_analysis_report.get("max_shortlist_candidates"),
                 },
                 "moment_category_ranking": {
                     "enabled": moment_category_ranking_enabled,
@@ -5692,6 +8174,21 @@ class ApiBridge:
                     "enabled": voice_profile_ranking_enabled,
                     "status": voice_feature_status,
                 },
+                "multi_signal_ai_ranking": {
+                    "enabled": bool(processing_depth == "deep"),
+                    "selection_impact": multi_signal_ai_ranking.get("selection_impact", "none"),
+                    "selection_score_source": selection_score_key,
+                    "max_positive_adjustment": round(MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT, 4),
+                    "max_negative_adjustment": round(MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT, 4),
+                    "game_context_nudge_max_adjustment": round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+                    "has_game_context_scores": bool(multi_signal_ai_ranking.get("has_game_context_scores")),
+                    "game_context_scored_candidate_count": int(multi_signal_ai_ranking.get("game_context_scored_candidate_count") or 0),
+                    "status": {
+                        "ranking_enabled": bool(multi_signal_ai_ranking.get("ranking_enabled")),
+                        "has_multi_signal_scores": bool(multi_signal_ai_ranking.get("has_multi_signal_scores")),
+                    },
+                },
+                "near_quality_fallback": near_quality_fallback,
             }
 
             def _timing_payload(status: str, rendered_clip_count: int = 0) -> dict:
@@ -5724,19 +8221,41 @@ class ApiBridge:
                     "selected_count": len(selected),
                     "rendered_clip_count": int(rendered_clip_count or 0),
                     "settings_fingerprint": {
+                        "generation_mode": generation_mode,
+                        "montage_template": montage_settings.get("template"),
+                        "montage_target_duration": montage_settings.get("target_duration"),
                         "candidate_whisper_model": candidate_model,
                         "scene_mode": scene_mode,
                         "candidate_pool_cap": candidate_pool_cap,
                         "visual_analysis": bool(visual_diagnostics_enabled),
+                        "multimodal_analysis": bool(multimodal_analysis_enabled),
                         "ai_moment_labels": bool(ai_moment_classification_enabled),
                         "ai_moment_ranking": bool(ai_moment_ranking.get("ranking_enabled")),
+                        "multimodal_ranking": bool(multimodal_ranking.get("ranking_enabled")),
+                        "multi_signal_ai_ranking": bool(multi_signal_ai_ranking.get("ranking_enabled")),
                         "moment_label_ranking": bool(moment_category_ranking_enabled),
                         "voice_profile_ranking": bool(voice_profile_ranking_enabled),
+                        "game_identity_qid": source_game_identity.get("qid") or "",
+                        "game_identity_confidence": source_game_identity.get("confidence") or 0.0,
+                        "game_context": bool(source_game_context_prompt.get("available")),
                         "subtitle_style": style,
                     },
                     "stage_timings": dict(stage_timings),
                 }
                 return payload
+
+            for row in selected:
+                if not isinstance(row, dict):
+                    continue
+                row.setdefault("source_id", source_id)
+                row.setdefault("source_path", str(video_path))
+                row.setdefault("source_stem", source_stem)
+                row.setdefault("game_title", source_game_context.get("label") or source_game_title)
+                row.setdefault("game_identity", source_game_identity)
+                row.setdefault("game_context", source_game_context)
+                if game_title_hint and not row.get("game_title_hint"):
+                    row["game_title_hint"] = game_title_hint
+                row["truth_summary"] = self._clip_truth_summary(row, video_path)
 
             try:
                 write_debug_report(
@@ -5754,7 +8273,10 @@ class ApiBridge:
                     voice_profile_ranking=voice_profile_ranking,
                     moment_category_ranking=moment_category_ranking,
                     ai_moment_ranking=ai_moment_ranking,
+                    multimodal_ranking=multimodal_ranking,
+                    multi_signal_ai_ranking=multi_signal_ai_ranking,
                     visual_diagnostics=visual_diagnostics_report,
+                    multimodal_analysis=multimodal_analysis_report,
                     ai_moment_classification=ai_moment_classification_report,
                     ai_moment_classification_shadow=ai_moment_classification_shadow,
                     timing=_timing_payload("candidate_pre_render"),
@@ -5791,7 +8313,10 @@ class ApiBridge:
                         voice_profile_ranking=voice_profile_ranking,
                         moment_category_ranking=moment_category_ranking,
                         ai_moment_ranking=ai_moment_ranking,
+                        multimodal_ranking=multimodal_ranking,
+                        multi_signal_ai_ranking=multi_signal_ai_ranking,
                         visual_diagnostics=visual_diagnostics_report,
+                        multimodal_analysis=multimodal_analysis_report,
                         ai_moment_classification=ai_moment_classification_report,
                         ai_moment_classification_shadow=ai_moment_classification_shadow,
                         timing=no_quality_timing,
@@ -5822,7 +8347,10 @@ class ApiBridge:
                 m["source_id"] = source_id
                 m["source_path"] = str(video_path)
                 m["source_stem"] = source_stem
-                m["game_title"] = self._infer_game_title_from_path(video_path)
+                m["game_title"] = source_game_context.get("label") or source_game_title
+                m["game_title_hint"] = game_title_hint
+                m["game_identity"] = source_game_identity
+                m["game_context"] = source_game_context
                 m["clip_id"] = self._clip_id_for(m)
                 m["audio_source"] = {
                     "mode": audio_source_debug.get("mode"),
@@ -5834,6 +8362,7 @@ class ApiBridge:
                     "render_audio": audio_source_debug.get("render_audio"),
                     "alternate_stream_retry": audio_source_debug.get("alternate_stream_retry"),
                     "subtitle_policy": audio_source_debug.get("subtitle_policy"),
+                    "commentary_guard_enabled": audio_source_debug.get("commentary_guard_enabled"),
                     "single_track_commentary_guard": audio_source_debug.get("single_track_commentary_guard"),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
@@ -5897,7 +8426,12 @@ class ApiBridge:
                 final_retry_report = None
                 if extract_audio_clip(video_path, start, final_probe_end, wav, audio_stream=final_stream):
                     final_words = transcribe_clip(wav, model_size=model, language=language)
-                if allow_stream_retry and needs_stream_retry(final_words, final_probe_end - start):
+                if allow_stream_retry and needs_stream_retry(
+                    final_words,
+                    final_probe_end - start,
+                    subtitle_policy=commentary_guard_policy,
+                    commentary_guard=commentary_guard_enabled,
+                ):
                     retry_words, retry_stream = self._try_alternate_audio_streams(
                         video_path, start, final_probe_end, wav, model, language,
                         clip_num, total, final_stream, return_stream=True,
@@ -5914,6 +8448,11 @@ class ApiBridge:
                 )
 
                 if final_words:
+                    final_stream_profile = _selected_audio_stream_profile(
+                        audio_source_debug,
+                        selected_stream=final_stream,
+                        retry_report=final_retry_report,
+                    )
                     final_candidate = {
                         **item["candidate"],
                         "start": start,
@@ -5932,19 +8471,23 @@ class ApiBridge:
                         detection_preference=detection_preference,
                         commentary_guard=commentary_guard_enabled,
                         commentary_guard_policy=commentary_guard_policy,
+                        voice_profile=final_voice_profile_score,
+                        stream_profile=final_stream_profile,
                     )
                     final_eval["voice_profile"] = final_voice_profile_score
                     final_eval["moment"]["voice_profile"] = final_voice_profile_score
                     if final_retry_report:
                         final_eval["stream_retry"] = final_retry_report
                         final_eval["moment"]["stream_retry"] = final_retry_report
-                    if final_eval["words"]:
+                    final_words_for_subtitles = final_eval.get("words")
+                    if final_words_for_subtitles:
                         refined_moment = final_eval.get("moment") or {}
                         try:
                             trim_start = int(refined_moment.get("start", start))
                             trim_end = int(refined_moment.get("end", end))
                         except (TypeError, ValueError):
                             trim_start, trim_end = start, end
+                        start, end = trim_start, trim_end
                         keep_rank = m.get("quality_rank")
                         keep_selection_quality = m.get("selection_quality_score")
                         keep_selection_rank_score = m.get("selection_rank_score")
@@ -5961,6 +8504,10 @@ class ApiBridge:
                         keep_ai_adjustment = m.get("ai_adjustment")
                         keep_ai_scoring = m.get("ai_moment_scoring")
                         keep_ai_classification = m.get("ai_moment_classification")
+                        keep_multimodal_analysis = copy.deepcopy(m.get("multimodal_analysis")) if isinstance(m.get("multimodal_analysis"), dict) else None
+                        keep_multimodal_quality = m.get("multimodal_quality_score")
+                        keep_multimodal_adjustment = m.get("multimodal_adjustment")
+                        keep_multimodal_scoring = copy.deepcopy(m.get("multimodal_scoring")) if isinstance(m.get("multimodal_scoring"), dict) else None
                         keep_selection_ai_classification = m.get("selection_ai_moment_classification")
                         keep_ranking_primary_category = m.get("ranking_primary_category")
                         keep_ranking_moment_categories = copy.deepcopy(m.get("ranking_moment_categories")) if isinstance(m.get("ranking_moment_categories"), dict) else None
@@ -5980,9 +8527,9 @@ class ApiBridge:
                             trim_start != selected_start or trim_end != selected_end
                         )
                         m["subtitle_timing_offset"] = round(float(trim_start) - float(selected_start), 3)
-                        m["start"] = selected_start
-                        m["end"] = selected_end
-                        m["duration"] = selected_end - selected_start
+                        m["start"] = start
+                        m["end"] = end
+                        m["duration"] = end - start
                         if keep_ai_classification:
                             m["ai_moment_classification"] = copy.deepcopy(keep_ai_classification)
                             m["ai_moment_classification_stage"] = "selection_pre_render"
@@ -6018,6 +8565,14 @@ class ApiBridge:
                             m["ai_adjustment"] = keep_ai_adjustment
                         if keep_ai_scoring is not None:
                             m["ai_moment_scoring"] = keep_ai_scoring
+                        if keep_multimodal_analysis is not None:
+                            m["multimodal_analysis"] = keep_multimodal_analysis
+                        if keep_multimodal_quality is not None:
+                            m["multimodal_quality_score"] = keep_multimodal_quality
+                        if keep_multimodal_adjustment is not None:
+                            m["multimodal_adjustment"] = keep_multimodal_adjustment
+                        if keep_multimodal_scoring is not None:
+                            m["multimodal_scoring"] = keep_multimodal_scoring
                         m["selection_primary_category"] = keep_selection_primary_category
                         if keep_selection_moment_categories is not None:
                             m["selection_moment_categories"] = keep_selection_moment_categories
@@ -6027,8 +8582,23 @@ class ApiBridge:
                         words = _subtitle_words_for_render_start(
                             final_eval["words"],
                             trim_start,
-                            selected_start,
+                            start,
                         )
+                    elif isinstance(final_words_for_subtitles, list):
+                        refined_moment = final_eval.get("moment") or {}
+                        for key in (
+                            "commentary_guard",
+                            "music_lyrics_guard",
+                            "music_lyrics_penalty",
+                            "speech_source",
+                            "speech_source_penalty",
+                        ):
+                            if refined_moment.get(key) is not None:
+                                m[key] = refined_moment.get(key)
+                        words = []
+                        m["word_count"] = 0
+                        m["subtitle_word_count"] = 0
+                        m["transcript"] = ""
                 m["audio_source"] = {
                     "mode": audio_source_debug.get("mode"),
                     "selected_stream": final_stream,
@@ -6039,10 +8609,12 @@ class ApiBridge:
                     "render_audio": audio_source_debug.get("render_audio"),
                     "alternate_stream_retry": audio_source_debug.get("alternate_stream_retry"),
                     "subtitle_policy": audio_source_debug.get("subtitle_policy"),
+                    "commentary_guard_enabled": audio_source_debug.get("commentary_guard_enabled"),
                     "single_track_commentary_guard": audio_source_debug.get("single_track_commentary_guard"),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
                         selected_stream=final_stream,
+                        retry_report=final_retry_report,
                     ),
                 }
                 m["stream_selection"] = m["audio_source"]["stream_selection"]
@@ -6117,7 +8689,10 @@ class ApiBridge:
                     m["source_id"] = source_id
                     m["source_path"] = str(video_path)
                     m["source_stem"] = source_stem
-                    m["game_title"] = self._infer_game_title_from_path(video_path)
+                    m["game_title"] = source_game_context.get("label") or source_game_title
+                    m["game_title_hint"] = game_title_hint
+                    m["game_identity"] = source_game_identity
+                    m["game_context"] = source_game_context
                     m["clip_id"] = self._clip_id_for(m, clip_result.path)
                     if clip_result.warning:
                         m["render_warning"] = clip_result.warning
@@ -6142,6 +8717,7 @@ class ApiBridge:
                         else:
                             run_warnings.append(f"clip_{clip_num}_music_file_missing")
 
+                    m["truth_summary"] = self._clip_truth_summary(m, clip_result.path)
                     done.append(clip_result.path)
                     done_moments.append(m)
                     final_primary_category = m.get("primary_category") or item.get("primary_category")
@@ -6154,6 +8730,17 @@ class ApiBridge:
                             "source_id": m.get("source_id"),
                             "source_path": m.get("source_path"),
                             "source_stem": m.get("source_stem"),
+                            "game_title": m.get("game_title"),
+                            "game_identity": {
+                                "status": (m.get("game_identity") or {}).get("status"),
+                                "title": (m.get("game_identity") or {}).get("title"),
+                                "qid": (m.get("game_identity") or {}).get("qid"),
+                                "confidence": (m.get("game_identity") or {}).get("confidence"),
+                                "matched_via": (m.get("game_identity") or {}).get("matched_via"),
+                            } if isinstance(m.get("game_identity"), dict) else {},
+                            "game_context": compact_game_context_for_prompt(
+                                m.get("game_context") if isinstance(m.get("game_context"), dict) else {}
+                            ),
                             "subtitle_path": str(ass_path) if ass_path else None,
                             "start": start,
                             "end": end,
@@ -6206,6 +8793,14 @@ class ApiBridge:
                             "ai_scoring_eligible": item.get("ai_moment_scoring", {}).get("ai_scoring_eligible"),
                             "ai_ineligible_reason": item.get("ai_moment_scoring", {}).get("ai_ineligible_reason"),
                             "ai_moment_scoring": item.get("ai_moment_scoring") or m.get("ai_moment_scoring"),
+                            "multimodal_quality_score": item.get("multimodal_scoring", {}).get("multimodal_quality_score"),
+                            "multimodal_ranking_enabled": item.get("multimodal_scoring", {}).get("ranking_enabled"),
+                            "multimodal_adjustment": item.get("multimodal_scoring", {}).get("multimodal_adjustment"),
+                            "multimodal_selection_delta": item.get("multimodal_scoring", {}).get("selection_delta", ""),
+                            "multimodal_rank_delta": item.get("multimodal_scoring", {}).get("rank_delta"),
+                            "multimodal_scoring_eligible": item.get("multimodal_scoring", {}).get("scoring_eligible"),
+                            "multimodal_ineligible_reason": item.get("multimodal_scoring", {}).get("ineligible_reason"),
+                            "multimodal_scoring": item.get("multimodal_scoring") or m.get("multimodal_scoring"),
                             "rank_delta": item.get("shadow_scoring", {}).get("rank_delta"),
                             "selection_delta": item.get("shadow_scoring", {}).get("selection_delta", ""),
                             "shadow_scoring": item.get("shadow_scoring", {}),
@@ -6218,6 +8813,8 @@ class ApiBridge:
                             "stream_selection": m.get("stream_selection"),
                             "stream_retry": m.get("stream_retry"),
                             "visual_diagnostics": m.get("visual_diagnostics"),
+                            "multimodal_analysis": m.get("multimodal_analysis"),
+                            "truth_summary": m.get("truth_summary"),
                             "selection_ai_moment_classification": m.get("selection_ai_moment_classification") or item.get("ai_moment_classification"),
                             "ai_moment_classification_stage": m.get("ai_moment_classification_stage"),
                             "ai_moment_classification": m.get("ai_moment_classification"),
@@ -6251,9 +8848,17 @@ class ApiBridge:
                     pass
 
             # Append results (batch mode: preserve previous video's clips)
+            first_new_clip_index = len(self._results)
             self._results.extend(done)
             self._moments.extend(done_moments)
+            auto_metadata = self._generate_auto_metadata_for_results(
+                first_new_clip_index,
+                len(done),
+                final_clip_debug,
+                run_warnings,
+            ) if done else []
             final_timing = _timing_payload("success", rendered_clip_count=len(done))
+            final_timing["auto_metadata_count"] = len(auto_metadata)
             try:
                 final_timing["history_summary_after_run"] = self._record_processing_history(final_timing)
             except Exception as e:
@@ -6275,7 +8880,10 @@ class ApiBridge:
                     voice_profile_ranking=voice_profile_ranking,
                     moment_category_ranking=moment_category_ranking,
                     ai_moment_ranking=ai_moment_ranking,
+                    multimodal_ranking=multimodal_ranking,
+                    multi_signal_ai_ranking=multi_signal_ai_ranking,
                     visual_diagnostics=visual_diagnostics_report,
+                    multimodal_analysis=multimodal_analysis_report,
                     ai_moment_classification=ai_moment_classification_report,
                     ai_moment_classification_shadow=ai_moment_classification_shadow,
                     timing=final_timing,
@@ -6340,11 +8948,57 @@ class ApiBridge:
 
         # If it looks like a local file path, just use it directly
         if Path(url).exists():
-            return Path(url)
+            path = Path(url)
+            if not hasattr(self, "_download_info_by_path"):
+                self._download_info_by_path = {}
+            try:
+                self._download_info_by_path.pop(str(path.resolve()), None)
+            except Exception:
+                pass
+            return path
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return resolve_downloaded_path(info, ydl)
+            path = resolve_downloaded_path(info, ydl)
+            if not hasattr(self, "_download_info_by_path"):
+                self._download_info_by_path = {}
+            try:
+                self._download_info_by_path[str(path.resolve())] = self._compact_download_info(info, url)
+            except Exception:
+                pass
+            return path
+
+    @staticmethod
+    def _compact_download_info(info: dict | None, original_url: str = "") -> dict:
+        info = info if isinstance(info, dict) else {}
+
+        def text(value, limit):
+            cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+            cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", cleaned)
+            return cleaned[:limit]
+
+        def list_text(values, limit, item_limit):
+            result = []
+            for value in values or []:
+                cleaned = text(value, item_limit)
+                if cleaned and cleaned not in result:
+                    result.append(cleaned)
+                if len(result) >= limit:
+                    break
+            return result
+
+        return {
+            "schema_version": 1,
+            "source": "yt_dlp",
+            "title": text(info.get("title"), 180),
+            "uploader": text(info.get("uploader") or info.get("channel"), 140),
+            "channel": text(info.get("channel"), 140),
+            "webpage_url": text(info.get("webpage_url") or original_url, 300),
+            "original_url": text(original_url, 300),
+            "categories": list_text(info.get("categories"), 8, 80),
+            "tags": list_text(info.get("tags"), 20, 60),
+            "description": text(info.get("description"), 1000),
+        }
 
     def _try_alternate_audio_streams(self, video_path, start, end, wav, model, language,
                                      clip_num, total, preferred_stream=None,
@@ -6379,7 +9033,7 @@ class ApiBridge:
             alternate_attempts += 1
             title = stream.get("title") or f"0:a:{ordinal}"
             self._last_stream_retry["attempted"] = True
-            print(f"[audio] No words on preferred stream; trying 0:a:{ordinal} ({title})")
+            print(f"[audio] Preferred stream needs retry; trying 0:a:{ordinal} ({title})")
             if progress_stage == "candidates":
                 pct = int(progress_percent) if progress_percent is not None else 0
                 self._push("candidates", pct, f"Candidate {clip_num}/{total}: trying audio track {ordinal + 1}...")
@@ -6435,7 +9089,60 @@ class ApiBridge:
 
     # ── Upload orchestrator (background thread) ──────────────────────────
 
-    def _scheduled_upload_active(self, clip_idx, meta=None, channel_id=None) -> bool:
+    @staticmethod
+    def _schedule_upload_fingerprint_value(value):
+        if isinstance(value, (list, tuple, set)):
+            return [ApiBridge._schedule_upload_fingerprint_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): ApiBridge._schedule_upload_fingerprint_value(value[key])
+                for key in sorted(value)
+                if value[key] not in (None, "")
+            }
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _schedule_upload_slot_fingerprint(self, item: dict | None) -> str:
+        item = item if isinstance(item, dict) else {}
+        payload = {
+            key: self._schedule_upload_fingerprint_value(item.get(key))
+            for key in (
+                "clip_id",
+                "clip_filename",
+                "clipIdx",
+                "source_id",
+                "account_id",
+                "channel_id",
+                "date",
+                "time",
+                "publish_at",
+                "scheduled_local",
+                "timezone_offset_minutes",
+                "title",
+                "privacy",
+                "description",
+                "final_description",
+                "tags",
+                "category_id",
+            )
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8", errors="ignore")
+        ).hexdigest()
+
+    def _scheduled_upload_attempt_matches(self, item: dict, attempt_id: str | None = None) -> bool:
+        attempt = str(attempt_id or "").strip()
+        if not attempt:
+            return True
+        if str(item.get("upload_attempt_id") or "").strip() != attempt:
+            return False
+        stored_fingerprint = str(item.get("upload_attempt_fingerprint") or "").strip()
+        if not stored_fingerprint:
+            return False
+        return stored_fingerprint == self._schedule_upload_slot_fingerprint(item)
+
+    def _scheduled_upload_active(self, clip_idx, meta=None, channel_id=None, attempt_id: str | None = None) -> bool:
         with self._get_state_lock():
             for item in self._scheduled:
                 if item.get("uploaded"):
@@ -6451,6 +9158,8 @@ class ApiBridge:
                 if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
                     continue
                 if meta and meta.get("account_id") and item.get("account_id") and item.get("account_id") != meta.get("account_id"):
+                    continue
+                if not self._scheduled_upload_attempt_matches(item, attempt_id):
                     continue
                 return True
         return False
@@ -6489,7 +9198,7 @@ class ApiBridge:
         except (TypeError, ValueError):
             return False
 
-    def _mark_scheduled_uploaded(self, clip_idx, meta, upload_result=None, trigger: str = "manual"):
+    def _mark_scheduled_uploaded(self, clip_idx, meta, upload_result=None, trigger: str = "manual", attempt_id: str | None = None):
         """Mark the matching scheduled item as uploaded after YouTube accepts it."""
         with self._get_state_lock():
             meta = meta or {}
@@ -6503,6 +9212,8 @@ class ApiBridge:
                 if meta and meta.get("channel_id") and item.get("channel_id") and item.get("channel_id") != meta.get("channel_id"):
                     continue
                 if meta and meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
+                    continue
+                if not self._scheduled_upload_attempt_matches(item, attempt_id):
                     continue
                 item["uploaded"] = True
                 item["uploaded_at"] = timestamp
@@ -6550,6 +9261,7 @@ class ApiBridge:
                 item["scheduler_status"] = "uploading"
                 item["scheduler_note"] = "Sending to YouTube"
                 item["upload_attempt_id"] = attempt_id
+                item["upload_attempt_fingerprint"] = self._schedule_upload_slot_fingerprint(item)
                 item["upload_attempt_started_at"] = timestamp
                 item["upload_attempt_trigger"] = trigger
                 item.pop("upload_unknown_at", None)
@@ -6559,7 +9271,7 @@ class ApiBridge:
                 return attempt_id
             return None
 
-    def _clear_scheduled_upload_attempt(self, clip_idx, meta=None, channel_id=None) -> bool:
+    def _clear_scheduled_upload_attempt(self, clip_idx, meta=None, channel_id=None, attempt_id: str | None = None) -> bool:
         """Clear an in-progress marker when an upload is cancelled before acceptance."""
         with self._get_state_lock():
             meta = meta or {}
@@ -6572,14 +9284,16 @@ class ApiBridge:
                 if channel_id and item.get("channel_id") and item.get("channel_id") != channel_id:
                     continue
                 if str(item.get("scheduler_status") or "").lower() == "uploading":
-                    for key in ("scheduler_status", "scheduler_note", "upload_attempt_id", "upload_attempt_started_at", "upload_attempt_trigger"):
+                    if not self._scheduled_upload_attempt_matches(item, attempt_id):
+                        continue
+                    for key in ("scheduler_status", "scheduler_note", "upload_attempt_id", "upload_attempt_fingerprint", "upload_attempt_started_at", "upload_attempt_trigger"):
                         item.pop(key, None)
                     changed = True
             if changed:
                 self._save_state()
             return changed
 
-    def _mark_scheduled_upload_failed_for_clip(self, clip_idx, meta, error, now=None) -> bool:
+    def _mark_scheduled_upload_failed_for_clip(self, clip_idx, meta, error, now=None, attempt_id: str | None = None) -> bool:
         """Mark matching scheduled rows as failed after a known upload error."""
         with self._get_state_lock():
             meta = meta or {}
@@ -6595,13 +9309,15 @@ class ApiBridge:
                     continue
                 if meta.get("title") and item.get("title") and item.get("title") != meta.get("title"):
                     continue
+                if not self._scheduled_upload_attempt_matches(item, attempt_id):
+                    continue
                 self._mark_scheduled_upload_failed(item, error, now)
                 changed = True
             if changed:
                 self._save_state()
             return changed
 
-    def _run_upload(self, clips_metadata, schedule_start_iso, interval_hours, channel_id=None, upload_lock=None):
+    def _run_upload(self, clips_metadata, channel_id=None, upload_lock=None):
         try:
             ordered_metadata = self._validate_upload_metadata(clips_metadata)
             total = len(ordered_metadata)
@@ -6628,7 +9344,11 @@ class ApiBridge:
                     continue
 
                 self._push("upload", pct, f"Uploading clip {i + 1}/{total}...")
-                self._begin_scheduled_upload_attempt(idx, meta, trigger="manual", channel_id=channel_id)
+                attempt_id = self._begin_scheduled_upload_attempt(idx, meta, trigger="manual", channel_id=channel_id)
+                if not attempt_id:
+                    skipped += 1
+                    print(f"[upload] Skipping Clip {idx + 1}; schedule slot changed before upload")
+                    continue
                 self._js("window.onScheduleUpdated()")
 
                 clip_base_pct = int((i / total) * 100)
@@ -6644,24 +9364,23 @@ class ApiBridge:
                         title=meta.get("title", f"Viral Clip #{i + 1}"),
                         description=meta.get("final_description") or meta.get("description", ""),
                         tags=meta.get("tags", generate_tags()),
-                        category_id=DEFAULT_VIDEO_CATEGORY_ID,
                         privacy=meta.get("privacy", "private"),
                         scheduled_time=scheduled,
                         channel_id=meta.get("channel_id") or channel_id,
                         account_id=meta.get("account_id"),
-                        cancel_check=lambda: self._is_cancelled() or not self._scheduled_upload_active(idx, meta, channel_id),
+                        cancel_check=lambda: self._is_cancelled() or not self._scheduled_upload_active(idx, meta, channel_id, attempt_id=attempt_id),
                         on_progress=_upload_progress,
                     )
                 except Exception as upload_error:
                     if self._is_cancelled():
-                        self._clear_scheduled_upload_attempt(idx, meta, channel_id)
+                        self._clear_scheduled_upload_attempt(idx, meta, channel_id, attempt_id=attempt_id)
                         self._js("window.onScheduleUpdated()")
                         return self._cancelled()
-                    self._mark_scheduled_upload_failed_for_clip(idx, meta, upload_error)
+                    self._mark_scheduled_upload_failed_for_clip(idx, meta, upload_error, attempt_id=attempt_id)
                     self._js("window.onScheduleUpdated()")
                     raise
                 uploaded += 1
-                if self._mark_scheduled_uploaded(idx, meta, result):
+                if self._mark_scheduled_uploaded(idx, meta, result, attempt_id=attempt_id):
                     self._js("window.onScheduleUpdated()")
 
                 # Auto-delete from disk after successful upload
@@ -6731,12 +9450,13 @@ class ApiBridge:
 
                     if now < sched_dt:
                         continue
-                    if self._scheduled_item_missed_upload_window(item, sched_dt, now):
+                    retrying_failed_upload = str(item.get("scheduler_status") or "").lower() == "upload_failed"
+                    if not retrying_failed_upload and self._scheduled_item_missed_upload_window(item, sched_dt, now):
                         if item.get("scheduler_status") != "missed":
                             item["scheduler_status"] = "missed"
                             item["missed_at"] = now.replace(microsecond=0).isoformat()
                             changed = True
-                            print("[scheduler] Public scheduled upload missed; waiting for manual reschedule/upload")
+                            print("[scheduler] Scheduled upload missed; waiting for manual reschedule/upload")
                         continue
                     clip_idx = self._resolve_clip_index(item)
                     video_path = self._safe_clip_path(self._results[clip_idx]) if clip_idx is not None and 0 <= clip_idx < len(self._results) else None
@@ -6746,11 +9466,12 @@ class ApiBridge:
                         print("[scheduler] Removed scheduled item for a missing clip")
                         continue
                     item["clipIdx"] = clip_idx
-                    title = item.get("title", f"Viral Clip #{clip_idx + 1}")
-                    tags = item.get("tags", generate_tags())
+                    meta = self._ensure_schedule_description(dict(item), clip_idx)
+                    item.update(meta)
+                    title = meta.get("title", f"Viral Clip #{clip_idx + 1}")
+                    tags = meta.get("tags", generate_tags())
                     if isinstance(tags, str):
                         tags = [t.strip() for t in tags.split(",") if t.strip()]
-                    meta = self._ensure_schedule_description(dict(item), clip_idx)
 
                 upload_lock = self._get_upload_lock()
                 with self._get_state_lock():
@@ -6763,6 +9484,7 @@ class ApiBridge:
                 print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
                 status_message = json.dumps(f"Uploading: {title}")
                 self._js(f"window.onSchedulerStatus({status_message})")
+                attempt_id = None
                 try:
                     attempt_id = self._begin_scheduled_upload_attempt(
                         clip_idx,
@@ -6779,16 +9501,15 @@ class ApiBridge:
                         title=title,
                         description=meta.get("final_description") or meta.get("description", ""),
                         tags=tags,
-                        category_id=DEFAULT_VIDEO_CATEGORY_ID,
                         privacy=meta.get("privacy", "private"),
                         channel_id=meta.get("channel_id"),
                         account_id=meta.get("account_id"),
                         cancel_check=lambda meta=meta, clip_idx=clip_idx: (
                             self._is_cancelled()
-                            or not self._scheduled_upload_active(clip_idx, meta, meta.get("channel_id"))
+                            or not self._scheduled_upload_active(clip_idx, meta, meta.get("channel_id"), attempt_id=attempt_id)
                         ),
                     )
-                    if self._mark_scheduled_uploaded(clip_idx, meta, result, trigger="scheduler"):
+                    if self._mark_scheduled_uploaded(clip_idx, meta, result, trigger="scheduler", attempt_id=attempt_id):
                         changed = True
                         self._js("window.onScheduleUpdated()")
                     print(f"[scheduler] Uploaded: {title}")
@@ -6803,8 +9524,8 @@ class ApiBridge:
                 except Exception as e:
                     print(f"[scheduler] Upload failed: {e}")
                     if self._is_cancelled():
-                        self._clear_scheduled_upload_attempt(clip_idx, meta, meta.get("channel_id"))
-                    elif self._mark_scheduled_upload_failed_for_clip(clip_idx, meta, e, now):
+                        self._clear_scheduled_upload_attempt(clip_idx, meta, meta.get("channel_id"), attempt_id=attempt_id)
+                    elif self._mark_scheduled_upload_failed_for_clip(clip_idx, meta, e, now, attempt_id=attempt_id):
                         changed = True
                     self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
                 finally:
@@ -6842,22 +9563,19 @@ class ApiBridge:
             item["last_error"] = str(error)[:500]
             item["last_failed_at"] = now.replace(microsecond=0).isoformat()
             item["retry_after"] = (now + timedelta(minutes=delay_minutes)).replace(microsecond=0).isoformat()
-            for key in ("scheduler_note", "upload_attempt_id", "upload_attempt_started_at", "upload_attempt_trigger", "upload_unknown_at"):
+            for key in ("scheduler_note", "upload_attempt_id", "upload_attempt_fingerprint", "upload_attempt_started_at", "upload_attempt_trigger", "upload_unknown_at"):
                 item.pop(key, None)
 
     def _scheduled_item_missed_upload_window(self, item, sched_dt, now=None) -> bool:
-        """Return True when an overdue public item should wait for user action."""
+        """Return True when an overdue local watcher item should wait for user action."""
         if not isinstance(item, dict):
-            return False
-        privacy = str(item.get("privacy", "private") or "private").lower()
-        if privacy != "public":
             return False
         now = _local_naive_datetime(now or datetime.now())
         sched_dt = _local_naive_datetime(sched_dt)
         return now > sched_dt + SCHEDULER_MISSED_GRACE
 
-    def _mark_overdue_public_schedules_missed(self, now=None) -> bool:
-        """Mark overdue public local-watcher items before the scheduler tick runs."""
+    def _mark_overdue_schedules_missed(self, now=None) -> bool:
+        """Mark overdue local-watcher items before the scheduler tick runs."""
         with self._get_state_lock():
             now = _local_naive_datetime(now or datetime.now())
             changed = False
@@ -6886,11 +9604,16 @@ class ApiBridge:
                 if isinstance(clip_idx, int) and 0 <= clip_idx < len(self._moments):
                     moment = self._moments[clip_idx] if isinstance(self._moments[clip_idx], dict) else {}
                     clip_id = moment.get("clip_id")
-                safe_path.unlink()
+                deleted_ok, delete_error = self._unlink_clip_file(safe_path)
+                if not deleted_ok:
+                    print(f"[cleanup] Failed to delete {safe_path.name}: {delete_error}")
+                    return
+                self._delete_clip_sidecar(safe_path, reason="uploaded_clip_deleted")
                 self._mark_personalization_clips_deleted({clip_id} if clip_id else set(), {deleted_name})
                 self._prune_missing_results()
                 print(f"[cleanup] Deleted uploaded clip: {deleted_name}")
-                self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(deleted_name)}`)")
+                payload = {"clipIdx": clip_idx, "clipId": clip_id or "", "filename": deleted_name}
+                self._js(f"window.onClipDeleted({json.dumps(payload)})")
         except Exception as e:
             print(f"[cleanup] Failed to delete {video_path.name}: {e}")
 
@@ -7202,6 +9925,15 @@ class ApiBridge:
                 "upload_history": self._upload_history,
                 "delete_after_upload": self._delete_after_upload,
                 "user_settings": self._user_settings,
+                "download_info_by_path": self._normalize_download_info_store(
+                    getattr(self, "_download_info_by_path", {})
+                ),
+                "source_context": {
+                    "schema_version": 1,
+                    "sources": self._normalize_source_context_store(
+                        getattr(self, "_source_context", {})
+                    ),
+                },
             }
             try:
                 self._write_state_atomic(data)
@@ -7279,6 +10011,12 @@ class ApiBridge:
                 self._upload_history = self._normalize_upload_history(old_upload_history)
                 self._delete_after_upload = bool(data.get("delete_after_upload", False))
                 self._user_settings = data.get("user_settings", {}) if isinstance(data.get("user_settings", {}), dict) else {}
+                self._download_info_by_path = self._normalize_download_info_store(
+                    data.get("download_info_by_path", {})
+                )
+                self._source_context = self._normalize_source_context_store(
+                    data.get("source_context", {})
+                )
 
                 removed_missing_files = len(self._results) != len(paths)
                 removed_scheduled_items = len(self._scheduled) != len(old_scheduled)
@@ -7286,6 +10024,7 @@ class ApiBridge:
                     isinstance(item, dict) and not item.get("schema_version")
                     for item in old_upload_history
                 )
+                source_context_missing = not isinstance(data.get("source_context"), dict)
                 needs_rewrite = (
                     schema_version != STATE_SCHEMA_VERSION
                     or identity_missing
@@ -7294,6 +10033,7 @@ class ApiBridge:
                     or removed_scheduled_items
                     or stale_upload_attempts
                     or history_missing_schema
+                    or source_context_missing
                 )
                 if schema_version < STATE_SCHEMA_VERSION:
                     self._backup_state_file(f"pre_v{STATE_SCHEMA_VERSION}")

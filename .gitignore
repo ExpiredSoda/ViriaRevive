@@ -34,6 +34,7 @@ downloads/
 clips/
 subtitles/
 analysis_cache/
+game_context/
 carryover_backups/
 music/
 bin/*.dll

@@ -2,9 +2,9 @@
 """
 ViriaRevive  –  Viral Clip Generator
 
-  Downloads a YouTube video, finds the most engaging moments (no AI –
-  pure audio-energy + scene-change analysis), adds TikTok-style
-  word-by-word subtitles, and optionally schedules uploads to YouTube.
+  Downloads a YouTube video, finds engaging moments with transcript-aware
+  ranking, optional learning/category scoring, word-by-word subtitles, and
+  optionally schedules uploads to YouTube with generated metadata.
 
 Usage:
   python main.py "https://youtube.com/watch?v=VIDEO_ID"
@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import multiprocessing
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -58,7 +59,25 @@ from speech_stream_selector import (
     select_speech_stream,
     should_accept_alternate_stream,
 )
+from title_generator import (
+    generate_description,
+    generate_tags,
+    generate_title,
+)
 from uploader import upload_to_youtube, build_schedule
+
+MIN_CLIP_DURATION_SECONDS = 10
+MAX_CLIP_DURATION_SECONDS = 180
+
+
+def _normalize_clip_duration(value, default: int = CLIP_DURATION) -> int:
+    try:
+        duration = int(value)
+    except (TypeError, ValueError):
+        duration = int(default or CLIP_DURATION)
+    if duration <= 0:
+        duration = int(default or CLIP_DURATION)
+    return max(MIN_CLIP_DURATION_SECONDS, min(MAX_CLIP_DURATION_SECONDS, duration))
 
 
 def _check_deps():
@@ -121,6 +140,101 @@ def _print_category_summary(moment_category_ranking: dict):
         f"[rank] Moment-label blend: cap ±{cap}, {len(changes)} reorder signal(s), "
         f"{added} added, {dropped} dropped; {changed}"
     )
+
+
+def _infer_cli_game_title_from_path(path) -> str:
+    generic = {
+        "vertical", "horizontal", "clips", "downloads", "recording video files",
+        "videos", "video files", "captures", "recordings", "obs", "output",
+    }
+    try:
+        p = Path(path)
+    except Exception:
+        return ""
+    for part in (p.parent.name, p.parent.parent.name if p.parent else ""):
+        cleaned = str(part or "").strip()
+        if not cleaned or cleaned.lower() in generic:
+            continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}", cleaned):
+            continue
+        return cleaned
+    return ""
+
+
+def _cli_title_context(
+    video_path: Path,
+    clip_path: Path,
+    item: dict,
+    idx: int,
+    stream_selection: dict,
+    source_audio_streams: list[dict],
+) -> dict:
+    moment = item.get("moment") if isinstance(item.get("moment"), dict) else {}
+    ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+    multi_signal_ai = (
+        moment.get("multi_signal_ai_scoring")
+        if isinstance(moment.get("multi_signal_ai_scoring"), dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "clip_id": moment.get("clip_id"),
+        "source_id": moment.get("source_id"),
+        "source_path": str(video_path),
+        "source_stem": video_path.stem[:50],
+        "game_title": moment.get("game_title") or _infer_cli_game_title_from_path(video_path),
+        "clip_filename": Path(clip_path).name,
+        "clip_index": idx,
+        "start": moment.get("start"),
+        "end": moment.get("end"),
+        "duration": moment.get("duration"),
+        "peak_time": moment.get("peak_time"),
+        "candidate_rank": moment.get("candidate_rank"),
+        "candidate_kind": moment.get("candidate_kind"),
+        "detector_score": moment.get("score"),
+        "detector_scores": moment.get("detector_scores") if isinstance(moment.get("detector_scores"), dict) else {},
+        "scene_detection_status": moment.get("scene_detection_status"),
+        "scene_score": moment.get("scene_score"),
+        "variance_score": moment.get("variance_score"),
+        "quality_score": moment.get("quality_score"),
+        "selection_quality_score": moment.get("selection_quality_score"),
+        "selection_rank_score": item.get("selection_rank_score") or moment.get("selection_rank_score"),
+        "selection_score_source": item.get("selection_score_source") or moment.get("selection_score_source"),
+        "quality_rank": moment.get("quality_rank"),
+        "learned_quality_score": item.get("shadow_scoring", {}).get("learned_quality_score") or moment.get("learned_quality_score"),
+        "learned_adjustment": item.get("shadow_scoring", {}).get("learned_adjustment") or moment.get("learned_adjustment"),
+        "moment_categories": moment.get("moment_categories") or item.get("moment_categories"),
+        "primary_category": moment.get("primary_category") or item.get("primary_category"),
+        "ai_moment_classification": moment.get("ai_moment_classification"),
+        "visual_diagnostics": moment.get("visual_diagnostics"),
+        "multimodal_analysis": moment.get("multimodal_analysis"),
+        "multi_signal_ai_quality_score": moment.get("multi_signal_ai_quality_score"),
+        "multi_signal_ai_adjustment": moment.get("multi_signal_ai_adjustment"),
+        "multi_signal_ai_scoring": multi_signal_ai,
+        "commentary_guard": moment.get("commentary_guard"),
+        "voice_profile": moment.get("voice_profile"),
+        "word_count": moment.get("word_count"),
+        "analysis_word_count": moment.get("analysis_word_count"),
+        "subtitle_word_count": moment.get("subtitle_word_count"),
+        "speech_stream": moment.get("speech_stream"),
+        "audio_source": moment.get("audio_source"),
+        "stream_selection": moment.get("stream_selection") or stream_selection,
+        "source_audio_streams": source_audio_streams,
+        "subtitle_generated": moment.get("subtitle_generated"),
+        "subtitles_burned": moment.get("subtitles_burned"),
+        "subtitle_placement": moment.get("subtitle_placement"),
+        "transcript_source": moment.get("transcript_source"),
+        "transcript_backfilled": moment.get("transcript_backfilled"),
+        "transcript": str(moment.get("transcript") or item.get("transcript") or "")[:4000],
+        "ranker": {
+            "hook_points": ranker.get("hook_points"),
+            "weak_points": ranker.get("weak_points"),
+            "aftermath_points": ranker.get("aftermath_points"),
+            "first_word_start": ranker.get("first_word_start"),
+            "last_word_end": ranker.get("last_word_end"),
+            "reject_reason": ranker.get("reject_reason"),
+        },
+    }
 
 
 def _apply_cli_moment_category_ranking(
@@ -193,6 +307,13 @@ def process(
     moment_category_ranking: bool = False,
 ):
     _check_deps()
+    requested_clip_duration = clip_duration
+    clip_duration = _normalize_clip_duration(clip_duration)
+    if clip_duration != requested_clip_duration:
+        print(
+            "[i] Clip duration adjusted to "
+            f"{clip_duration}s to stay within the 3-minute Shorts limit"
+        )
     subtitle_placement = normalize_subtitle_placement(subtitle_placement or SUBTITLE_PLACEMENT)
 
     # ── 1. Download ──────────────────────────────────────────────────────
@@ -357,6 +478,7 @@ def process(
     # ── 4. Clip + subtitle each selected moment ──────────────────────────
     print(f"\n══ 4 · Creating {len(selected)} selected clips with subtitles ══")
     done: list[Path] = []
+    done_items: list[dict] = []
     final_clip_debug: list[dict] = []
 
     for idx, item in enumerate(selected, 1):
@@ -469,6 +591,7 @@ def process(
                 m["render_warning"] = result.warning
                 run_warnings.append(f"clip_{idx}_{result.warning}")
             done.append(result.path)
+            done_items.append(item)
             final_clip_debug.append(
                 {
                     "index": idx,
@@ -539,12 +662,34 @@ def process(
             start_time=datetime.now(timezone.utc) + timedelta(hours=1),
             interval_hours=schedule_hours,
         )
-        for item in sched:
-            idx = done.index(item["path"]) + 1
+        for idx, (item, selected_item) in enumerate(zip(sched, done_items), 1):
+            clip_path = item["path"]
+            clip_context = _cli_title_context(
+                video_path,
+                clip_path,
+                selected_item,
+                idx,
+                stream_selection,
+                source_audio_streams,
+            )
+            transcript = str(clip_context.get("transcript") or "")
+            game_title = str(clip_context.get("game_title") or "")
+            title = generate_title(
+                transcript,
+                game_title=game_title,
+                clip_context=clip_context,
+            ) or f"{stem} - Clip #{idx}"
+            description = generate_description(
+                title,
+                game_title=game_title,
+                clip_context=clip_context,
+            )
+            tags = generate_tags(game_title, transcript, clip_context=clip_context)
             upload_to_youtube(
-                item["path"],
-                title=f"{stem} – Viral Clip #{idx}",
-                description=f"Viral clip from {stem}\n\n#shorts #viral",
+                clip_path,
+                title=title,
+                description=description,
+                tags=tags,
                 scheduled_time=item["scheduled_time"],
                 privacy="public",
             )
@@ -604,7 +749,13 @@ def main():
     )
     p.add_argument("url", help="YouTube video URL")
     p.add_argument("-n", "--clips",    type=int, default=NUM_CLIPS,    help=f"number of clips  (default {NUM_CLIPS})")
-    p.add_argument("-d", "--duration", type=int, default=CLIP_DURATION, help=f"clip length in seconds  (default {CLIP_DURATION})")
+    p.add_argument(
+        "-d",
+        "--duration",
+        type=int,
+        default=CLIP_DURATION,
+        help=f"clip length in seconds, {MIN_CLIP_DURATION_SECONDS}-{MAX_CLIP_DURATION_SECONDS} for Shorts  (default {CLIP_DURATION})",
+    )
     p.add_argument("-s", "--style",    choices=["tiktok", "karaoke", "glow", "clean", "bold", "minimal"], default=SUBTITLE_STYLE, help="subtitle style")
     p.add_argument("-m", "--model",    choices=["tiny", "base", "small", "medium", "large-v3"], default=WHISPER_MODEL, help="whisper model size")
     p.add_argument("-l", "--language", default=WHISPER_LANGUAGE, help="force language (en, es, fr …)")

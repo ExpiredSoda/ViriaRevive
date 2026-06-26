@@ -51,7 +51,7 @@ class ExternalStatusTruthTests(unittest.TestCase):
         def fake_urlopen(req, timeout=0):
             url = getattr(req, "full_url", str(req))
             if url.endswith("/api/tags"):
-                return _FakeResponse({"models": [{"name": "qwen2.5:3b"}]})
+                return _FakeResponse({"models": [{"name": "qwen3.5:4b"}]})
             if url.endswith("/api/version"):
                 return _FakeResponse({"version": "0.9.0"})
             return _FakeResponse({})
@@ -64,7 +64,7 @@ class ExternalStatusTruthTests(unittest.TestCase):
 
         self.assertTrue(status["running"])
         self.assertTrue(status["using_ollama"])
-        self.assertIn("qwen2.5:3b", status["models"])
+        self.assertIn("qwen3.5:4b", status["models"])
         self.assertEqual(status["version"], "0.9.0")
 
     def test_ollama_status_rejects_tags_without_version(self):
@@ -73,7 +73,7 @@ class ExternalStatusTruthTests(unittest.TestCase):
         def fake_urlopen(req, timeout=0):
             url = getattr(req, "full_url", str(req))
             if url.endswith("/api/tags"):
-                return _FakeResponse({"models": [{"name": "qwen2.5:3b"}]})
+                return _FakeResponse({"models": [{"name": "qwen3.5:4b"}]})
             if url.endswith("/api/version"):
                 return _FakeResponse({"not_version": "nope"})
             return _FakeResponse({})
@@ -135,7 +135,11 @@ class ExternalStatusTruthTests(unittest.TestCase):
         )
 
         self.assertEqual(uploader.list_accounts(), [{"id": "UC123", "title": "Expired Soda"}])
-        self.assertTrue(uploader.is_connected())
+        self.assertEqual(
+            uploader.list_accounts(validate=True),
+            [{"id": "UC123", "title": "Expired Soda", "usable": False, "status": "needs_reauth"}],
+        )
+        self.assertFalse(uploader.is_connected())
 
     def _assert_token_account_id_rejects_path_traversal(self, temp):
         outside = temp / "evil.json"

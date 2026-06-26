@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,26 +17,33 @@ from candidate_ranker import (  # noqa: E402
     AI_MOMENT_SELECTION_MAX_ADJUSTMENT,
     LEARNED_SELECTION_MAX_ADJUSTMENT,
     MOMENT_CATEGORY_SELECTION_MAX_ADJUSTMENT,
+    MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT,
+    MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT,
     VOICE_PROFILE_SELECTION_MAX_ADJUSTMENT,
     VOICE_PROFILE_SHADOW_MAX_ADJUSTMENT,
     attach_ai_moment_classification,
     apply_ai_moment_scoring,
     apply_learned_scoring,
     apply_moment_category_scoring,
+    apply_multi_signal_ai_scoring,
     apply_voice_profile_scoring,
     build_learning_status,
     build_ai_moment_ranking_report,
     build_moment_category_ranking_report,
+    build_multi_signal_ai_ranking_report,
     build_shadow_scoring_report,
     build_voice_profile_ranking_report,
     build_voice_profile_shadow_report,
     classify_commentary_guard,
     classify_music_lyrics_guard,
     evaluate_candidate,
+    needs_stream_retry,
     normalize_commentary_subtitle_policy,
     quality_floor_for_preference,
     score_moment_categories,
     select_best_candidates,
+    select_near_quality_fallback_candidates,
+    trim_candidate_with_transcript,
     write_debug_report,
 )
 
@@ -477,6 +485,22 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertEqual(baseline[0]["candidate"]["candidate_rank"], 1)
         self.assertEqual(selected[0]["candidate"]["candidate_rank"], 1)
 
+    def test_later_selection_clears_stale_overlap_reject_reason(self):
+        first = _evaluation(1, 0.90, "first candidate starts stronger", start=0)
+        second = _evaluation(2, 0.80, "second candidate later wins another ranking pass", start=10)
+        first["alternate_quality_score"] = 0.10
+        second["alternate_quality_score"] = 1.0
+
+        baseline = select_best_candidates([first, second], 2, min_gap=60, score_key="quality_score")
+        self.assertEqual(baseline[0]["candidate"]["candidate_rank"], 1)
+        self.assertEqual(second["reject_reason"], "overlaps_better_candidate")
+
+        selected = select_best_candidates([first, second], 2, min_gap=60, score_key="alternate_quality_score")
+
+        self.assertEqual(selected[0]["candidate"]["candidate_rank"], 2)
+        self.assertEqual(selected[0]["reject_reason"], "")
+        self.assertEqual(selected[0]["moment"]["ranker"]["reject_reason"], "")
+
     def test_debug_report_includes_ai_moment_classification_metadata(self):
         evaluation = _evaluation(1, 0.72, "Oh my god he is right behind me please run")
         attach_ai_moment_classification(evaluation, {
@@ -589,6 +613,199 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertTrue(quantity_eval["accepted"])
         self.assertEqual(quantity_eval["detection_preference"], "quantity")
         self.assertEqual(quality_floor_for_preference("bad-value"), 0.50)
+
+    def test_near_quality_fallback_promotes_creator_misses_when_strict_floor_selects_zero(self):
+        def near_miss(rank, quality, start):
+            return {
+                "accepted": False,
+                "reject_reason": "low_transcript_quality",
+                "quality_score": quality,
+                "learned_quality_score": quality,
+                "quality_floor": 0.60,
+                "candidate": {"candidate_rank": rank, "candidate_kind": "primary"},
+                "moment": {
+                    "start": start,
+                    "end": start + 35,
+                    "duration": 35,
+                    "transcript": "I think this is actually a pretty good moment with creator commentary",
+                    "ranker": {"reject_reason": "low_transcript_quality"},
+                },
+                "word_count": 18,
+                "subtitle_word_count": 18,
+                "music_lyrics_guard": {"reject_candidate": False},
+                "speech_source": {
+                    "primary_source": "creator",
+                    "creator_safe": True,
+                    "game_or_npc_probability": 0.05,
+                    "music_or_lyrics_probability": 0.01,
+                },
+                "commentary_guard": {"summary": {"primary_label": "creator_commentary"}},
+            }
+
+        evaluations = [
+            near_miss(1, 0.56, 0),
+            near_miss(2, 0.52, 80),
+            near_miss(3, 0.49, 160),
+        ]
+
+        selected = select_near_quality_fallback_candidates(
+            evaluations,
+            5,
+            min_gap=8,
+            score_key="learned_quality_score",
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(all(item["accepted"] for item in selected))
+        self.assertEqual({item["candidate"]["candidate_rank"] for item in selected}, {1, 2})
+        self.assertTrue(all(item["near_quality_fallback"]["applied"] for item in selected))
+        self.assertEqual(selected[0]["moment"]["ranker"]["reject_reason"], "")
+        self.assertEqual(selected[0]["moment"]["ranker"]["original_reject_reason"], "low_transcript_quality")
+        self.assertTrue(all(item["selection_tier"] == "near_quality_pick" for item in selected))
+        self.assertTrue(all(item["moment"]["selection_tier"] == "near_quality_pick" for item in selected))
+
+    def test_near_quality_fallback_does_not_promote_game_or_music_rejections(self):
+        base = {
+            "accepted": False,
+            "reject_reason": "low_transcript_quality",
+            "quality_score": 0.57,
+            "learned_quality_score": 0.57,
+            "quality_floor": 0.60,
+            "candidate": {"candidate_rank": 1, "candidate_kind": "primary"},
+            "moment": {
+                "start": 0,
+                "end": 35,
+                "duration": 35,
+                "transcript": "objective updated find the route to the ship",
+                "ranker": {"reject_reason": "low_transcript_quality"},
+            },
+            "word_count": 12,
+            "subtitle_word_count": 12,
+            "music_lyrics_guard": {"reject_candidate": False},
+            "speech_source": {
+                "primary_source": "game",
+                "creator_safe": False,
+                "game_or_npc_probability": 0.8,
+                "music_or_lyrics_probability": 0.02,
+            },
+            "commentary_guard": {"summary": {"primary_label": "game_narration"}},
+        }
+        music = json.loads(json.dumps(base))
+        music["candidate"]["candidate_rank"] = 2
+        music["moment"]["start"] = 80
+        music["moment"]["end"] = 115
+        music["speech_source"]["primary_source"] = "music"
+        music["music_lyrics_guard"] = {"reject_candidate": True}
+        low = json.loads(json.dumps(base))
+        low["candidate"]["candidate_rank"] = 3
+        low["moment"]["start"] = 160
+        low["moment"]["end"] = 195
+        low["quality_score"] = 0.42
+        low["learned_quality_score"] = 0.42
+
+        selected = select_near_quality_fallback_candidates(
+            [base, music, low],
+            5,
+            min_gap=8,
+            score_key="learned_quality_score",
+        )
+
+        self.assertEqual(selected, [])
+
+    def test_partial_near_quality_fallback_fills_deep_auto_shortfall(self):
+        existing = _evaluation(1, 0.58, "oh my god this is a strong creator moment", start=0)
+
+        def near_miss(rank, quality, start):
+            return {
+                "accepted": False,
+                "reject_reason": "low_transcript_quality",
+                "quality_score": quality,
+                "learned_quality_score": quality,
+                "multi_signal_ai_quality_score": quality + 0.04,
+                "quality_floor": 0.50,
+                "candidate": {"candidate_rank": rank, "candidate_kind": "primary"},
+                "moment": {
+                    "start": start,
+                    "end": start + 35,
+                    "duration": 35,
+                    "transcript": "I think this is actually useful creator commentary about what is happening",
+                    "ranker": {"reject_reason": "low_transcript_quality"},
+                },
+                "word_count": 14,
+                "subtitle_word_count": 14,
+                "music_lyrics_guard": {"reject_candidate": False},
+                "speech_source": {
+                    "primary_source": "creator",
+                    "creator_safe": True,
+                    "game_or_npc_probability": 0.05,
+                    "music_or_lyrics_probability": 0.01,
+                },
+                "commentary_guard": {"summary": {"primary_label": "creator_commentary"}},
+            }
+
+        evaluations = [
+            existing,
+            near_miss(2, 0.36, 80),
+            near_miss(3, 0.34, 160),
+            near_miss(4, 0.26, 240),
+        ]
+
+        selected = select_near_quality_fallback_candidates(
+            evaluations,
+            4,
+            min_gap=8,
+            score_key="multi_signal_ai_quality_score",
+            existing_selected=[existing],
+            allow_partial=True,
+            reason="deep_auto_best_available_fill",
+        )
+
+        self.assertEqual(len(selected), 3)
+        extra = [item for item in selected if item.get("near_quality_fallback")]
+        self.assertEqual(len(extra), 2)
+        self.assertTrue(all(item["accepted"] for item in extra))
+        self.assertEqual({item["candidate"]["candidate_rank"] for item in extra}, {2, 3})
+        self.assertTrue(all(item["near_quality_fallback"]["selection_tier"] == "extra_candidate" for item in extra))
+        self.assertTrue(all(item["selection_tier"] == "extra_pick" for item in extra))
+        self.assertEqual(existing["selection_tier"], "recommended")
+        self.assertEqual(extra[0]["near_quality_fallback"]["reason"], "deep_auto_best_available_fill")
+
+    def test_laid_back_commentary_gets_capped_quality_boost(self):
+        quiet_words = _words_from_tokens(
+            "I think this game is actually doing something interesting here because the jacket is just her size".split(),
+            start=0.1,
+        )
+        plain_words = _words_from_tokens(
+            "walking around through this hallway with nothing much happening right now".split(),
+            start=0.1,
+        )
+
+        quiet_eval = evaluate_candidate(
+            _ranker_candidate(),
+            quiet_words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=90,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            detection_preference="auto",
+        )
+        plain_eval = evaluate_candidate(
+            _ranker_candidate(),
+            plain_words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=90,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            detection_preference="auto",
+        )
+
+        self.assertGreater(quiet_eval["laid_back_commentary_boost"], 0)
+        self.assertGreater(quiet_eval["quality_score"], plain_eval["quality_score"])
+        self.assertIn("laid_back_commentary", quiet_eval["moment"]["ranker"])
 
     def test_commentary_guard_shadow_classifies_creator_and_game_segments(self):
         creator = classify_commentary_guard([
@@ -722,15 +939,171 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertEqual(guarded["commentary_guard"]["application"]["policy"], "game")
         self.assertEqual(guarded["commentary_guard"]["application"]["removed_labels"], ["creator_commentary"])
 
-    def test_commentary_guard_falls_back_when_filter_would_empty_subtitles(self):
+    def test_commentary_guard_prefers_no_creator_subtitles_over_game_dialogue(self):
         game_only = _words_from_tokens("objective updated find the key to the door.".split(), start=0.1)
         guarded = _evaluate_with_guard(game_only)
 
-        self.assertIn("objective updated", guarded["moment"]["transcript"])
-        self.assertFalse(guarded["commentary_guard"]["output_changed"])
-        self.assertTrue(guarded["commentary_guard"]["application"]["fallback_used"])
-        self.assertEqual(guarded["commentary_guard"]["application"]["reason"], "filtered_transcript_too_sparse")
-        self.assertEqual(guarded["moment"]["subtitle_word_count"], len(game_only))
+        self.assertEqual(guarded["moment"]["transcript"], "")
+        self.assertTrue(guarded["commentary_guard"]["output_changed"])
+        self.assertFalse(guarded["commentary_guard"]["application"]["fallback_used"])
+        self.assertEqual(guarded["commentary_guard"]["application"]["reason"], "no_creator_commentary_after_filter")
+        self.assertEqual(guarded["moment"]["subtitle_word_count"], 0)
+
+    def test_commentary_guard_restores_unclear_creator_like_stream(self):
+        words = _words_from_tokens(
+            "oh great little hole gonna get hit right in the knee".split(),
+            start=0.1,
+        )
+        guarded = evaluate_candidate(
+            _ranker_candidate(),
+            words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=60,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "creator_likeness_score": 0.58,
+                "natural_dialogue_score": 4.4,
+                "scripted_game_score": 0.25,
+                "acoustic_game_bed_score": 0.02,
+                "lyric_likelihood": 0.05,
+                "voice_title_hints": [],
+                "game_title_hints": [],
+            },
+        )
+
+        self.assertIn("little hole", guarded["moment"]["transcript"])
+        self.assertEqual(guarded["moment"]["subtitle_word_count"], len(words))
+        self.assertEqual(
+            guarded["commentary_guard"]["application"]["reason"],
+            "trusted_creator_track_unclear_restored",
+        )
+        self.assertTrue(guarded["commentary_guard"]["application"]["trusted_unclear_creator_track"])
+
+    def test_commentary_guard_restores_creator_selected_stream(self):
+        words = _words_from_tokens(
+            "oh great little hole gonna get hit right in the knee".split(),
+            start=0.1,
+        )
+        guarded = evaluate_candidate(
+            {
+                **_ranker_candidate(),
+                "multimodal_analysis": {
+                    "primary_visual_label": "lore_or_story",
+                    "visual_labels": ["dialogue_scene", "facecam_visible"],
+                },
+            },
+            words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=60,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "title": "Track3_vertical",
+                "selected_reason": "creator_source_confidence",
+                "selected_confidence": 0.724,
+                "creator_likeness_score": 0.62,
+                "natural_dialogue_score": 3.6,
+                "scripted_game_score": 0.25,
+                "acoustic_game_bed_score": 0.02,
+                "lyric_likelihood": 0.05,
+                "voice_title_hints": [],
+                "game_title_hints": [],
+            },
+        )
+
+        self.assertIn("little hole", guarded["moment"]["transcript"])
+        self.assertEqual(guarded["moment"]["subtitle_word_count"], len(words))
+        self.assertEqual(
+            guarded["commentary_guard"]["application"]["reason"],
+            "trusted_creator_track_unclear_restored",
+        )
+        self.assertTrue(guarded["commentary_guard"]["application"]["trusted_unclear_creator_track"])
+
+    def test_commentary_guard_does_not_restore_game_speech_from_creator_like_stream(self):
+        game_only = _words_from_tokens("objective updated find the key to the door.".split(), start=0.1)
+        guarded = evaluate_candidate(
+            _ranker_candidate(),
+            game_only,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=60,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "creator_likeness_score": 0.58,
+                "natural_dialogue_score": 4.4,
+                "scripted_game_score": 0.25,
+                "acoustic_game_bed_score": 0.02,
+                "lyric_likelihood": 0.05,
+                "voice_title_hints": [],
+                "game_title_hints": [],
+            },
+        )
+
+        self.assertEqual(guarded["moment"]["transcript"], "")
+        self.assertEqual(
+            guarded["commentary_guard"]["application"]["reason"],
+            "no_creator_commentary_after_filter",
+        )
+
+    def test_commentary_guard_restores_creator_setup_but_drops_read_game_text(self):
+        words = _words_from_tokens(
+            (
+                "Good job. Yes. Going to pat myself on the back. Ooh, piece of candy. "
+                "What does this say? The Night Owl. The voice of Pat Main all night, every night. "
+                "His picture there does not do him justice. Early bird, start your day right, 7 to 10 a.m."
+            ).split(),
+            start=0.1,
+        )
+        guarded = evaluate_candidate(
+            _ranker_candidate(),
+            words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=60,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "creator_likeness_score": 0.76,
+                "natural_dialogue_score": 4.4,
+                "scripted_game_score": 0.25,
+                "acoustic_game_bed_score": 0.02,
+                "lyric_likelihood": 0.05,
+                "voice_title_hints": [],
+                "game_title_hints": [],
+            },
+        )
+
+        self.assertIn("What does this say", guarded["moment"]["transcript"])
+        self.assertIn("pat myself", guarded["moment"]["transcript"])
+        self.assertNotIn("The Night Owl", guarded["moment"]["transcript"])
+        self.assertNotIn("Pat Main", guarded["moment"]["transcript"])
+        self.assertNotIn("Early bird", guarded["moment"]["transcript"])
+        self.assertGreater(guarded["moment"]["subtitle_word_count"], 0)
+        self.assertLess(guarded["moment"]["subtitle_word_count"], len(words))
+        self.assertEqual(
+            guarded["commentary_guard"]["application"]["reason"],
+            "trusted_creator_track_unclear_segments_restored",
+        )
+        self.assertGreater(
+            guarded["commentary_guard"]["application"]["dropped_after_read_prompt_segments"],
+            0,
+        )
 
     def test_commentary_guard_creator_policy_penalizes_game_narration_without_hard_reject(self):
         game_only = _words_from_tokens("objective updated find the key to the door.".split(), start=0.1)
@@ -752,6 +1125,175 @@ class FeedbackReconciliationTests(unittest.TestCase):
             guarded["moment"]["commentary_guard"]["selection"]["selection_impact"],
             "quality_penalty",
         )
+
+    def test_speech_source_classifier_attaches_probabilities_and_penalty(self):
+        words = _words_from_tokens(
+            "you are required to continue through the corridor now".split(),
+            start=0.1,
+        )
+        guarded = evaluate_candidate(
+            _ranker_candidate(),
+            words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=60,
+            target_duration=30,
+            selected_stream=0,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "creator_likeness_score": 0.18,
+                "natural_dialogue_score": 0.4,
+                "scripted_game_score": 3.0,
+                "acoustic_game_bed_score": 0.76,
+                "voice_title_hints": ["microphone"],
+                "game_title_hints": [],
+            },
+            voice_profile={"reason": "scored", "confidence": 0.18, "sample_count": 6},
+        )
+
+        source = guarded["speech_source"]
+        self.assertEqual(source["primary_source"], "game")
+        self.assertGreater(source["game_or_npc_probability"], source["creator_probability"])
+        self.assertGreaterEqual(source["selection"]["raw_selection_penalty"], source["selection_penalty"])
+        self.assertEqual(guarded["moment"]["speech_source"]["primary_source"], "game")
+        self.assertIn("speech_source", guarded["moment"]["ranker"])
+
+    def test_stream_retry_triggers_for_game_or_weak_creator_speech(self):
+        game_words = _words_from_tokens(
+            "objective updated you must find the key to the door before checkpoint".split(),
+            start=0.1,
+        )
+        npc_words = _words_from_tokens(
+            "want it done right you do it yourself bram".split(),
+            start=0.1,
+        )
+
+        self.assertTrue(
+            needs_stream_retry(
+                game_words,
+                30,
+                subtitle_policy="creator",
+                commentary_guard=True,
+            )
+        )
+        self.assertTrue(
+            needs_stream_retry(
+                npc_words,
+                30,
+                subtitle_policy="creator",
+                commentary_guard=True,
+            )
+        )
+        self.assertFalse(
+            needs_stream_retry(
+                game_words,
+                30,
+                subtitle_policy="all",
+                commentary_guard=True,
+            )
+        )
+
+    def test_short_commentary_trim_keeps_visual_setup_preroll(self):
+        candidate = {
+            "start": 4718,
+            "end": 4748,
+            "duration": 30,
+            "peak_time": 4740,
+            "candidate_kind": "primary",
+        }
+        words = _words_from_tokens(
+            "i like it how its just her size too like what the hell how convenient".split(),
+            start=20.2,
+        )
+
+        start, end, render_words = trim_candidate_with_transcript(
+            candidate,
+            words,
+            extraction_start=4718,
+            extraction_end=4748,
+            video_duration=5000,
+            target_duration=30,
+        )
+
+        self.assertLessEqual(start, 4734)
+        self.assertGreaterEqual(words[0]["start"] + 4718 - start, 4.0)
+        self.assertGreater(end, start)
+        self.assertGreater(render_words[0]["start"], 0.0)
+
+    def test_shorts_trim_cap_prevents_max_extension_over_180_seconds(self):
+        candidate = {
+            "start": 0,
+            "end": 240,
+            "duration": 240,
+            "peak_time": 20,
+            "candidate_kind": "primary",
+        }
+        words = [
+            {"text": "word", "start": 2.0 + i * 0.25, "end": 2.2 + i * 0.25}
+            for i in range(830)
+        ]
+
+        start, end, render_words = trim_candidate_with_transcript(
+            candidate,
+            words,
+            extraction_start=0,
+            extraction_end=240,
+            video_duration=500,
+            target_duration=180,
+        )
+
+        self.assertEqual(start, 0)
+        self.assertLessEqual(end - start, 180)
+        self.assertEqual(end, 180)
+        self.assertLessEqual(render_words[-1]["start"], 180)
+
+    def test_shorts_trim_cap_applies_without_transcript_words(self):
+        candidate = {
+            "start": 12.4,
+            "end": 260.2,
+            "duration": 247.8,
+            "peak_time": 120,
+            "candidate_kind": "primary",
+        }
+
+        start, end, render_words = trim_candidate_with_transcript(
+            candidate,
+            [],
+            extraction_start=12.4,
+            extraction_end=260.2,
+            video_duration=500,
+            target_duration=180,
+        )
+
+        self.assertEqual(render_words, [])
+        self.assertLessEqual(end - start, 180)
+
+    def test_shorts_trim_cap_applies_to_end_fallback_branch(self):
+        candidate = {
+            "start": 0,
+            "end": 240,
+            "duration": 240,
+            "peak_time": 20,
+            "candidate_kind": "primary",
+        }
+        words = [{"text": "word", "start": 2.0, "end": 2.2}]
+
+        with patch.object(candidate_ranker, "_natural_end_after", return_value=0.0):
+            start, end, render_words = trim_candidate_with_transcript(
+                candidate,
+                words,
+                extraction_start=0,
+                extraction_end=240,
+                video_duration=500,
+                target_duration=220,
+            )
+
+        self.assertEqual(start, 0)
+        self.assertLessEqual(end - start, 180)
+        self.assertEqual(end, 180)
+        self.assertEqual(render_words, [])
 
     def test_commentary_guard_all_and_game_policy_do_not_penalize_game_narration(self):
         game_only = _words_from_tokens("objective updated find the key to the door.".split(), start=0.1)
@@ -914,7 +1456,16 @@ class FeedbackReconciliationTests(unittest.TestCase):
         scoring_source = inspect.getsource(candidate_ranker._score_shadow_candidate)
         feedback_source = inspect.getsource(candidate_ranker._add_feedback_signal)
 
-        for forbidden in ("commentary_guard", "creator_commentary", "game_narration"):
+        for forbidden in (
+            "commentary_guard",
+            "creator_commentary",
+            "game_narration",
+            "speech_source",
+            "source_confidence",
+            "creator_source_confidence",
+            "game_source_confidence",
+            "game_or_npc_probability",
+        ):
             self.assertNotIn(forbidden, scoring_source)
             self.assertNotIn(forbidden, feedback_source)
         self.assertNotIn("music_lyrics_guard", scoring_source)
@@ -1063,6 +1614,45 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertLess(shadow["learned_adjustment"], 0.0)
         self.assertLess(evaluation["learned_quality_score"], 0.5)
         self.assertGreater(shadow["signals"]["negative_points"], 0)
+
+    def test_feedback_learning_can_match_ai_and_vision_terms(self):
+        evaluation = _evaluation(1, 0.5, "")
+        evaluation["moment"]["ai_moment_classification"] = {
+            "primary_category": "atmosphere_or_visual",
+            "fine_labels": ["beautiful_vista"],
+        }
+        evaluation["moment"]["multimodal_analysis"] = {
+            "primary_visual_label": "atmosphere_or_visual",
+            "metadata_keywords": ["beautiful vista", "forest overlook"],
+            "visual_labels": ["scenic_view"],
+        }
+        personalization = {
+            "schema_version": 1,
+            "events": [],
+            "clips": {
+                "clip_1": {
+                    "clip_id": "clip_1",
+                    "latest": {"like": True, "dislike": False, "favorite": False, "reason": ""},
+                    "clip_snapshot": {
+                        "ai_moment_classification": {
+                            "primary_category": "atmosphere_or_visual",
+                            "fine_labels": ["beautiful_vista"],
+                        },
+                        "multimodal_analysis": {
+                            "primary_visual_label": "atmosphere_or_visual",
+                            "metadata_keywords": ["beautiful vista", "forest overlook"],
+                            "visual_labels": ["scenic_view"],
+                        },
+                    },
+                }
+            },
+        }
+
+        apply_learned_scoring([evaluation], personalization)
+
+        shadow = evaluation["shadow_scoring"]
+        self.assertGreater(shadow["signals"]["positive_points"], 0)
+        self.assertGreater(shadow["learned_adjustment"], 0.0)
 
     def test_removed_learning_terms_feedback_no_longer_counts(self):
         evaluation = _evaluation(1, 0.5, "panic chase right behind me run please")
@@ -1644,6 +2234,272 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertEqual(heuristic["ai_moment_scoring"]["ai_adjustment"], 0.0)
         self.assertEqual(heuristic["ai_moment_scoring"]["ai_ineligible_reason"], "not_ollama")
         self.assertEqual(report["selection_score_source"], "learned_quality_score")
+
+    def test_ai_moment_scoring_can_influence_marked_near_miss(self):
+        near_miss = _evaluation(7, 0.470, "I think this scene is actually useful commentary", start=90)
+        near_miss["accepted"] = False
+        near_miss["reject_reason"] = "low_transcript_quality"
+        near_miss["quality_floor"] = 0.50
+        near_miss["ai_rescue_candidate"] = True
+        near_miss["moment"]["ranker"]["reject_reason"] = "low_transcript_quality"
+        attach_ai_moment_classification(near_miss, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "commentary_or_review",
+            "confidence": 0.91,
+            "ai_confidence": 0.91,
+            "ai_viral_score": 78,
+            "ai_dimensions": {"hook": 0.55, "flow": 0.8, "value": 0.9, "platform_fit": 0.75, "game_context": 0.7},
+        })
+
+        result = apply_ai_moment_scoring([near_miss], enabled=True, score_key="quality_score")
+
+        self.assertTrue(result["has_ai_scores"])
+        self.assertGreater(near_miss["ai_moment_scoring"]["ai_adjustment"], 0.0)
+        self.assertLessEqual(
+            abs(near_miss["ai_moment_scoring"]["ai_adjustment"]),
+            AI_MOMENT_SELECTION_MAX_ADJUSTMENT,
+        )
+        self.assertFalse(near_miss["accepted"])
+
+    def test_multi_signal_ai_blend_can_select_stronger_ai_vision_candidate(self):
+        plain = _evaluation(1, 0.620, "walking around checking this room", start=0)
+        preferred = _evaluation(2, 0.590, "panic chase right behind me run please", start=45)
+        for row in (plain, preferred):
+            row["candidate"]["detector_scores"] = {"audio": 0.65, "variance": 0.55, "scene": 0.35}
+            row["moment"]["detector_scores"] = row["candidate"]["detector_scores"]
+        plain["shadow_scoring"] = {"learned_adjustment": -0.06, "learned_selection_cap": 0.06}
+        preferred["shadow_scoring"] = {"learned_adjustment": 0.06, "learned_selection_cap": 0.06}
+        plain["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": -0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "low_value",
+        }
+        preferred["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": 0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "high_energy",
+        }
+        plain["moment_category_scoring"] = {
+            "ranking_enabled": True,
+            "category_signal": -1.0,
+            "category_diversity_adjustment": 0.0,
+            "category_diversity_cap": 0.006,
+        }
+        preferred["moment_category_scoring"] = {
+            "ranking_enabled": True,
+            "category_signal": 1.0,
+            "category_diversity_adjustment": 0.006,
+            "category_diversity_cap": 0.006,
+        }
+        plain["voice_scoring"] = {"ranking_enabled": True, "voice_reason": "scored", "voice_confidence": 0.0}
+        preferred["voice_scoring"] = {"ranking_enabled": True, "voice_reason": "scored", "voice_confidence": 1.0}
+        attach_ai_moment_classification(plain, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "low_value",
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 24,
+            "ai_dimensions": {"hook": 0.15, "flow": 0.2, "value": 0.1, "platform_fit": 0.2, "game_context": 0.2},
+        })
+        attach_ai_moment_classification(preferred, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "high_energy",
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 92,
+            "ai_dimensions": {"hook": 0.95, "flow": 0.9, "value": 0.8, "platform_fit": 0.9, "game_context": 0.85},
+        })
+        evaluations = [plain, preferred]
+        baseline = select_best_candidates(evaluations, 1, min_gap=8, score_key="quality_score")
+
+        result = apply_multi_signal_ai_scoring(evaluations, enabled=True)
+        selected = select_best_candidates(evaluations, 1, min_gap=8, score_key="multi_signal_ai_quality_score")
+        report = build_multi_signal_ai_ranking_report(
+            evaluations,
+            baseline,
+            selected,
+            enabled=True,
+            max_count=1,
+            min_gap=8,
+        )
+
+        self.assertTrue(result["ranking_enabled"])
+        self.assertEqual(baseline[0]["candidate"]["candidate_rank"], 1)
+        self.assertEqual(selected[0]["candidate"]["candidate_rank"], 2)
+        self.assertEqual(selected[0]["selection_score_source"], "multi_signal_ai_quality_score")
+        self.assertLessEqual(
+            preferred["multi_signal_ai_scoring"]["multi_signal_adjustment"],
+            MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT,
+        )
+        self.assertGreaterEqual(
+            plain["multi_signal_ai_scoring"]["multi_signal_adjustment"],
+            -MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT,
+        )
+        self.assertTrue(report["output_changed"])
+        self.assertEqual(preferred["multi_signal_ai_scoring"]["selection_delta"], "added_by_multi_signal_ai")
+        self.assertEqual(plain["multi_signal_ai_scoring"]["selection_delta"], "dropped_by_multi_signal_ai")
+
+    def test_multi_signal_ai_does_not_rescue_music_guard_rejections(self):
+        candidate = _evaluation(1, 0.500, "song lyric sounding speech with music", start=0)
+        candidate["shadow_scoring"] = {"learned_adjustment": 0.06, "learned_selection_cap": 0.06}
+        candidate["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": 0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "high_energy",
+        }
+        candidate["voice_scoring"] = {"ranking_enabled": True, "voice_reason": "scored", "voice_confidence": 1.0}
+        candidate["music_lyrics_guard"] = {"reject_candidate": True}
+        candidate["moment"]["music_lyrics_guard"] = candidate["music_lyrics_guard"]
+        attach_ai_moment_classification(candidate, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "high_energy",
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 95,
+            "ai_dimensions": {"hook": 1.0, "flow": 1.0, "value": 1.0, "platform_fit": 1.0, "game_context": 1.0},
+        })
+
+        apply_multi_signal_ai_scoring([candidate], enabled=True)
+
+        scoring = candidate["multi_signal_ai_scoring"]
+        self.assertEqual(scoring["blocked_positive_reason"], "music_lyrics_guard_rejected")
+        self.assertLessEqual(scoring["multi_signal_adjustment"], 0.0)
+        self.assertEqual(scoring["multi_signal_ai_quality_score"], 0.5)
+
+    def test_multi_signal_ai_blocks_positive_boost_for_game_narration_guard(self):
+        candidate = _evaluation(1, 0.500, "objective updated find the key to the door", start=0)
+        guard = classify_commentary_guard(
+            _words_from_tokens("objective updated find the key to the door".split()),
+            enabled=True,
+        )
+        guard["policy"] = "creator"
+        guard["selection"] = {
+            "policy": "creator",
+            "selection_penalty": 0.04,
+            "selection_impact": "quality_penalty",
+        }
+        candidate["commentary_guard"] = guard
+        candidate["moment"]["commentary_guard"] = guard
+        candidate["shadow_scoring"] = {"learned_adjustment": 0.06, "learned_selection_cap": 0.06}
+        candidate["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": 0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "lore_or_story",
+        }
+        candidate["voice_scoring"] = {"ranking_enabled": True, "voice_reason": "scored", "voice_confidence": 1.0}
+        attach_ai_moment_classification(candidate, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "lore_or_story",
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 90,
+            "ai_dimensions": {"hook": 0.9, "flow": 0.9, "value": 0.8, "platform_fit": 0.9, "game_context": 0.9},
+        })
+
+        apply_multi_signal_ai_scoring([candidate], enabled=True)
+
+        scoring = candidate["multi_signal_ai_scoring"]
+        self.assertEqual(scoring["blocked_positive_reason"], "commentary_guard_game_narration")
+        self.assertEqual(scoring["multi_signal_adjustment"], 0.0)
+        self.assertEqual(scoring["multi_signal_ai_quality_score"], 0.5)
+
+    def test_multi_signal_ai_penalizes_ai_game_narration_label(self):
+        candidate = _evaluation(1, 0.500, "npc dialogue that sounds like a first person story", start=0)
+        candidate["shadow_scoring"] = {"learned_adjustment": 0.06, "learned_selection_cap": 0.06}
+        candidate["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": 0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "lore_or_story",
+        }
+        attach_ai_moment_classification(candidate, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "tutorial_or_explainer",
+            "fine_labels": ["game_narration"],
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 88,
+            "ai_dimensions": {"hook": 0.9, "flow": 0.8, "value": 0.7, "platform_fit": 0.8, "game_context": 0.9},
+        })
+
+        apply_multi_signal_ai_scoring([candidate], enabled=True)
+
+        scoring = candidate["multi_signal_ai_scoring"]
+        self.assertEqual(scoring["blocked_positive_reason"], "ai_game_narration")
+        self.assertLess(scoring["signals"]["text_ai"], 0.0)
+        self.assertLessEqual(scoring["multi_signal_adjustment"], 0.0)
+
+    def test_multi_signal_ai_blocks_positive_boost_for_source_confidence(self):
+        candidate = _evaluation(1, 0.500, "you are required to continue through the corridor now", start=0)
+        source = {
+            "policy": "creator",
+            "primary_source": "game",
+            "confidence": 0.70,
+            "creator_probability": 0.22,
+            "game_or_npc_probability": 0.58,
+            "music_or_lyrics_probability": 0.04,
+            "unknown_probability": 0.16,
+            "creator_safe": False,
+        }
+        candidate["speech_source"] = source
+        candidate["moment"]["speech_source"] = source
+        candidate["shadow_scoring"] = {"learned_adjustment": 0.06, "learned_selection_cap": 0.06}
+        candidate["multimodal_scoring"] = {
+            "ranking_enabled": True,
+            "scoring_eligible": True,
+            "multimodal_adjustment": 0.02,
+            "multimodal_selection_max_adjustment": 0.02,
+            "primary_visual_label": "high_energy",
+        }
+        candidate["voice_scoring"] = {"ranking_enabled": True, "voice_reason": "scored", "voice_confidence": 1.0}
+        attach_ai_moment_classification(candidate, {
+            "status": "ok",
+            "provider": "ollama",
+            "primary_category": "high_energy",
+            "confidence": 0.95,
+            "ai_confidence": 0.95,
+            "ai_viral_score": 92,
+            "ai_dimensions": {"hook": 0.95, "flow": 0.9, "value": 0.8, "platform_fit": 0.9, "game_context": 0.85},
+        })
+
+        apply_multi_signal_ai_scoring([candidate], enabled=True)
+
+        scoring = candidate["multi_signal_ai_scoring"]
+        self.assertEqual(scoring["blocked_positive_reason"], "speech_source_game_or_npc")
+        self.assertEqual(scoring["multi_signal_adjustment"], 0.0)
+        self.assertEqual(scoring["multi_signal_ai_quality_score"], 0.5)
+
+    def test_multi_signal_ai_uses_requested_base_score_source(self):
+        candidate = _evaluation(1, 0.500, "quiet but clearly useful explanation", start=0)
+        candidate["learned_quality_score"] = 0.72
+        candidate["moment"]["learned_quality_score"] = 0.72
+
+        result = apply_multi_signal_ai_scoring(
+            [candidate],
+            enabled=True,
+            score_key="learned_quality_score",
+        )
+
+        scoring = candidate["multi_signal_ai_scoring"]
+        self.assertEqual(result["score_source"], "learned_quality_score")
+        self.assertEqual(scoring["score_source"], "learned_quality_score")
+        self.assertEqual(scoring["base_score"], 0.72)
+        self.assertEqual(scoring["multi_signal_ai_quality_score"], 0.72)
 
     def test_voice_profile_ranking_can_flip_close_call_when_opted_in(self):
         plain = _evaluation(1, 0.60, "walking around checking this room", start=0)

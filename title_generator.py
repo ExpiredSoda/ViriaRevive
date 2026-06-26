@@ -9,13 +9,14 @@ import re
 import urllib.request
 import urllib.error
 
-# Default model — 3b is the sweet spot for creative titles (~2GB RAM)
-DEFAULT_MODEL = "qwen2.5:3b"
+from game_context import compact_game_context_for_prompt
+
+# Default model for local AI titles, descriptions, and moment labels.
+DEFAULT_MODEL = "qwen3.5:4b"
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_DOWNLOAD_URL = "https://ollama.com/download/windows"
 OLLAMA_WINDOWS_DOCS_URL = "https://docs.ollama.com/windows"
-OLLAMA_INSTALL_SCRIPT_URL = "https://ollama.com/install.ps1"
-TIMEOUT = 30  # seconds per title request
+TIMEOUT = 90  # seconds per title request; cold local models can take 30s+ to load
 YOUTUBE_TAG_LIMIT = 500
 YOUTUBE_TAG_TARGET = YOUTUBE_TAG_LIMIT - 100
 DEFAULT_VIDEO_CATEGORY_ID = "20"  # Gaming
@@ -151,7 +152,7 @@ def _pull_model(model: str = DEFAULT_MODEL) -> bool:
         headers={"Content-Type": "application/json"},
     )
     try:
-        # Long timeout — small models like qwen2.5:0.5b are ~400MB
+        # Long timeout because first-time model pulls can be several GB.
         with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read())
             status = data.get("status", "")
@@ -249,6 +250,33 @@ def generated_description_body(
     return "\n\n".join(part for part in parts if part)
 
 
+def generate_ai_description_body(
+    title: str,
+    transcript: str | None = None,
+    game_title: str | None = None,
+    clip_context: dict | None = None,
+    model: str = DEFAULT_MODEL,
+) -> str:
+    """Generate the short auto-written description body using local Ollama."""
+    if not title or not is_ollama_model_ready(model):
+        return ""
+    prompt = _build_description_prompt(title, transcript or "", game_title, clip_context)
+    try:
+        parsed = ask_ollama_json(
+            prompt,
+            model=model,
+            timeout=TIMEOUT,
+            num_predict=120,
+            temperature=0.45,
+        )
+    except Exception as exc:
+        print(f"[description-gen] Ollama error: {exc}")
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return _clean_generated_description(parsed.get("description"))
+
+
 def compose_description(
     title: str,
     game_title: str | None = None,
@@ -283,6 +311,15 @@ def generate_tags(
     tags = []
     if game:
         tags.extend([game, f"{game} gameplay", f"{game} shorts", f"{game} clips"])
+    multimodal = context.get("multimodal_analysis") if isinstance(context.get("multimodal_analysis"), dict) else {}
+    for group_key in ("metadata_keywords", "visual_labels", "detected_events", "title_hooks"):
+        values = multimodal.get(group_key)
+        if not isinstance(values, list):
+            continue
+        for value in values[:6]:
+            cleaned_value = re.sub(r"\s+", " ", str(value or "")).strip(" ,")
+            if 2 <= len(cleaned_value) <= 36:
+                tags.append(cleaned_value)
     for rule in MOMENT_SIGNAL_RULES:
         if context.get("moment_type") == rule["type"]:
             tags.extend(rule["tags"])
@@ -382,6 +419,17 @@ def summarize_clip_context(
         if isinstance(clip_context.get("ai_moment_classification"), dict)
         else {}
     )
+    multimodal = (
+        clip_context.get("multimodal_analysis")
+        if isinstance(clip_context.get("multimodal_analysis"), dict)
+        else {}
+    )
+    multi_signal_ai = (
+        clip_context.get("multi_signal_ai_scoring")
+        if isinstance(clip_context.get("multi_signal_ai_scoring"), dict)
+        else {}
+    )
+    game_knowledge = compact_game_context_for_prompt(clip_context.get("game_context"))
     text = transcript or clip_context.get("transcript") or ""
     normal = _normal_text(text)
     matched = _matching_signal_phrases(normal)
@@ -389,10 +437,34 @@ def summarize_clip_context(
 
     resolved_game = (game_title or clip_context.get("game_title") or "").strip()
     creator_context = sanitize_creator_title_context(clip_context.get("creator_title_context"))
+    raw_learning = (
+        clip_context.get("feedback_learning_context")
+        if isinstance(clip_context.get("feedback_learning_context"), dict)
+        else {}
+    )
+    learning_context = {
+        "enabled": bool(raw_learning.get("enabled")),
+        "positive_feedback_count": int(raw_learning.get("positive_feedback_count") or 0),
+        "negative_feedback_count": int(raw_learning.get("negative_feedback_count") or 0),
+        "favorite_count": int(raw_learning.get("favorite_count") or 0),
+        "positive_terms": [
+            _prompt_safe_text(term, limit=48)
+            for term in (raw_learning.get("positive_terms") or [])[:8]
+            if str(term or "").strip()
+        ],
+        "negative_terms": [
+            _prompt_safe_text(term, limit=48)
+            for term in (raw_learning.get("negative_terms") or [])[:8]
+            if str(term or "").strip()
+        ],
+        "guidance": "",
+    }
     summary = {
         "schema_version": TITLE_CONTEXT_SCHEMA_VERSION,
         "game_title": resolved_game,
+        "game_knowledge": game_knowledge,
         "creator_title_context": creator_context,
+        "feedback_learning_context": learning_context,
         "moment_type": moment_type,
         "primary_category": clip_context.get("primary_category") or moment_categories.get("primary"),
         "ai_primary_category": ai_classification.get("primary_category"),
@@ -408,6 +480,14 @@ def summarize_clip_context(
         "candidate_kind": clip_context.get("candidate_kind"),
         "selection_quality_score": _round_or_none(clip_context.get("selection_quality_score")),
         "learned_quality_score": _round_or_none(clip_context.get("learned_quality_score")),
+        "multi_signal_ai_quality_score": _round_or_none(
+            clip_context.get("multi_signal_ai_quality_score")
+            or multi_signal_ai.get("multi_signal_ai_quality_score")
+        ),
+        "multi_signal_ai_adjustment": _round_or_none(
+            clip_context.get("multi_signal_ai_adjustment")
+            or multi_signal_ai.get("multi_signal_adjustment")
+        ),
         "quality_rank": clip_context.get("quality_rank"),
         "word_count": clip_context.get("word_count"),
         "visual": {
@@ -426,6 +506,32 @@ def summarize_clip_context(
             if isinstance(ai_classification.get("fine_labels"), list) else [],
             "confidence": _round_or_none(ai_classification.get("confidence")),
             "fallback_used": bool(ai_classification.get("fallback_used")),
+        },
+        "multimodal_analysis": {
+            "status": multimodal.get("status"),
+            "provider": multimodal.get("provider"),
+            "model": multimodal.get("model"),
+            "primary_visual_label": multimodal.get("primary_visual_label"),
+            "visible_summary": multimodal.get("visible_summary"),
+            "visual_labels": multimodal.get("visual_labels", [])[:6]
+            if isinstance(multimodal.get("visual_labels"), list) else [],
+            "detected_events": multimodal.get("detected_events", [])[:4]
+            if isinstance(multimodal.get("detected_events"), list) else [],
+            "title_hooks": multimodal.get("title_hooks", [])[:4]
+            if isinstance(multimodal.get("title_hooks"), list) else [],
+            "metadata_keywords": multimodal.get("metadata_keywords", [])[:8]
+            if isinstance(multimodal.get("metadata_keywords"), list) else [],
+            "confidence": _round_or_none(multimodal.get("confidence")),
+            "ranking_adjustment": _round_or_none(multimodal.get("ranking_adjustment")),
+            "reject_flags": multimodal.get("reject_flags", [])[:5]
+            if isinstance(multimodal.get("reject_flags"), list) else [],
+        },
+        "multi_signal_ai": {
+            "ranking_enabled": bool(multi_signal_ai.get("ranking_enabled")),
+            "selection_delta": multi_signal_ai.get("selection_delta", ""),
+            "rank_delta": multi_signal_ai.get("rank_delta"),
+            "signals": multi_signal_ai.get("signals") if isinstance(multi_signal_ai.get("signals"), dict) else {},
+            "contributions": multi_signal_ai.get("contributions") if isinstance(multi_signal_ai.get("contributions"), dict) else {},
         },
         "timing": {
             "start": clip_context.get("start"),
@@ -494,6 +600,8 @@ def _ask_ollama(
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
+        "keep_alive": "10m",
         "options": {"temperature": 0.7, "num_predict": 40},
     }).encode()
 
@@ -505,7 +613,7 @@ def _ask_ollama(
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read())
-            title = _clean_base_title(data.get("response", ""))
+            title = _clean_base_title(_ollama_response_text(data))
             if title and len(title) >= 3:
                 # Truncate at word boundary to keep titles clean for Shorts
                 if len(title) > 70:
@@ -522,6 +630,29 @@ def _ask_ollama(
     return None
 
 
+def _warm_ollama_model(model: str = DEFAULT_MODEL) -> bool:
+    """Load the local model once before batch work fans out."""
+    body = json.dumps({
+        "model": model,
+        "prompt": "Reply with OK.",
+        "stream": False,
+        "think": False,
+        "keep_alive": "10m",
+        "options": {"temperature": 0.0, "num_predict": 2},
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return getattr(resp, "status", 200) == 200
+    except Exception as e:
+        print(f"[title-gen] Ollama warm-up failed: {e}")
+        return False
+
+
 def ask_ollama_json(
     prompt: str,
     model: str = DEFAULT_MODEL,
@@ -535,6 +666,8 @@ def ask_ollama_json(
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
+        "keep_alive": "10m",
         "options": {
             "temperature": float(temperature),
             "num_predict": int(num_predict),
@@ -549,7 +682,7 @@ def ask_ollama_json(
         if getattr(resp, "status", 200) != 200:
             return None
         data = json.loads(resp.read())
-    response = str(data.get("response", "") if isinstance(data, dict) else "")
+    response = _ollama_response_text(data)
     parsed = _extract_json_object(response)
     return parsed if isinstance(parsed, dict) else None
 
@@ -622,7 +755,9 @@ def _build_moment_classification_prompt(
     }
     payload = {
         "game_title": context.get("game_title") or "",
+        "game_knowledge": context.get("game_knowledge"),
         "heuristic_primary": context.get("primary_category") or categories.get("primary") or "general_gameplay",
+        "creator_learning": context.get("feedback_learning_context"),
         "heuristic_scores": {
             key: _round_or_none(category_scores.get(key))
             for key in AI_MOMENT_CATEGORIES
@@ -646,7 +781,7 @@ def _build_moment_classification_prompt(
     return (
         "You classify gameplay clips for a local Shorts clipping app.\n"
         "Use only the compact transcript preview and numeric detector metadata below.\n"
-        "Do not invent names, locations, mechanics, enemies, or events.\n"
+        "Use game knowledge as background only. Do not invent names, locations, mechanics, enemies, or events.\n"
         "Return exactly one JSON object with this schema:\n"
         "{\"primary_category\":\"one allowed category\",\"fine_labels\":[\"compact_label\"],"
         "\"confidence\":0.0,\"reason\":\"short grounded reason\","
@@ -727,6 +862,31 @@ def _viral_dimensions_from_context(
         + 0.12 * _float_or_zero(visual.get("scenic_score"))
         + (0.08 if primary in {"high_energy", "death_or_failure", "atmosphere_or_visual"} else 0.0)
     )
+    game_knowledge = context.get("game_knowledge") if isinstance(context.get("game_knowledge"), dict) else {}
+    if game_knowledge.get("available"):
+        filled_fields = sum(
+            1
+            for key in (
+                "genres",
+                "series",
+                "fictional_universes",
+                "characters",
+                "narrative_locations",
+                "game_modes",
+                "release_year",
+            )
+            if game_knowledge.get(key)
+        )
+        richness = min(1.0, filled_fields / 5.0)
+        game_context = _clamp01(
+            game_context
+            + 0.08 * richness
+            + (
+                0.04 * richness
+                if primary in {"lore_or_story", "tutorial_or_explainer", "atmosphere_or_visual"}
+                else 0.0
+            )
+        )
     dimensions = {
         "hook": round(hook, 4),
         "flow": round(flow, 4),
@@ -968,6 +1128,18 @@ def _extract_json_object(text: str):
         return None
 
 
+def _ollama_response_text(data) -> str:
+    if not isinstance(data, dict):
+        return ""
+    response = data.get("response")
+    if response not in (None, ""):
+        return str(response)
+    message = data.get("message")
+    if isinstance(message, dict) and message.get("content") not in (None, ""):
+        return str(message.get("content"))
+    return ""
+
+
 def _classification_reason(primary: str, fine_labels: list[str], visual: dict) -> str:
     if primary == "death_or_failure":
         return "Failure/death cues from transcript, ranker, or visual diagnostics."
@@ -1132,6 +1304,8 @@ def generate_titles_batch(
     # Check model availability ONCE, not per-title. Do not auto-pull here; model
     # downloads are intentionally opt-in through the Settings UI.
     model_ready = is_ollama_model_ready(model)
+    if model_ready:
+        _warm_ollama_model(model)
 
     results = [""] * total
     done_count = 0
@@ -1176,9 +1350,39 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         if isinstance(context.get("ai_moment_classification"), dict)
         else {}
     )
+    multimodal = (
+        context.get("multimodal_analysis")
+        if isinstance(context.get("multimodal_analysis"), dict)
+        else {}
+    )
     lines = [
         f"- Moment type: {context.get('moment_type') or 'general gameplay'}",
     ]
+    game_knowledge = context.get("game_knowledge") if isinstance(context.get("game_knowledge"), dict) else {}
+    if game_knowledge.get("available"):
+        fact_parts = []
+        if game_knowledge.get("label"):
+            fact_parts.append(f"title={game_knowledge.get('label')}")
+        if game_knowledge.get("release_year"):
+            fact_parts.append(f"year={game_knowledge.get('release_year')}")
+        for key, label in (
+            ("series", "series"),
+            ("fictional_universes", "universe"),
+            ("genres", "genre"),
+            ("developers", "developer"),
+            ("characters", "characters"),
+            ("narrative_locations", "setting"),
+            ("game_modes", "mode"),
+        ):
+            values = game_knowledge.get(key)
+            if isinstance(values, list) and values:
+                fact_parts.append(f"{label}={', '.join(values[:4])}")
+        if fact_parts:
+            lines.append(
+                "- Game knowledge: "
+                + "; ".join(fact_parts[:8])
+                + ". Use as background only; do not name characters, places, or mechanics unless transcript or vision supports them."
+            )
     category_parts = []
     if context.get("primary_category"):
         category_parts.append(f"heuristic={context['primary_category']}")
@@ -1205,6 +1409,10 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         score_parts.append(f"selection_quality={context['selection_quality_score']}")
     if context.get("learned_quality_score") is not None:
         score_parts.append(f"learned={context['learned_quality_score']}")
+    if context.get("multi_signal_ai_quality_score") is not None:
+        score_parts.append(f"multi_signal={context['multi_signal_ai_quality_score']}")
+    if context.get("multi_signal_ai_adjustment") is not None:
+        score_parts.append(f"multi_signal_adjustment={context['multi_signal_ai_adjustment']}")
     if score_parts:
         lines.append(f"- Clip scores: {', '.join(score_parts)}")
     candidate_parts = []
@@ -1218,6 +1426,20 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         lines.append(f"- Scene detection status: {context['scene_detection_status']}")
     if context.get("creator_title_context"):
         lines.append(f"- Creator-provided context: {context['creator_title_context']}")
+    learning = context.get("feedback_learning_context") if isinstance(context.get("feedback_learning_context"), dict) else {}
+    if learning.get("enabled"):
+        parts = []
+        if learning.get("positive_terms"):
+            parts.append(f"likes={', '.join(learning.get('positive_terms')[:5])}")
+        if learning.get("negative_terms"):
+            parts.append(f"dislikes={', '.join(learning.get('negative_terms')[:5])}")
+        counts = (
+            f"positive={learning.get('positive_feedback_count', 0)}, "
+            f"negative={learning.get('negative_feedback_count', 0)}, "
+            f"favorites={learning.get('favorite_count', 0)}"
+        )
+        parts.append(counts)
+        lines.append(f"- Creator feedback learning: {'; '.join(parts)}")
     ranker_parts = []
     for key in ("hook_points", "weak_points", "aftermath_points", "first_word_start"):
         if ranker.get(key) is not None:
@@ -1243,6 +1465,40 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         if ai_classification.get("confidence") is not None:
             ai_parts.append(f"confidence={ai_classification.get('confidence')}")
         lines.append(f"- AI moment label: {', '.join(part for part in ai_parts if part)}")
+    if multimodal.get("status"):
+        vision_parts = [
+            f"status={multimodal.get('status')}",
+            f"provider={multimodal.get('provider')}",
+            f"primary_visual={multimodal.get('primary_visual_label')}",
+        ]
+        if multimodal.get("visible_summary"):
+            vision_parts.append(f"summary={multimodal.get('visible_summary')}")
+        if multimodal.get("visual_labels"):
+            vision_parts.append(f"labels={', '.join(multimodal.get('visual_labels')[:5])}")
+        if multimodal.get("detected_events"):
+            vision_parts.append(f"events={', '.join(multimodal.get('detected_events')[:3])}")
+        if multimodal.get("title_hooks"):
+            vision_parts.append(f"title_hooks={', '.join(multimodal.get('title_hooks')[:3])}")
+        if multimodal.get("confidence") is not None:
+            vision_parts.append(f"confidence={multimodal.get('confidence')}")
+        lines.append(f"- Vision model analysis: {'; '.join(part for part in vision_parts if part)}")
+    multi_signal_ai = context.get("multi_signal_ai") if isinstance(context.get("multi_signal_ai"), dict) else {}
+    if multi_signal_ai.get("ranking_enabled") or multi_signal_ai.get("selection_delta"):
+        parts = []
+        if multi_signal_ai.get("selection_delta"):
+            parts.append(f"selection_delta={multi_signal_ai.get('selection_delta')}")
+        if multi_signal_ai.get("rank_delta") is not None:
+            parts.append(f"rank_delta={multi_signal_ai.get('rank_delta')}")
+        signals = multi_signal_ai.get("signals") if isinstance(multi_signal_ai.get("signals"), dict) else {}
+        strongest = [
+            f"{key}={value}"
+            for key, value in sorted(signals.items(), key=lambda kv: abs(float(kv[1] or 0.0)), reverse=True)[:4]
+            if value is not None
+        ]
+        if strongest:
+            parts.append(f"signals={', '.join(strongest)}")
+        if parts:
+            lines.append(f"- Combined AI selection signals: {'; '.join(parts)}")
     time_parts = []
     for key in ("start", "end", "duration", "peak_time"):
         if timing.get(key) is not None:
@@ -1254,6 +1510,80 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
     if context.get("context_sentence"):
         lines.append(f"- Metadata context: {context['context_sentence']}")
     return lines
+
+
+def _build_description_prompt(
+    title: str,
+    transcript: str,
+    game_title: str | None = None,
+    clip_context: dict | None = None,
+) -> str:
+    context = summarize_clip_context(transcript, game_title, clip_context)
+    analysis_lines = [
+        line for line in _analysis_prompt_lines(context)
+        if not line.startswith("- Metadata context:")
+    ]
+    analysis_block = "\n".join(analysis_lines) or "- No structured analysis available."
+    game_line = f"Game: {game_title or context.get('game_title') or 'Unknown game'}"
+    return (
+        "Write the generated part of a YouTube Shorts description for one gameplay clip.\n"
+        f"{game_line}\n"
+        f"Title: {_prompt_safe_text(_clean_base_title(title), limit=120)}\n\n"
+        "Use the transcript, detector/ranker summary, game knowledge, creator feedback hints, and vision summary if present.\n"
+        "Do not mention AI, analysis, detector, ranker, scores, metadata, captions, subtitles, or that the clip was selected.\n"
+        "Do not include hashtags, links, calls to action, channel branding, or the custom footer.\n"
+        "Do not quote the prompt or explain your reasoning.\n"
+        "Make it sound like a creator wrote it, not like software labeling a clip.\n"
+        "Keep it specific, natural, and short: one or two sentences, 120-240 characters total.\n"
+        "Return ONLY valid JSON in this shape: {\"description\":\"...\"}\n\n"
+        f"Clip analysis:\n{analysis_block}\n\n"
+        f'Transcript preview: "{_prompt_safe_text(transcript, limit=900)}"'
+    )
+
+
+def _clean_generated_description(value) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" \"'\n\t")
+    text = re.sub(r"^(description|caption)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"#\w+", "", text).strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    blocked = (
+        "detector",
+        "ranker",
+        "analysis",
+        "metadata",
+        "selected from",
+        "selected for",
+        "clip was selected",
+        "story or lore moment",
+        "high-energy",
+        "chase/panic",
+        "moment built around",
+        "moment with narrative context",
+        "action, panic, or reaction cues",
+        "grounded by",
+        "this moment is",
+        "return only",
+        "valid json",
+        "youtube shorts description",
+    )
+    if any(term in lower for term in blocked):
+        return ""
+    if len(text) > 260:
+        text = text[:260].rstrip()
+        sentence_end = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+        if sentence_end >= 120:
+            text = text[: sentence_end + 1]
+        else:
+            words = text.split()
+            text = ""
+            for word in words:
+                candidate = f"{text} {word}".strip() if text else word
+                if len(candidate) > 240:
+                    break
+                text = candidate
+    return text.strip()
 
 
 def _description_context_line(
@@ -1272,28 +1602,39 @@ def _context_sentence(context: dict, game_title: str | None) -> str:
     game = game_title or "gameplay"
     moment_type = context.get("moment_type")
     hook = context.get("hook_phrases", [""])[0] if context.get("hook_phrases") else ""
+    multimodal = context.get("multimodal_analysis") if isinstance(context.get("multimodal_analysis"), dict) else {}
+    game_knowledge = context.get("game_knowledge") if isinstance(context.get("game_knowledge"), dict) else {}
+    if game_knowledge.get("label"):
+        game = game_knowledge.get("label") or game
+    if (
+        multimodal.get("status") == "ok"
+        and multimodal.get("visible_summary")
+        and _float_or_zero(multimodal.get("confidence")) >= 0.62
+    ):
+        summary = str(multimodal.get("visible_summary") or "").strip()
+        return f"{game} gets tense here: {summary[:180].rstrip('.') }."
     if moment_type == "chase/panic":
         if hook:
-            return f"A tense {game} chase/panic moment built around \"{hook}\"."
-        return f"A tense {game} chase/panic moment pulled from the strongest spoken hook."
+            return f"The panic ramps up around \"{hook}\" as {game} closes in."
+        return f"{game} turns tense fast as the chase pressure takes over."
     if moment_type == "combat/fight":
-        return f"An intense {game} fight moment picked from the clip's strongest action beat."
+        return f"{game} drops straight into a fight with the pressure turned up."
     if moment_type == "high-energy gameplay":
-        return f"A high-energy {game} moment selected from action, panic, or reaction cues."
+        return f"{game} turns loud and chaotic here, with the reaction carrying the clip."
     if moment_type == "death/failure":
-        return f"A {game} failure or danger moment selected from the strongest payoff."
+        return f"{game} gets rough here, with the danger landing right at the payoff."
     if moment_type == "funny failure":
-        return f"A funny {game} failure moment selected from the clip's clearest payoff."
+        return f"{game} goes sideways in the kind of way that only gets funnier after it happens."
     if moment_type == "exploration/setup":
-        return f"A {game} gameplay moment selected from the clearest spoken setup."
+        return f"{game} slows down for a setup beat before the next problem shows itself."
     if moment_type == "tutorial/explainer":
-        return f"A helpful {game} explanation or tutorial-style moment."
+        return f"A quick {game} explanation with the useful part kept front and center."
     if moment_type == "commentary/review":
-        return f"A {game} commentary moment focused on creator reaction or opinion."
+        return f"{game} gets a little creator commentary here, with the reaction doing the heavy lifting."
     if moment_type == "lore/story":
-        return f"A {game} story or lore moment with narrative context."
+        return f"{game}'s story takes a strange turn here, right in the middle of the darkness."
     if moment_type == "atmosphere/visual":
-        return f"An atmospheric {game} moment selected for visual or mood cues."
+        return f"{game} leans into the mood here, letting the atmosphere do the work."
     return ""
 
 
@@ -1418,5 +1759,4 @@ def ollama_status(model: str = DEFAULT_MODEL) -> dict:
         "version": ollama_version() if running else "",
         "download_url": OLLAMA_DOWNLOAD_URL,
         "windows_docs_url": OLLAMA_WINDOWS_DOCS_URL,
-        "install_script_url": OLLAMA_INSTALL_SCRIPT_URL,
     }

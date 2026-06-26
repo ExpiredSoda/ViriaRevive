@@ -8,6 +8,14 @@ import math
 import re
 from pathlib import Path
 
+from speech_source_classifier import (
+    classify_speech_source,
+    positive_boost_block_reason as speech_source_positive_boost_block_reason,
+    should_retry_for_creator_policy,
+    speech_source_selection_penalty,
+    with_selection_penalty as speech_source_with_selection_penalty,
+)
+
 
 HOOK_WEIGHTS = (
     ("right behind", 6.0),
@@ -46,6 +54,29 @@ AFTERMATH_WEIGHTS = (
     ("what just happened", 2.0),
 )
 
+LAID_BACK_COMMENTARY_WEIGHTS = (
+    ("i think", 2.4),
+    ("i feel", 2.0),
+    ("i like", 2.4),
+    ("i love", 2.0),
+    ("i hate", 1.8),
+    ("i wonder", 2.2),
+    ("i don't know", 1.6),
+    ("i dont know", 1.6),
+    ("this game", 2.2),
+    ("look at this", 2.2),
+    ("what the hell", 1.8),
+    ("that's weird", 1.8),
+    ("thats weird", 1.8),
+    ("that's cool", 1.6),
+    ("thats cool", 1.6),
+    ("how convenient", 1.8),
+    ("the thing is", 2.0),
+    ("it feels", 1.8),
+    ("it looks", 1.6),
+    ("maybe", 1.0),
+)
+
 MIN_QUALITY_SCORE = 0.50
 DETECTION_PREFERENCES = {"auto", "quality", "quantity"}
 QUALITY_FLOORS = {
@@ -56,6 +87,11 @@ QUALITY_FLOORS = {
 MIN_WORDS = 6
 MIN_PEAK_TAIL = 8
 MAX_EXTENSION = 10
+SHORTS_RENDER_CAP_SECONDS = 180
+DEFAULT_SPEECH_PREROLL = 2.0
+SHORT_COMMENTARY_VISUAL_PREROLL = 5.0
+SHORT_COMMENTARY_WORD_LIMIT = 32
+SHORT_COMMENTARY_SPAN_LIMIT = 18.0
 SHADOW_SCORING_SCHEMA_VERSION = 2
 SHADOW_MAX_ADJUSTMENT = 0.18
 LEARNED_SELECTION_MAX_ADJUSTMENT = 0.06
@@ -71,6 +107,11 @@ MOMENT_CATEGORY_SELECTION_MAX_ADJUSTMENT = 0.020
 MOMENT_CATEGORY_DIVERSITY_MAX_ADJUSTMENT = 0.006
 AI_MOMENT_SELECTION_SCHEMA_VERSION = 1
 AI_MOMENT_SELECTION_MAX_ADJUSTMENT = 0.015
+MULTI_SIGNAL_AI_SELECTION_SCHEMA_VERSION = 1
+GAME_CONTEXT_NUDGE_SCHEMA_VERSION = 1
+GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT = 0.012
+MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT = 0.12
+MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT = 0.14
 COMMENTARY_GUARD_SCHEMA_VERSION = 1
 COMMENTARY_SEGMENT_MAX_WORDS = 14
 COMMENTARY_SEGMENT_GAP = 0.75
@@ -132,6 +173,10 @@ GAME_NARRATION_PHRASES = (
     ("you need to", 1.6),
     ("the door", 1.7),
     ("the key", 1.7),
+    ("get inside", 1.8),
+    ("take cover", 1.8),
+    ("look out", 1.2),
+    ("do it yourself", 1.6),
     ("manuscript", 2.0),
     ("narrator", 2.0),
     ("warning", 2.0),
@@ -313,7 +358,13 @@ def clean_words(words: list[dict]) -> list[dict]:
     return cleaned
 
 
-def needs_stream_retry(words: list[dict], duration: float) -> bool:
+def needs_stream_retry(
+    words: list[dict],
+    duration: float,
+    *,
+    subtitle_policy: str | None = "creator",
+    commentary_guard: bool = False,
+) -> bool:
     words = clean_words(words)
     if len(words) < MIN_WORDS:
         return True
@@ -323,6 +374,15 @@ def needs_stream_retry(words: list[dict], duration: float) -> bool:
         return True
     if _weighted_score(text, WEAK_WEIGHTS) >= 4 and _weighted_score(text, HOOK_WEIGHTS) < 4:
         return True
+    if commentary_guard and normalize_commentary_subtitle_policy(subtitle_policy) == "creator":
+        guard = classify_commentary_guard(words, enabled=True)
+        source = classify_speech_source(
+            words=words,
+            commentary_guard=guard,
+            subtitle_policy=subtitle_policy,
+        )
+        if should_retry_for_creator_policy(source):
+            return True
     return False
 
 
@@ -444,7 +504,16 @@ def apply_commentary_subtitle_policy(
         keep_labels = {"game_narration", "unclear"}
         remove_labels = {"creator_commentary"}
     else:
-        keep_labels = {"creator_commentary", "unclear"}
+        summary = guard.get("summary") if isinstance(guard.get("summary"), dict) else {}
+        creator_ratio = _score01(summary.get("creator_word_ratio", 0.0))
+        game_ratio = _score01(summary.get("game_narration_word_ratio", 0.0))
+        primary = str(summary.get("primary_label") or "")
+        # If the selected source looks like story/game speech, creator-only
+        # subtitles should prefer silence over burning NPC dialogue.
+        if primary != "creator_commentary" and creator_ratio < 0.25 and game_ratio >= creator_ratio:
+            keep_labels = {"creator_commentary"}
+        else:
+            keep_labels = {"creator_commentary", "unclear"}
         remove_labels = {"game_narration"}
 
     filtered = _filter_words_by_commentary_labels(words, segments, keep_labels)
@@ -463,7 +532,22 @@ def apply_commentary_subtitle_policy(
     if not removed_word_count:
         application["reason"] = "no_matching_segments_removed"
         return words, application
-    if len(filtered) < MIN_WORDS:
+    min_filtered_words = 2 if policy == "creator" and "creator_commentary" in kept_labels else MIN_WORDS
+    if len(filtered) < min_filtered_words:
+        if policy == "creator" and removed_word_count and not filtered:
+            application.update(
+                {
+                    "applied": True,
+                    "output_changed": True,
+                    "fallback_used": False,
+                    "reason": "no_creator_commentary_after_filter",
+                    "filtered_word_count": 0,
+                    "removed_word_count": len(words),
+                    "selection_impact": "none",
+                    "subtitle_impact": "filtered_words",
+                }
+            )
+            return [], application
         application.update(
             {
                 "fallback_used": True,
@@ -484,6 +568,313 @@ def apply_commentary_subtitle_policy(
         }
     )
     return filtered, application
+
+
+def _trust_unclear_creator_stream(stream_profile: dict | None) -> bool:
+    """Return true when an unclear transcript came from a likely creator track."""
+    if not isinstance(stream_profile, dict):
+        return False
+    voice_hints = bool(stream_profile.get("voice_title_hints"))
+    game_hints = bool(stream_profile.get("game_title_hints"))
+    selected_reason = str(
+        stream_profile.get("selected_reason")
+        or stream_profile.get("selection_reason")
+        or stream_profile.get("reason")
+        or ""
+    ).lower()
+    selected_confidence = _score01(
+        stream_profile.get(
+            "selected_confidence",
+            stream_profile.get("confidence", 0.0),
+        )
+    )
+    creator_selection_signal = "creator" in selected_reason and selected_confidence >= 0.55
+    creator_likeness = _score01(stream_profile.get("creator_likeness_score", 0.0))
+    natural = _score01(_safe_float(stream_profile.get("natural_dialogue_score"), 0.0) / 5.0)
+    scripted = _score01(_safe_float(stream_profile.get("scripted_game_score"), 0.0) / 4.0)
+    game_bed = _score01(stream_profile.get("acoustic_game_bed_score", 0.0))
+    lyric = _score01(stream_profile.get("lyric_likelihood", 0.0))
+    if game_hints and not voice_hints:
+        return False
+    if lyric >= 0.58:
+        return False
+    if scripted >= 0.62 and creator_likeness < 0.50:
+        return False
+    if game_bed >= 0.70 and creator_likeness < 0.60 and natural < 0.60:
+        return False
+    return (
+        voice_hints
+        or creator_selection_signal
+        or creator_likeness >= 0.52
+        or (natural >= 0.70 and scripted < 0.45)
+    )
+
+
+def _unclear_creator_segment_signal(text: str) -> dict:
+    """Score unclear text for creator-like rescue without trusting the whole track."""
+    normal = _normal_text(text)
+    tokens = set(normal.split())
+    first_person = len(
+        tokens.intersection(
+            {
+                "i",
+                "im",
+                "i'm",
+                "ive",
+                "i've",
+                "me",
+                "my",
+                "myself",
+                "we",
+                "were",
+                "we're",
+                "our",
+            }
+        )
+    )
+    reaction = len(
+        tokens.intersection(
+            {
+                "oh",
+                "ooh",
+                "whoa",
+                "wow",
+                "wait",
+                "what",
+                "why",
+                "how",
+                "okay",
+                "alright",
+                "yeah",
+                "yes",
+                "no",
+                "please",
+                "bro",
+                "brother",
+                "gonna",
+                "gotta",
+                "chat",
+            }
+        )
+    )
+    creator_meta = _weighted_score(
+        normal,
+        (
+            ("what does this say", 2.2),
+            ("what does that say", 2.0),
+            ("what is this", 1.3),
+            ("what's this", 1.3),
+            ("look at this", 1.5),
+            ("pat myself", 1.6),
+            ("piece of candy", 1.4),
+            ("good job", 1.1),
+            ("this game", 1.4),
+            ("the game", 1.0),
+        ),
+    )
+    display_text_risk = _score01(
+        _weighted_score(
+            normal,
+            (
+                ("all night every night", 1.4),
+                ("start your day right", 1.3),
+                ("the voice of", 1.2),
+                ("early bird", 1.0),
+                ("tune in", 0.9),
+                ("now playing", 0.9),
+            ),
+        )
+        / 2.2
+    )
+    has_clock_copy = bool(re.search(r"\b\d{1,2}\s*(?:a|p)\s*\.?\s*m\b", normal))
+    read_prompt = bool(
+        re.search(
+            r"\bwhat(?:'s| is| does)?\s+(?:this|that|it)\s+(?:say|read|mean)\b",
+            normal,
+        )
+    )
+    creator_signal = _score01((first_person * 0.45) + (reaction * 0.24) + (creator_meta * 0.38))
+    has_creator_cue = first_person > 0 or reaction > 0 or creator_meta >= 0.8
+    return {
+        "creator_signal": round(float(creator_signal), 4),
+        "has_creator_cue": bool(has_creator_cue),
+        "read_prompt": bool(read_prompt),
+        "display_text_risk": round(float(max(display_text_risk, 0.65 if has_clock_copy else 0.0)), 4),
+    }
+
+
+def _restorable_unclear_creator_segment_indexes(segments: list[dict]) -> tuple[set[int], dict]:
+    """Choose which unclear segments should be rescued for creator-only subtitles."""
+    keep: set[int] = set()
+    dropped_after_read_prompt = 0
+    dropped_display_text = 0
+    read_prompt_cooldown = 0
+    diagnostics: list[dict] = []
+    for idx, segment in enumerate(segments):
+        if str(segment.get("label") or "unclear") != "unclear":
+            continue
+        signal = _unclear_creator_segment_signal(str(segment.get("text") or ""))
+        should_keep = bool(signal["has_creator_cue"]) and signal["display_text_risk"] < 0.68
+        drop_reason = ""
+        if read_prompt_cooldown > 0 and not signal["has_creator_cue"]:
+            should_keep = False
+            drop_reason = "likely_read_in_game_text_after_prompt"
+            dropped_after_read_prompt += 1
+        elif signal["display_text_risk"] >= 0.68 and signal["creator_signal"] < 0.62:
+            should_keep = False
+            drop_reason = "likely_display_or_radio_text"
+            dropped_display_text += 1
+        elif not signal["has_creator_cue"]:
+            drop_reason = "weak_creator_segment_evidence"
+
+        if should_keep:
+            keep.add(idx)
+            if signal["read_prompt"]:
+                read_prompt_cooldown = 4
+            elif read_prompt_cooldown > 0:
+                read_prompt_cooldown -= 1
+        elif read_prompt_cooldown > 0:
+            read_prompt_cooldown -= 1
+        diagnostics.append(
+            {
+                "index": idx,
+                "kept": bool(should_keep),
+                "reason": "creator_segment_cue" if should_keep else drop_reason,
+                "creator_signal": signal["creator_signal"],
+                "display_text_risk": signal["display_text_risk"],
+                "read_prompt": signal["read_prompt"],
+                "word_count": int(segment.get("word_count") or 0),
+            }
+        )
+    return keep, {
+        "restorable_unclear_segments": len(keep),
+        "dropped_after_read_prompt_segments": dropped_after_read_prompt,
+        "dropped_display_text_segments": dropped_display_text,
+        "segment_diagnostics": diagnostics[:12],
+    }
+
+
+def _filter_words_by_commentary_segment_indexes(
+    words: list[dict],
+    segments: list[dict],
+    keep_indexes: set[int],
+) -> list[dict]:
+    filtered: list[dict] = []
+    for word in words:
+        try:
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        midpoint = (start + end) / 2.0
+        for idx, segment in enumerate(segments):
+            if idx not in keep_indexes:
+                continue
+            try:
+                seg_start = float(segment.get("start", 0.0))
+                seg_end = float(segment.get("end", seg_start))
+            except (TypeError, ValueError):
+                continue
+            if seg_start - 0.05 <= midpoint <= seg_end + 0.05:
+                filtered.append(word)
+                break
+    return filtered
+
+
+def _restore_trusted_unclear_creator_subtitles(
+    *,
+    subtitle_words: list[dict],
+    render_words: list[dict],
+    commentary_guard_result: dict,
+    commentary_guard_application: dict,
+    speech_source: dict,
+    stream_profile: dict | None,
+    policy: str | None,
+) -> tuple[list[dict], dict, dict]:
+    """Keep mic-track speech when the light guard only failed to classify it."""
+    if normalize_commentary_subtitle_policy(policy) != "creator":
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+    if subtitle_words or not render_words:
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+    if commentary_guard_application.get("reason") != "no_creator_commentary_after_filter":
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+    if not _trust_unclear_creator_stream(stream_profile):
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+
+    block_reason = speech_source_positive_boost_block_reason(speech_source, policy=policy)
+    creator_probability = _score01(speech_source.get("creator_probability", 0.0))
+    game_probability = _score01(speech_source.get("game_or_npc_probability", 0.0))
+    music_probability = _score01(speech_source.get("music_or_lyrics_probability", 0.0))
+    selected_reason = str(
+        (stream_profile or {}).get("selected_reason")
+        or (stream_profile or {}).get("selection_reason")
+        or ""
+    ).lower()
+    selected_confidence = _score01(
+        (stream_profile or {}).get(
+            "selected_confidence",
+            (stream_profile or {}).get("confidence", 0.0),
+        )
+    )
+    trusted_creator_selection = "creator" in selected_reason and selected_confidence >= 0.55
+    creator_likeness = _score01((stream_profile or {}).get("creator_likeness_score", 0.0))
+    trusted_creator_override = bool(
+        trusted_creator_selection
+        and creator_probability >= 0.42
+        and creator_likeness >= 0.52
+        and game_probability < 0.38
+        and music_probability < 0.42
+    )
+    if (block_reason and not trusted_creator_override) or game_probability >= 0.48 or music_probability >= 0.50:
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+    min_creator_probability = 0.30 if trusted_creator_selection else 0.38
+    if not bool(speech_source.get("creator_safe")) and creator_probability < min_creator_probability:
+        return subtitle_words, commentary_guard_result, commentary_guard_application
+
+    segments = commentary_guard_result.get("segments") if isinstance(commentary_guard_result.get("segments"), list) else []
+    restored_words = list(render_words)
+    restore_details: dict = {}
+    restore_mode = "trusted_track"
+    if segments:
+        keep_indexes, restore_details = _restorable_unclear_creator_segment_indexes(segments)
+        if keep_indexes:
+            restored_words = _filter_words_by_commentary_segment_indexes(render_words, segments, keep_indexes)
+            restore_mode = "trusted_track_partial" if len(restored_words) < len(render_words) else "trusted_track"
+        elif trusted_creator_override:
+            restore_details = {
+                **restore_details,
+                "restored_all_unclear_creator_selected_stream": True,
+                "trusted_creator_override_reason": block_reason or "creator_selected_stream",
+            }
+        else:
+            return subtitle_words, commentary_guard_result, commentary_guard_application
+
+    restored_application = dict(commentary_guard_application)
+    partial_restore = len(restored_words) < len(render_words)
+    restored_application.update(
+        {
+            "applied": bool(partial_restore),
+            "output_changed": bool(partial_restore),
+            "fallback_used": True,
+            "reason": "trusted_creator_track_unclear_segments_restored"
+            if partial_restore
+            else "trusted_creator_track_unclear_restored",
+            "filtered_word_count": len(restored_words),
+            "removed_word_count": max(0, len(render_words) - len(restored_words)),
+            "kept_labels": ["unclear_creator_like"],
+            "removed_labels": ["unclear_non_creator_like"] if partial_restore else [],
+            "selection_impact": "none",
+            "subtitle_impact": "filtered_words" if partial_restore else "none",
+            "trusted_unclear_creator_track": True,
+            **restore_details,
+        }
+    )
+    restored_guard = dict(commentary_guard_result)
+    restored_guard["application"] = restored_application
+    restored_guard["output_changed"] = bool(partial_restore)
+    restored_guard["subtitle_impact"] = "filtered_words" if partial_restore else "none"
+    restored_guard["mode"] = restore_mode
+    return restored_words, restored_guard, restored_application
 
 
 def classify_music_lyrics_guard(words: list[dict], *, policy: str | None = "creator") -> dict:
@@ -612,6 +1003,7 @@ def commentary_guard_selection_penalty(guard: dict, *, policy: str | None = "cre
     creator_ratio = _score01(summary.get("creator_word_ratio", 0.0))
     fallback_used = bool(application.get("fallback_used"))
     output_changed = bool(application.get("output_changed"))
+    application_reason = str(application.get("reason") or "")
 
     base["signals"] = {
         "primary_label": primary,
@@ -624,7 +1016,7 @@ def commentary_guard_selection_penalty(guard: dict, *, policy: str | None = "cre
     if primary != "game_narration":
         base["reason"] = "not_game_narration_primary"
         return base
-    if output_changed and not fallback_used:
+    if output_changed and not fallback_used and application_reason != "no_creator_commentary_after_filter":
         base["reason"] = "creator_filter_recovered"
         return base
     if confidence < 0.55 or game_ratio < 0.55:
@@ -738,6 +1130,13 @@ def _speech_source_evidence(normal: str) -> dict:
     if first_person_hits and formal_hits:
         creator_score += 0.4
         game_score += 0.4
+    source_report = classify_speech_source(transcript=normal, subtitle_policy="creator")
+    scripted_dialogue_risk = _score01(source_report.get("scripted_dialogue_risk", 0.0))
+    creator_meta_score = _score01(source_report.get("creator_meta_score", 0.0))
+    if scripted_dialogue_risk >= 0.45 and creator_meta_score < 0.38:
+        game_score += min(3.2, 1.0 + scripted_dialogue_risk * 2.4)
+    elif creator_meta_score >= 0.35:
+        creator_score += min(1.6, creator_meta_score * 1.8)
 
     total = max(0.01, creator_score + game_score)
     creator_norm = creator_score / total if total else 0.0
@@ -766,6 +1165,10 @@ def _speech_source_evidence(normal: str) -> dict:
         signals.append("creator_phrase")
     if game_score:
         signals.append("game_phrase")
+    if scripted_dialogue_risk >= 0.45:
+        signals.append("scripted_dialogue_risk")
+    if creator_meta_score >= 0.35:
+        signals.append("creator_meta_context")
 
     return {
         "label": label,
@@ -780,6 +1183,8 @@ def _speech_source_evidence(normal: str) -> dict:
         "second_person_hits": second_person_hits,
         "reactive_hits": reactive_hits,
         "formal_hits": formal_hits,
+        "scripted_dialogue_risk": round(float(scripted_dialogue_risk), 4),
+        "creator_meta_score": round(float(creator_meta_score), 4),
         "signals": signals[:8],
     }
 
@@ -807,6 +1212,58 @@ def _repeated_ngram_ratio(tokens: list[str], size: int) -> float:
         counts[gram] = counts.get(gram, 0) + 1
     repeated = sum(count for count in counts.values() if count > 1)
     return repeated / max(1, len(tokens) - size + 1)
+
+
+def _laid_back_commentary_signal(
+    normal: str,
+    *,
+    word_count: int,
+    duration: float,
+    moment_categories: dict | None = None,
+) -> dict:
+    """Reward coherent creator commentary that does not need panic keywords."""
+    normal = str(normal or "")
+    categories = moment_categories if isinstance(moment_categories, dict) else {}
+    primary = str(categories.get("primary") or "").strip()
+    category_scores = categories.get("scores") if isinstance(categories.get("scores"), dict) else {}
+    phrase_score = min(_weighted_score(normal, LAID_BACK_COMMENTARY_WEIGHTS) / 7.0, 1.0)
+    density = word_count / max(1.0, duration)
+    density_score = 1.0 if 0.12 <= density <= 1.35 else max(0.0, 1.0 - abs(density - 0.62))
+    complete_thought = 0.0
+    if 12 <= word_count <= 95:
+        complete_thought += 0.45
+    if re.search(r"\b(?:because|so|but|then|when|if|maybe|actually|though|which|what|why|how)\b", normal):
+        complete_thought += 0.30
+    if normal.rstrip().endswith((".", "!", "?")):
+        complete_thought += 0.15
+    category_signal = 0.0
+    if primary in {"tutorial_or_explainer", "commentary_or_review", "lore_or_story", "atmosphere_or_visual"}:
+        category_signal = 0.55
+    category_signal = max(
+        category_signal,
+        min(
+            1.0,
+            float(category_scores.get("tutorial_or_explainer", 0.0) or 0.0)
+            + float(category_scores.get("commentary_or_review", 0.0) or 0.0)
+            + float(category_scores.get("lore_or_story", 0.0) or 0.0) * 0.75,
+        ),
+    )
+    signal = _score01(
+        phrase_score * 0.42
+        + min(complete_thought, 1.0) * 0.28
+        + density_score * 0.14
+        + category_signal * 0.30
+    )
+    return {
+        "schema_version": 1,
+        "signal": round(float(signal), 4),
+        "phrase_score": round(float(phrase_score), 4),
+        "complete_thought_score": round(float(min(complete_thought, 1.0)), 4),
+        "density_score": round(float(density_score), 4),
+        "category_signal": round(float(category_signal), 4),
+        "primary_category": primary,
+        "selection_impact": "quality_boost" if signal >= 0.20 else "none",
+    }
 
 
 def _classify_commentary_segment(segment: list[dict]) -> dict:
@@ -842,6 +1299,8 @@ def evaluate_candidate(
     detection_preference: str = "auto",
     commentary_guard: bool = False,
     commentary_guard_policy: str = "creator",
+    voice_profile: dict | None = None,
+    stream_profile: dict | None = None,
 ) -> dict:
     words = clean_words(words)
     text = transcript_text(words)
@@ -850,6 +1309,7 @@ def evaluate_candidate(
     weak_points = _weighted_score(normal, WEAK_WEIGHTS)
     aftermath_points = _weighted_score(normal, AFTERMATH_WEIGHTS)
     visual_diagnostics = candidate.get("visual_diagnostics") if isinstance(candidate.get("visual_diagnostics"), dict) else {}
+    multimodal_context = candidate.get("multimodal_analysis") if isinstance(candidate.get("multimodal_analysis"), dict) else {}
     duration = max(1.0, float(candidate["end"]) - float(candidate["start"]))
     word_count = len(words)
     first_word_start = words[0]["start"] if words else None
@@ -865,21 +1325,6 @@ def evaluate_candidate(
         late_penalty = 0.35
     elif first_word_start > 12 and hook_points < 5:
         late_penalty = 0.12
-
-    quality = (
-        0.25 * detector_score
-        + 0.28 * density_score
-        + 0.52 * hook_score
-        - weak_penalty
-        - late_penalty
-    )
-    if candidate.get("candidate_kind") == "primary" and aftermath_points:
-        quality -= aftermath_penalty
-    else:
-        quality -= min(aftermath_penalty, 0.12)
-    quality = max(0.0, min(1.0, quality))
-    quality_floor = MIN_QUALITY_SCORE if quality_floor is None else float(quality_floor)
-    detection_preference = normalize_detection_preference(detection_preference)
     moment_categories = score_moment_categories(
         text,
         candidate,
@@ -890,6 +1335,29 @@ def evaluate_candidate(
         duration=duration,
         visual_diagnostics=visual_diagnostics,
     )
+    laid_back_commentary = _laid_back_commentary_signal(
+        normal,
+        word_count=word_count,
+        duration=duration,
+        moment_categories=moment_categories,
+    )
+    laid_back_boost = min(0.16, 0.16 * float(laid_back_commentary.get("signal") or 0.0))
+
+    quality = (
+        0.25 * detector_score
+        + 0.28 * density_score
+        + 0.52 * hook_score
+        + laid_back_boost
+        - weak_penalty
+        - late_penalty
+    )
+    if candidate.get("candidate_kind") == "primary" and aftermath_points:
+        quality -= aftermath_penalty
+    else:
+        quality -= min(aftermath_penalty, 0.12)
+    quality = max(0.0, min(1.0, quality))
+    quality_floor = MIN_QUALITY_SCORE if quality_floor is None else float(quality_floor)
+    detection_preference = normalize_detection_preference(detection_preference)
 
     render_start, render_end, render_words = trim_candidate_with_transcript(
         candidate, words, extraction_start, extraction_end, video_duration, target_duration
@@ -933,6 +1401,50 @@ def evaluate_candidate(
         quality = max(0.0, min(1.0, quality - music_lyrics_penalty))
         music_lyrics_guard["quality_before_penalty"] = round(float(quality + music_lyrics_penalty), 4)
         music_lyrics_guard["quality_after_penalty"] = round(float(quality), 4)
+    speech_source_words = render_words
+    if (
+        normalize_commentary_subtitle_policy(commentary_guard_policy) == "creator"
+        and commentary_guard_application.get("output_changed")
+        and subtitle_words
+    ):
+        speech_source_words = subtitle_words
+    speech_source = classify_speech_source(
+        words=speech_source_words,
+        commentary_guard=commentary_guard_result,
+        music_lyrics_guard=music_lyrics_guard,
+        voice_profile=voice_profile,
+        stream_profile=stream_profile,
+        visual_context=multimodal_context,
+        subtitle_policy=commentary_guard_policy,
+    )
+    subtitle_words, commentary_guard_result, commentary_guard_application = _restore_trusted_unclear_creator_subtitles(
+        subtitle_words=subtitle_words,
+        render_words=render_words,
+        commentary_guard_result=commentary_guard_result,
+        commentary_guard_application=commentary_guard_application,
+        speech_source=speech_source,
+        stream_profile=stream_profile,
+        policy=commentary_guard_policy,
+    )
+    commentary_guard_summary = _compact_commentary_guard(commentary_guard_result)
+    speech_source_selection = speech_source_selection_penalty(
+        speech_source,
+        policy=commentary_guard_policy,
+    )
+    raw_speech_source_penalty = float(speech_source_selection.get("selection_penalty") or 0.0)
+    existing_source_penalty = min(raw_speech_source_penalty, commentary_guard_penalty + music_lyrics_penalty)
+    speech_source_penalty = max(0.0, raw_speech_source_penalty - existing_source_penalty)
+    if speech_source_penalty:
+        quality = max(0.0, min(1.0, quality - speech_source_penalty))
+        speech_source_selection["quality_before_penalty"] = round(float(quality + speech_source_penalty), 4)
+        speech_source_selection["quality_after_penalty"] = round(float(quality), 4)
+    speech_source_selection["raw_selection_penalty"] = round(float(raw_speech_source_penalty), 4)
+    speech_source_selection["overlap_with_existing_source_penalties"] = round(float(existing_source_penalty), 4)
+    speech_source = speech_source_with_selection_penalty(
+        speech_source,
+        speech_source_selection,
+        applied_penalty=speech_source_penalty,
+    )
 
     reject_reason = ""
     if word_count < MIN_WORDS:
@@ -965,13 +1477,20 @@ def evaluate_candidate(
         "visual_diagnostics": visual_diagnostics,
         "commentary_guard": commentary_guard_summary,
         "music_lyrics_guard": music_lyrics_guard,
+        "speech_source": speech_source,
+        "speech_source_penalty": round(float(speech_source_penalty), 4),
         "music_lyrics_penalty": round(float(music_lyrics_penalty), 4),
+        "laid_back_commentary": laid_back_commentary,
+        "laid_back_commentary_boost": round(float(laid_back_boost), 4),
         "ranker": {
             "hook_points": hook_points,
             "weak_points": weak_points,
             "aftermath_points": aftermath_points,
+            "laid_back_commentary": laid_back_commentary,
+            "laid_back_commentary_boost": round(float(laid_back_boost), 4),
             "commentary_guard_selection_penalty": round(float(commentary_guard_penalty), 4),
             "music_lyrics_penalty": round(float(music_lyrics_penalty), 4),
+            "speech_source_penalty": round(float(speech_source_penalty), 4),
             "first_word_start": first_word_start,
             "last_word_end": last_word_end,
             "reject_reason": reject_reason,
@@ -982,6 +1501,7 @@ def evaluate_candidate(
             "visual_diagnostics": visual_diagnostics,
             "commentary_guard": commentary_guard_summary,
             "music_lyrics_guard": music_lyrics_guard,
+            "speech_source": speech_source,
         },
     }
 
@@ -1000,6 +1520,11 @@ def evaluate_candidate(
         "commentary_guard_selection_penalty": commentary_guard_penalty,
         "music_lyrics_guard": music_lyrics_guard,
         "music_lyrics_penalty": music_lyrics_penalty,
+        "speech_source": speech_source,
+        "speech_source_selection": speech_source_selection,
+        "speech_source_penalty": speech_source_penalty,
+        "laid_back_commentary": laid_back_commentary,
+        "laid_back_commentary_boost": laid_back_boost,
         "words": subtitle_words,
         "analysis_words": render_words,
         "transcript": text,
@@ -1261,20 +1786,28 @@ def trim_candidate_with_transcript(
 
     if not words:
         start = int(max(0, math.floor(cand_start)))
-        end = int(min(video_duration, math.ceil(cand_end)))
+        end = int(min(video_duration, math.ceil(min(cand_end, start + SHORTS_RENDER_CAP_SECONDS))))
         return start, end, []
 
     hook_start_rel = _best_hook_start(words)
     first_speech_abs = extraction_start + words[0]["start"]
+    speech_span = max(0.0, float(words[-1]["end"]) - float(words[0]["start"]))
+    use_visual_preroll = (
+        len(words) <= SHORT_COMMENTARY_WORD_LIMIT
+        or speech_span <= SHORT_COMMENTARY_SPAN_LIMIT
+    )
+    speech_preroll = SHORT_COMMENTARY_VISUAL_PREROLL if use_visual_preroll else DEFAULT_SPEECH_PREROLL
     if candidate.get("candidate_kind") == "pre_event":
-        desired_start = first_speech_abs - 1.5
+        desired_start = first_speech_abs - max(1.5, speech_preroll)
     elif hook_start_rel is not None:
-        desired_start = extraction_start + hook_start_rel - 2.0
+        hook_desired = extraction_start + hook_start_rel - DEFAULT_SPEECH_PREROLL
+        speech_desired = first_speech_abs - speech_preroll
+        desired_start = min(hook_desired, speech_desired)
     else:
-        desired_start = first_speech_abs - 1.5
+        desired_start = first_speech_abs - speech_preroll
     desired_start = max(cand_start, desired_start)
 
-    latest_start = max(cand_start, peak - 2.0)
+    latest_start = max(cand_start, peak - max(DEFAULT_SPEECH_PREROLL, speech_preroll + 2.0))
     desired_start = min(desired_start, latest_start)
     render_start = int(max(0, math.floor(desired_start)))
 
@@ -1287,10 +1820,10 @@ def trim_candidate_with_transcript(
         last_abs = extraction_start + words[-1]["end"] + 0.35
         natural_end = max(min_end, last_abs)
 
-    hard_end = min(float(video_duration), render_start + target_duration + MAX_EXTENSION)
+    hard_end = min(float(video_duration), render_start + _shorts_render_duration_limit(target_duration))
     render_end = int(min(video_duration, math.ceil(min(natural_end, hard_end))))
     if render_end <= render_start:
-        render_end = int(min(video_duration, render_start + max(1, target_duration)))
+        render_end = int(min(video_duration, render_start + _shorts_render_duration_limit(target_duration, include_extension=False)))
 
     render_words = []
     word_cutoff = min(float(render_end), float(natural_end) + 0.05)
@@ -1308,6 +1841,18 @@ def trim_candidate_with_transcript(
         )
 
     return render_start, render_end, render_words
+
+
+def _shorts_render_duration_limit(target_duration: float, *, include_extension: bool = True) -> float:
+    try:
+        duration = float(target_duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if include_extension:
+        duration += MAX_EXTENSION
+    else:
+        duration = max(1.0, duration)
+    return min(float(SHORTS_RENDER_CAP_SECONDS), max(1.0, duration))
 
 
 def select_best_candidates(
@@ -1337,6 +1882,8 @@ def select_best_candidates(
             break
 
     for idx, evaluation in enumerate(selected, 1):
+        evaluation["reject_reason"] = ""
+        evaluation["moment"].setdefault("ranker", {})["reject_reason"] = ""
         base_quality = _safe_float(evaluation.get("quality_score", 0.0), 0.0) or 0.0
         rank_score = _safe_float(evaluation.get(score_key, base_quality), base_quality) or base_quality
         evaluation["selection_quality_score"] = round(base_quality, 4)
@@ -1384,9 +1931,188 @@ def select_best_candidates(
             evaluation["moment"]["ai_adjustment"] = ai_scoring.get("ai_adjustment")
         if ai_scoring:
             evaluation["moment"]["ai_moment_scoring"] = copy.deepcopy(ai_scoring)
+        multimodal_scoring = evaluation.get("multimodal_scoring") or {}
+        if "multimodal_quality_score" in evaluation:
+            multimodal_score = _safe_float(evaluation["multimodal_quality_score"], rank_score)
+            evaluation["moment"]["multimodal_quality_score"] = round(
+                rank_score if multimodal_score is None else multimodal_score,
+                4,
+            )
+        if "multimodal_adjustment" in multimodal_scoring:
+            evaluation["moment"]["multimodal_adjustment"] = multimodal_scoring.get("multimodal_adjustment")
+        if multimodal_scoring:
+            evaluation["moment"]["multimodal_scoring"] = copy.deepcopy(multimodal_scoring)
+        multi_signal_scoring = evaluation.get("multi_signal_ai_scoring") or {}
+        if "multi_signal_ai_quality_score" in evaluation:
+            multi_signal_score = _safe_float(evaluation["multi_signal_ai_quality_score"], rank_score)
+            evaluation["moment"]["multi_signal_ai_quality_score"] = round(
+                rank_score if multi_signal_score is None else multi_signal_score,
+                4,
+            )
+        if "multi_signal_adjustment" in multi_signal_scoring:
+            evaluation["moment"]["multi_signal_ai_adjustment"] = multi_signal_scoring.get("multi_signal_adjustment")
+        if multi_signal_scoring:
+            evaluation["moment"]["multi_signal_ai_scoring"] = copy.deepcopy(multi_signal_scoring)
+        fallback = (
+            evaluation.get("near_quality_fallback")
+            if isinstance(evaluation.get("near_quality_fallback"), dict)
+            else evaluation["moment"].get("near_quality_fallback")
+            if isinstance(evaluation["moment"].get("near_quality_fallback"), dict)
+            else {}
+        )
+        selection_tier = "recommended"
+        selection_reason = "quality_ranked"
+        if fallback.get("applied"):
+            if fallback.get("selection_tier") == "extra_candidate":
+                selection_tier = "extra_pick"
+            else:
+                selection_tier = "near_quality_pick"
+            selection_reason = str(fallback.get("reason") or "near_quality_fallback")
+        elif evaluation.get("multimodal_rescue_applied") or evaluation["moment"].get("multimodal_rescue_applied"):
+            selection_tier = "extra_pick"
+            selection_reason = "visual_rescue"
+        evaluation["selection_tier"] = selection_tier
+        evaluation["selection_reason"] = selection_reason
+        evaluation["moment"]["selection_tier"] = selection_tier
+        evaluation["moment"]["selection_reason"] = selection_reason
+        evaluation["moment"].setdefault("ranker", {})["selection_tier"] = selection_tier
+        evaluation["moment"]["ranker"]["selection_reason"] = selection_reason
         evaluation["selection_moment"] = copy.deepcopy(evaluation["moment"])
     selected.sort(key=lambda e: e["moment"]["start"])
     return selected
+
+
+def select_near_quality_fallback_candidates(
+    evaluations: list[dict],
+    max_count: int,
+    min_gap: int = 12,
+    score_key: str = "quality_score",
+    *,
+    existing_selected: list[dict] | None = None,
+    allow_partial: bool = False,
+    reason: str = "strict_quality_selected_zero",
+) -> list[dict]:
+    """Promote creator-safe near-misses when strict quality under-fills a run."""
+    existing_selected = list(existing_selected or [])
+    if max_count <= 0:
+        return []
+    if not allow_partial and any(e.get("accepted") for e in evaluations):
+        return []
+    missing_count = max_count - len(existing_selected) if allow_partial else max_count
+    if missing_count <= 0:
+        return []
+
+    fallback_cap = min(
+        missing_count,
+        max(1, min(max_count, math.ceil(max_count * (0.55 if allow_partial else 0.35)))),
+    )
+    candidate_qualities = sorted(
+        _safe_float(e.get("quality_score"), 0.0) or 0.0
+        for e in evaluations
+        if e.get("reject_reason") == "low_transcript_quality"
+    )
+    relative_floor = QUALITY_FLOORS["quantity"]
+    if allow_partial and candidate_qualities:
+        relative_idx = min(len(candidate_qualities) - 1, max(0, int(len(candidate_qualities) * 0.55)))
+        relative_floor = max(0.30, min(QUALITY_FLOORS["auto"], candidate_qualities[relative_idx]))
+    eligible: list[tuple[float, float, dict, float]] = []
+    for evaluation in evaluations:
+        if evaluation.get("reject_reason") != "low_transcript_quality":
+            continue
+        word_count = int(evaluation.get("subtitle_word_count") or evaluation.get("word_count") or 0)
+        if word_count < max(MIN_WORDS, 8):
+            continue
+
+        quality = _safe_float(evaluation.get("quality_score"), 0.0) or 0.0
+        floor = _safe_float(evaluation.get("quality_floor"), MIN_QUALITY_SCORE) or MIN_QUALITY_SCORE
+        relaxed_floor = max(QUALITY_FLOORS["quantity"], floor - 0.12)
+        if allow_partial:
+            relaxed_floor = min(relaxed_floor, relative_floor)
+        if quality < relaxed_floor:
+            continue
+
+        music_guard = evaluation.get("music_lyrics_guard") or {}
+        if music_guard.get("reject_candidate"):
+            continue
+        speech_source = evaluation.get("speech_source") or {}
+        primary_source = str(speech_source.get("primary_source") or "").lower()
+        if primary_source in {"game", "game_or_npc", "npc", "music", "music_or_lyrics"}:
+            continue
+        if speech_source:
+            creator_safe = bool(speech_source.get("creator_safe"))
+            game_prob = _safe_float(speech_source.get("game_or_npc_probability"), 0.0) or 0.0
+            music_prob = _safe_float(speech_source.get("music_or_lyrics_probability"), 0.0) or 0.0
+            if not creator_safe and max(game_prob, music_prob) >= 0.45:
+                continue
+
+        commentary_guard = evaluation.get("commentary_guard") or {}
+        commentary_summary = commentary_guard.get("summary") if isinstance(commentary_guard.get("summary"), dict) else {}
+        if str(commentary_summary.get("primary_label") or "").lower() == "game_narration":
+            continue
+        commentary_penalty = _safe_float(evaluation.get("commentary_guard_selection_penalty"), 0.0) or 0.0
+        speech_penalty = _safe_float(evaluation.get("speech_source_penalty"), 0.0) or 0.0
+        if commentary_penalty >= 0.15 or speech_penalty >= 0.15:
+            continue
+
+        rank_score = _safe_float(
+            evaluation.get(score_key),
+            _safe_float(evaluation.get("learned_quality_score"), quality) or quality,
+        )
+        if rank_score is None:
+            rank_score = quality
+        eligible.append((rank_score, quality, evaluation, relaxed_floor))
+
+    eligible.sort(
+        key=lambda row: (
+            row[0],
+            row[1],
+            -(_safe_float(row[2].get("candidate", {}).get("candidate_rank"), 9999) or 9999),
+        ),
+        reverse=True,
+    )
+
+    chosen: list[tuple[dict, float]] = []
+    selected_for_overlap: list[dict] = [item for item in existing_selected if isinstance(item, dict)]
+    for _rank_score, _quality, evaluation, relaxed_floor in eligible:
+        if _overlaps_selected(evaluation["moment"], selected_for_overlap, min_gap):
+            continue
+        chosen.append((evaluation, relaxed_floor))
+        selected_for_overlap.append(evaluation)
+        if len(chosen) >= fallback_cap:
+            break
+
+    if not chosen:
+        return []
+
+    for evaluation, relaxed_floor in chosen:
+        original_reject_reason = str(evaluation.get("reject_reason") or "")
+        fallback = {
+            "schema_version": 1,
+            "applied": True,
+            "reason": reason,
+            "original_reject_reason": original_reject_reason,
+            "relaxed_quality_floor": round(float(relaxed_floor), 4),
+            "quality_floor": round(
+                _safe_float(evaluation.get("quality_floor"), MIN_QUALITY_SCORE) or MIN_QUALITY_SCORE,
+                4,
+            ),
+            "quality_score": round(float(evaluation.get("quality_score") or 0.0), 4),
+            "score_key": score_key,
+            "selection_tier": "extra_candidate" if allow_partial else "near_quality_fallback",
+            "relative_floor": round(float(relative_floor), 4),
+        }
+        evaluation["accepted"] = True
+        evaluation["reject_reason"] = ""
+        evaluation["near_quality_fallback"] = fallback
+        moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+        ranker = moment.get("ranker") if isinstance(moment.get("ranker"), dict) else {}
+        moment["near_quality_fallback"] = fallback
+        ranker["near_quality_fallback"] = fallback
+        ranker["original_reject_reason"] = original_reject_reason
+        ranker["reject_reason"] = ""
+        moment["ranker"] = ranker
+
+    return select_best_candidates(evaluations, max_count, min_gap=min_gap, score_key=score_key)
 
 
 def apply_learned_scoring(
@@ -1658,12 +2384,19 @@ def apply_ai_moment_scoring(
         base_score = _safe_float(evaluation.get(score_key, evaluation.get("quality_score", 0.0)), 0.0) or 0.0
         ai = _ai_classification_for_scoring(evaluation)
         eligibility = _ai_moment_scoring_eligibility(ai, evaluation, confidence_floor=confidence_floor)
+        selection_eligible = bool(
+            evaluation.get("accepted")
+            or (
+                evaluation.get("reject_reason") == "low_transcript_quality"
+                and evaluation.get("ai_rescue_candidate")
+            )
+        )
         raw_adjustment = 0.0
         if eligibility["eligible"]:
             raw_adjustment = _ai_moment_signal(ai) * safe_max
             eligible_count += 1
         ai_adjustment = 0.0
-        if ranking_enabled and evaluation.get("accepted") and eligibility["eligible"]:
+        if ranking_enabled and selection_eligible and eligibility["eligible"]:
             ai_adjustment = max(-safe_max, min(safe_max, raw_adjustment))
             if abs(ai_adjustment) > 0.0001:
                 scored_count += 1
@@ -1712,6 +2445,287 @@ def apply_ai_moment_scoring(
     }
 
 
+def apply_multi_signal_ai_scoring(
+    evaluations: list[dict],
+    *,
+    enabled: bool = False,
+    score_key: str = "quality_score",
+    max_positive_adjustment: float = MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT,
+    max_negative_adjustment: float = MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT,
+) -> dict:
+    """Blend all mature AI and learning signals into one final selection score."""
+    positive_cap = max(0.0, _safe_float(max_positive_adjustment, 0.0) or 0.0)
+    negative_cap = max(0.0, _safe_float(max_negative_adjustment, 0.0) or 0.0)
+    ranking_enabled = bool(enabled and (positive_cap > 0 or negative_cap > 0))
+    scored_count = 0
+    signal_counts = {
+        "learned": 0,
+        "vision": 0,
+        "text_ai": 0,
+        "voice": 0,
+        "category": 0,
+        "diversity": 0,
+        "audio_scene": 0,
+        "ai_vision_agreement": 0,
+        "game_context": 0,
+    }
+
+    for evaluation in evaluations or []:
+        base_score = _safe_float(evaluation.get(score_key, evaluation.get("quality_score")), 0.0) or 0.0
+        selection_eligible = bool(
+            evaluation.get("accepted") or evaluation.get("reject_reason") == "low_transcript_quality"
+        )
+        game_context_nudge = _source_game_context_nudge(evaluation)
+        signals = _multi_signal_components(evaluation, game_context_nudge=game_context_nudge)
+        contributions = {
+            "learned": 0.050 * signals["learned"],
+            "vision": 0.035 * signals["vision"],
+            "text_ai": 0.030 * signals["text_ai"],
+            "voice": 0.022 * signals["voice"],
+            "category": 0.018 * signals["category"],
+            "diversity": 0.008 * signals["diversity"],
+            "audio_scene": 0.008 * signals["audio_scene"],
+            "ai_vision_agreement": 0.010 * signals["ai_vision_agreement"],
+            "game_context": GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT * signals["game_context"],
+        }
+        game_context_nudge["adjustment"] = round(contributions["game_context"], 4)
+        raw_adjustment = sum(contributions.values())
+        blocked_positive_reason = _multi_signal_positive_block_reason(evaluation)
+        if blocked_positive_reason and raw_adjustment > 0:
+            raw_adjustment = 0.0
+        capped_adjustment = max(-negative_cap, min(positive_cap, raw_adjustment))
+        active_signal_count = 0
+        for key, value in signals.items():
+            if abs(value) > 0.0001:
+                signal_counts[key] = signal_counts.get(key, 0) + 1
+                active_signal_count += 1
+        adjustment = capped_adjustment if ranking_enabled and selection_eligible else 0.0
+        if abs(adjustment) > 0.0001:
+            scored_count += 1
+        final_score = max(0.0, min(1.0, base_score + adjustment))
+        scoring = {
+            "schema_version": MULTI_SIGNAL_AI_SELECTION_SCHEMA_VERSION,
+            "mode": "multi_signal_ai_blend",
+            "ranking_enabled": ranking_enabled,
+            "selection_impact": "capped_multi_signal_adjustment" if ranking_enabled else "none",
+            "score_source": score_key,
+            "base_score": round(base_score, 4),
+            "signals": {key: round(value, 4) for key, value in signals.items()},
+            "contributions": {key: round(value, 4) for key, value in contributions.items()},
+            "game_context_nudge": copy.deepcopy(game_context_nudge),
+            "active_signal_count": active_signal_count,
+            "max_positive_adjustment": round(positive_cap, 4),
+            "max_negative_adjustment": round(negative_cap, 4),
+            "raw_adjustment": round(raw_adjustment, 4),
+            "multi_signal_adjustment": round(adjustment, 4),
+            "blocked_positive_reason": blocked_positive_reason,
+            "multi_signal_ai_quality_score": round(final_score, 4),
+            "selected_by_baseline": False,
+            "selected_by_multi_signal": False,
+            "baseline_rank": None,
+            "multi_signal_rank": None,
+            "rank_delta": None,
+            "selection_delta": "",
+        }
+        evaluation["multi_signal_ai_quality_score"] = final_score
+        evaluation["multi_signal_ai_scoring"] = scoring
+        moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+        if isinstance(moment, dict):
+            moment["multi_signal_ai_quality_score"] = round(final_score, 4)
+            moment["multi_signal_ai_adjustment"] = round(adjustment, 4)
+            moment["multi_signal_ai_scoring"] = copy.deepcopy(scoring)
+
+    return {
+        "schema_version": MULTI_SIGNAL_AI_SELECTION_SCHEMA_VERSION,
+        "mode": "multi_signal_ai_blend",
+        "ranking_enabled": ranking_enabled,
+        "selection_impact": "capped_multi_signal_adjustment" if ranking_enabled else "none",
+        "score_source": score_key,
+        "selection_score_source": "multi_signal_ai_quality_score",
+        "max_positive_adjustment": round(positive_cap, 4),
+        "max_negative_adjustment": round(negative_cap, 4),
+        "game_context_max_adjustment": round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+        "has_multi_signal_scores": scored_count > 0,
+        "scored_candidate_count": scored_count,
+        "signal_counts": signal_counts,
+    }
+
+
+def build_multi_signal_ai_ranking_report(
+    evaluations: list[dict],
+    baseline_selected: list[dict],
+    selected: list[dict],
+    *,
+    enabled: bool = False,
+    max_count: int = 0,
+    min_gap: int = 12,
+    baseline_score_key: str = "quality_score",
+    multi_signal_score_key: str = "multi_signal_ai_quality_score",
+    max_positive_adjustment: float = MULTI_SIGNAL_AI_MAX_POSITIVE_ADJUSTMENT,
+    max_negative_adjustment: float = MULTI_SIGNAL_AI_MAX_NEGATIVE_ADJUSTMENT,
+) -> dict:
+    """Report actual combined AI/learning ranking impact."""
+    if not all("multi_signal_ai_scoring" in evaluation for evaluation in evaluations or []):
+        prepared = apply_multi_signal_ai_scoring(
+            evaluations,
+            enabled=enabled,
+            score_key=baseline_score_key,
+            max_positive_adjustment=max_positive_adjustment,
+            max_negative_adjustment=max_negative_adjustment,
+        )
+    else:
+        rows = [e.get("multi_signal_ai_scoring") or {} for e in evaluations or []]
+        prepared = {
+            "ranking_enabled": any(bool(row.get("ranking_enabled")) for row in rows),
+            "selection_impact": "capped_multi_signal_adjustment"
+            if any(bool(row.get("ranking_enabled")) for row in rows)
+            else "none",
+            "max_positive_adjustment": round(max(0.0, _safe_float(max_positive_adjustment, 0.0) or 0.0), 4),
+            "max_negative_adjustment": round(max(0.0, _safe_float(max_negative_adjustment, 0.0) or 0.0), 4),
+            "game_context_max_adjustment": round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+            "has_multi_signal_scores": any(abs(_safe_float(row.get("multi_signal_adjustment"), 0.0) or 0.0) > 0 for row in rows),
+            "scored_candidate_count": sum(
+                1 for row in rows if abs(_safe_float(row.get("multi_signal_adjustment"), 0.0) or 0.0) > 0
+            ),
+            "signal_counts": {},
+        }
+
+    accepted = [e for e in evaluations or [] if e.get("accepted")]
+    target_count = max(0, int(max_count or len(selected) or len(baseline_selected) or len(accepted)))
+    baseline_order = sorted(
+        accepted,
+        key=lambda e: (
+            _safe_float(e.get(baseline_score_key, e.get("quality_score", 0.0)), 0.0) or 0.0,
+            _safe_float(e.get("quality_score", 0.0), 0.0) or 0.0,
+        ),
+        reverse=True,
+    )
+    multi_order = sorted(
+        accepted,
+        key=lambda e: (
+            _safe_float(e.get(multi_signal_score_key, e.get("quality_score", 0.0)), 0.0) or 0.0,
+            _safe_float(e.get(baseline_score_key, e.get("quality_score", 0.0)), 0.0) or 0.0,
+            _safe_float(e.get("quality_score", 0.0), 0.0) or 0.0,
+        ),
+        reverse=True,
+    )
+    baseline_rank_by_id = {id(e): idx for idx, e in enumerate(baseline_order, 1)}
+    multi_rank_by_id = {id(e): idx for idx, e in enumerate(multi_order, 1)}
+    baseline_selected = baseline_selected or _select_for_report(baseline_order, target_count, min_gap)
+    selected = selected or baseline_selected
+    baseline_ids = {id(e) for e in baseline_selected}
+    selected_ids = {id(e) for e in selected}
+
+    selection_delta_counts: dict[str, int] = {}
+    top_changes = []
+    for evaluation in evaluations or []:
+        scoring = evaluation.get("multi_signal_ai_scoring") or {}
+        baseline_rank = baseline_rank_by_id.get(id(evaluation))
+        multi_rank = multi_rank_by_id.get(id(evaluation))
+        rank_delta = None
+        if baseline_rank is not None and multi_rank is not None:
+            rank_delta = int(baseline_rank) - int(multi_rank)
+        baseline = id(evaluation) in baseline_ids
+        chosen = id(evaluation) in selected_ids
+        if baseline and chosen:
+            selection_delta = "kept"
+        elif baseline and not chosen:
+            selection_delta = "dropped_by_multi_signal_ai"
+        elif not baseline and chosen:
+            selection_delta = "added_by_multi_signal_ai"
+        elif rank_delta:
+            selection_delta = "rank_changed"
+        else:
+            selection_delta = ""
+        scoring.update(
+            {
+                "baseline_rank": baseline_rank,
+                "multi_signal_rank": multi_rank,
+                "rank_delta": rank_delta,
+                "selected_by_baseline": baseline,
+                "selected_by_multi_signal": chosen,
+                "selection_delta": selection_delta,
+            }
+        )
+        evaluation["multi_signal_ai_scoring"] = scoring
+        if isinstance(evaluation.get("moment"), dict):
+            evaluation["moment"]["multi_signal_ai_scoring"] = copy.deepcopy(scoring)
+        if selection_delta:
+            selection_delta_counts[selection_delta] = selection_delta_counts.get(selection_delta, 0) + 1
+        if evaluation.get("accepted") and (rank_delta or selection_delta in {"added_by_multi_signal_ai", "dropped_by_multi_signal_ai"}):
+            moment = evaluation.get("selection_moment") or evaluation.get("moment", {})
+            top_changes.append(
+                {
+                    "candidate_rank": evaluation.get("candidate", {}).get("candidate_rank"),
+                    "candidate_kind": evaluation.get("candidate", {}).get("candidate_kind", ""),
+                    "start": moment.get("start"),
+                    "end": moment.get("end"),
+                    "base_score": scoring.get("base_score"),
+                    "multi_signal_ai_quality_score": scoring.get("multi_signal_ai_quality_score"),
+                    "multi_signal_adjustment": scoring.get("multi_signal_adjustment"),
+                    "signals": scoring.get("signals"),
+                    "contributions": scoring.get("contributions"),
+                    "game_context_nudge": scoring.get("game_context_nudge"),
+                    "baseline_rank": baseline_rank,
+                    "multi_signal_rank": multi_rank,
+                    "rank_delta": rank_delta,
+                    "selection_delta": selection_delta,
+                    "transcript_preview": _preview_text(moment.get("transcript", "")),
+                }
+            )
+
+    top_changes.sort(
+        key=lambda row: (
+            row.get("selection_delta") in {"added_by_multi_signal_ai", "dropped_by_multi_signal_ai"},
+            abs(int(row.get("rank_delta") or 0)),
+            abs(float(row.get("multi_signal_adjustment") or 0.0)),
+        ),
+        reverse=True,
+    )
+    usable_score = bool(prepared.get("ranking_enabled") and prepared.get("has_multi_signal_scores"))
+    return {
+        "schema_version": MULTI_SIGNAL_AI_SELECTION_SCHEMA_VERSION,
+        "mode": "multi_signal_ai_blend",
+        "ranking_enabled": bool(prepared.get("ranking_enabled")),
+        "selection_impact": "capped_multi_signal_adjustment" if prepared.get("ranking_enabled") else "none",
+        "output_changed": baseline_ids != selected_ids,
+        "selection_score_source": multi_signal_score_key if usable_score else baseline_score_key,
+        "base_score_source": baseline_score_key,
+        "max_positive_adjustment": prepared.get(
+            "max_positive_adjustment",
+            round(max(0.0, _safe_float(max_positive_adjustment, 0.0) or 0.0), 4),
+        ),
+        "max_negative_adjustment": prepared.get(
+            "max_negative_adjustment",
+            round(max(0.0, _safe_float(max_negative_adjustment, 0.0) or 0.0), 4),
+        ),
+        "game_context_max_adjustment": prepared.get(
+            "game_context_max_adjustment",
+            round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+        ),
+        "has_multi_signal_scores": bool(prepared.get("has_multi_signal_scores")),
+        "scored_candidate_count": int(prepared.get("scored_candidate_count") or 0),
+        "has_game_context_scores": any(
+            abs(_safe_float((e.get("multi_signal_ai_scoring") or {}).get("game_context_nudge", {}).get("adjustment"), 0.0) or 0.0) > 0
+            for e in evaluations or []
+        ),
+        "game_context_scored_candidate_count": sum(
+            1
+            for e in evaluations or []
+            if abs(_safe_float((e.get("multi_signal_ai_scoring") or {}).get("game_context_nudge", {}).get("adjustment"), 0.0) or 0.0) > 0
+        ),
+        "signal_counts": prepared.get("signal_counts") or {},
+        "candidate_count": len(evaluations or []),
+        "accepted_count": len(accepted),
+        "baseline_selected_count": len(baseline_selected),
+        "selected_count": len(selected),
+        "selection_delta_counts": selection_delta_counts,
+        "baseline_selected": [_multi_signal_ai_selection_summary(e) for e in baseline_selected],
+        "selected": [_multi_signal_ai_selection_summary(e) for e in selected],
+        "top_changes": top_changes[:10],
+    }
+
+
 def build_learning_status(
     personalization: dict | None,
     *,
@@ -1730,6 +2744,36 @@ def build_learning_status(
         "favorite_signals": int(profile.get("favorite_count") or 0),
         "learned_cap": round(cap, 4),
         "learned_cap_label": f"+/-{cap:.2f}",
+    }
+
+
+def build_learning_prompt_context(personalization: dict | None, *, term_limit: int = 8) -> dict:
+    """Return a compact, non-raw feedback summary safe for local AI prompts."""
+    profile = _build_shadow_profile(personalization or {})
+
+    def top_terms(values: dict) -> list[str]:
+        if not isinstance(values, dict):
+            return []
+        ordered = sorted(values.items(), key=lambda item: float(item[1] or 0.0), reverse=True)
+        return [str(term)[:48] for term, weight in ordered[:term_limit] if term and float(weight or 0.0) > 0]
+
+    positive_terms = top_terms(profile.get("positive_terms", {}))
+    negative_terms = top_terms(profile.get("negative_terms", {}))
+    enabled = bool(profile.get("signal_count") and (positive_terms or negative_terms))
+    guidance = []
+    if positive_terms:
+        guidance.append(f"prefer moments resembling: {', '.join(positive_terms[:5])}")
+    if negative_terms:
+        guidance.append(f"avoid moments resembling: {', '.join(negative_terms[:5])}")
+    return {
+        "schema_version": 1,
+        "enabled": enabled,
+        "positive_feedback_count": int(profile.get("positive_feedback_count") or 0),
+        "negative_feedback_count": int(profile.get("negative_feedback_count") or 0),
+        "favorite_count": int(profile.get("favorite_count") or 0),
+        "positive_terms": positive_terms,
+        "negative_terms": negative_terms,
+        "guidance": "; ".join(guidance),
     }
 
 
@@ -2562,7 +3606,10 @@ def write_debug_report(
     voice_profile_ranking: dict | None = None,
     moment_category_ranking: dict | None = None,
     ai_moment_ranking: dict | None = None,
+    multimodal_ranking: dict | None = None,
+    multi_signal_ai_ranking: dict | None = None,
     visual_diagnostics: dict | None = None,
+    multimodal_analysis: dict | None = None,
     ai_moment_classification: dict | None = None,
     ai_moment_classification_shadow: dict | None = None,
     timing: dict | None = None,
@@ -2581,6 +3628,8 @@ def write_debug_report(
         voice_scoring = evaluation.get("voice_scoring", {})
         category_scoring = evaluation.get("moment_category_scoring", {})
         ai_scoring = evaluation.get("ai_moment_scoring", {})
+        multimodal_scoring = evaluation.get("multimodal_scoring", {})
+        multi_signal_scoring = evaluation.get("multi_signal_ai_scoring", {})
         music_lyrics_guard = (
             evaluation.get("music_lyrics_guard")
             or selection_moment.get("music_lyrics_guard")
@@ -2596,6 +3645,12 @@ def write_debug_report(
             evaluation.get("visual_diagnostics")
             or selection_moment.get("visual_diagnostics")
             or candidate.get("visual_diagnostics")
+            or {}
+        )
+        candidate_multimodal = (
+            evaluation.get("multimodal_analysis")
+            or selection_moment.get("multimodal_analysis")
+            or candidate.get("multimodal_analysis")
             or {}
         )
         base_quality = round(_safe_float(evaluation.get("quality_score"), 0.0) or 0.0, 4)
@@ -2624,6 +3679,8 @@ def write_debug_report(
                 "selection_quality_score": selection_quality,
                 "selection_rank_score": evaluation.get("selection_rank_score"),
                 "selection_score_source": evaluation.get("selection_score_source", "quality_score"),
+                "selection_tier": evaluation.get("selection_tier") or selection_moment.get("selection_tier"),
+                "selection_reason": evaluation.get("selection_reason") or selection_moment.get("selection_reason"),
                 "learned_adjustment": shadow.get("learned_adjustment"),
                 "learned_score": learned_score,
                 "learned_quality_score": learned_score,
@@ -2645,6 +3702,23 @@ def write_debug_report(
                 "ai_rank_delta": ai_scoring.get("rank_delta"),
                 "ai_scoring_eligible": ai_scoring.get("ai_scoring_eligible"),
                 "ai_ineligible_reason": ai_scoring.get("ai_ineligible_reason"),
+                "multimodal_quality_score": multimodal_scoring.get("multimodal_quality_score"),
+                "multimodal_ranking_enabled": multimodal_scoring.get("ranking_enabled"),
+                "multimodal_adjustment": multimodal_scoring.get("multimodal_adjustment"),
+                "multimodal_selection_delta": multimodal_scoring.get("selection_delta", ""),
+                "multimodal_rank_delta": multimodal_scoring.get("rank_delta"),
+                "multimodal_scoring_eligible": multimodal_scoring.get("scoring_eligible"),
+                "multimodal_ineligible_reason": multimodal_scoring.get("ineligible_reason"),
+                "multi_signal_ai_quality_score": multi_signal_scoring.get("multi_signal_ai_quality_score"),
+                "multi_signal_ai_ranking_enabled": multi_signal_scoring.get("ranking_enabled"),
+                "multi_signal_ai_adjustment": multi_signal_scoring.get("multi_signal_adjustment"),
+                "multi_signal_ai_raw_adjustment": multi_signal_scoring.get("raw_adjustment"),
+                "multi_signal_ai_selection_delta": multi_signal_scoring.get("selection_delta", ""),
+                "multi_signal_ai_rank_delta": multi_signal_scoring.get("rank_delta"),
+                "multi_signal_ai_signals": multi_signal_scoring.get("signals"),
+                "multi_signal_ai_contributions": multi_signal_scoring.get("contributions"),
+                "game_context_nudge": multi_signal_scoring.get("game_context_nudge"),
+                "game_context_adjustment": (multi_signal_scoring.get("game_context_nudge") or {}).get("adjustment"),
                 "rank_delta": shadow.get("rank_delta"),
                 "selection_delta": shadow.get("selection_delta", ""),
                 "voice_adjustment": voice_shadow.get("voice_adjustment"),
@@ -2669,6 +3743,16 @@ def write_debug_report(
                 "primary_category": selection_primary_category,
                 "ai_moment_classification": ai_classification,
                 "visual_diagnostics": candidate_visual,
+                "multimodal_analysis": candidate_multimodal,
+                "truth_summary": (
+                    selection_moment.get("truth_summary")
+                    or evaluation.get("truth_summary")
+                    or candidate.get("truth_summary")
+                    or {}
+                ),
+                "near_quality_fallback": evaluation.get("near_quality_fallback")
+                or selection_moment.get("near_quality_fallback")
+                or {},
                 "commentary_guard": evaluation.get("commentary_guard") or selection_moment.get("commentary_guard"),
                 "commentary_guard_selection": evaluation.get("commentary_guard_selection")
                 or (selection_moment.get("commentary_guard") or {}).get("selection"),
@@ -2681,6 +3765,13 @@ def write_debug_report(
                     "music_lyrics_penalty",
                     selection_moment.get("music_lyrics_penalty"),
                 ),
+                "speech_source": evaluation.get("speech_source") or selection_moment.get("speech_source"),
+                "speech_source_selection": evaluation.get("speech_source_selection")
+                or (selection_moment.get("speech_source") or {}).get("selection"),
+                "speech_source_penalty": evaluation.get(
+                    "speech_source_penalty",
+                    selection_moment.get("speech_source_penalty"),
+                ),
                 "stream_retry": evaluation.get("stream_retry") or selection_moment.get("stream_retry"),
                 "voice_profile": evaluation.get("voice_profile") or selection_moment.get("voice_profile"),
                 "selection": _moment_summary(selection_moment, selection_quality),
@@ -2692,6 +3783,8 @@ def write_debug_report(
                 "shadow_scoring": shadow,
                 "moment_category_scoring": category_scoring,
                 "ai_moment_scoring": ai_scoring,
+                "multimodal_scoring": multimodal_scoring,
+                "multi_signal_ai_scoring": multi_signal_scoring,
                 "voice_scoring": voice_scoring,
                 "voice_profile_shadow": voice_shadow,
             }
@@ -2711,7 +3804,10 @@ def write_debug_report(
         "voice_profile_ranking": voice_profile_ranking or {},
         "moment_category_ranking": moment_category_ranking or {},
         "ai_moment_ranking": ai_moment_ranking or {},
+        "multimodal_ranking": multimodal_ranking or {},
+        "multi_signal_ai_ranking": multi_signal_ai_ranking or {},
         "visual_diagnostics": visual_diagnostics or {},
+        "multimodal_analysis": multimodal_analysis or {},
         "ai_moment_classification": ai_moment_classification or {},
         "ai_moment_classification_shadow": ai_moment_classification_shadow or {},
         "timing": timing or {},
@@ -2737,6 +3833,350 @@ def _select_for_report(ordered_evaluations: list[dict], max_count: int, min_gap:
         if len(selected) >= max_count:
             break
     return selected
+
+
+def _multi_signal_components(evaluation: dict, *, game_context_nudge: dict | None = None) -> dict[str, float]:
+    learned = _scored_adjustment_signal(
+        (evaluation.get("shadow_scoring") or {}).get("learned_adjustment"),
+        (evaluation.get("shadow_scoring") or {}).get("learned_selection_cap", LEARNED_SELECTION_MAX_ADJUSTMENT),
+    )
+    vision = _scored_adjustment_signal(
+        (evaluation.get("multimodal_scoring") or {}).get("multimodal_adjustment"),
+        (evaluation.get("multimodal_scoring") or {}).get(
+            "multimodal_selection_max_adjustment",
+            0.020,
+        ),
+    )
+    text_ai = _multi_signal_text_ai(evaluation)
+    voice = _multi_signal_voice(evaluation)
+    category = _multi_signal_category(evaluation)
+    diversity = _scored_adjustment_signal(
+        (evaluation.get("moment_category_scoring") or {}).get("category_diversity_adjustment"),
+        (evaluation.get("moment_category_scoring") or {}).get(
+            "category_diversity_cap",
+            MOMENT_CATEGORY_DIVERSITY_MAX_ADJUSTMENT,
+        ),
+    )
+    audio_scene = _audio_scene_confirmation_signal(evaluation)
+    agreement = _ai_vision_agreement_signal(evaluation)
+    game_context = _safe_float((game_context_nudge or _source_game_context_nudge(evaluation)).get("signal"), 0.0) or 0.0
+    return {
+        "learned": learned,
+        "vision": vision,
+        "text_ai": text_ai,
+        "voice": voice,
+        "category": category,
+        "diversity": diversity,
+        "audio_scene": audio_scene,
+        "ai_vision_agreement": agreement,
+        "game_context": game_context,
+    }
+
+
+def _scored_adjustment_signal(adjustment, cap) -> float:
+    value = _safe_float(adjustment, 0.0) or 0.0
+    safe_cap = abs(_safe_float(cap, 0.0) or 0.0)
+    if safe_cap <= 0 or not math.isfinite(value):
+        return 0.0
+    return max(-1.0, min(1.0, value / safe_cap))
+
+
+def _multi_signal_positive_block_reason(evaluation: dict) -> str:
+    moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+    ai = _ai_classification_for_scoring(evaluation)
+    if _ai_has_game_narration_label(ai):
+        return "ai_game_narration"
+    speech_source = (
+        evaluation.get("speech_source")
+        if isinstance(evaluation.get("speech_source"), dict)
+        else moment.get("speech_source")
+        if isinstance(moment.get("speech_source"), dict)
+        else {}
+    )
+    speech_block = speech_source_positive_boost_block_reason(speech_source)
+    if speech_block:
+        return speech_block
+    music_guard = (
+        evaluation.get("music_lyrics_guard")
+        if isinstance(evaluation.get("music_lyrics_guard"), dict)
+        else moment.get("music_lyrics_guard")
+        if isinstance(moment.get("music_lyrics_guard"), dict)
+        else {}
+    )
+    if music_guard.get("reject_candidate"):
+        return "music_lyrics_guard_rejected"
+    guard = (
+        evaluation.get("commentary_guard")
+        if isinstance(evaluation.get("commentary_guard"), dict)
+        else moment.get("commentary_guard")
+        if isinstance(moment.get("commentary_guard"), dict)
+        else {}
+    )
+    if not guard:
+        return ""
+    summary = guard.get("summary") if isinstance(guard.get("summary"), dict) else {}
+    if not summary:
+        return ""
+    selection = guard.get("selection") if isinstance(guard.get("selection"), dict) else {}
+    policy = normalize_commentary_subtitle_policy(guard.get("policy") or selection.get("policy"))
+    if policy == "creator":
+        primary = str(summary.get("primary_label") or "")
+        if primary in {"", "none"}:
+            return ""
+        confidence = _score01(summary.get("confidence", 0.0))
+        game_ratio = _score01(summary.get("game_narration_word_ratio", 0.0))
+        creator_ratio = _score01(summary.get("creator_word_ratio", 0.0))
+        penalty = _safe_float(guard.get("selection_penalty", selection.get("selection_penalty", 0.0)), 0.0) or 0.0
+        if primary == "game_narration" and confidence >= 0.52 and game_ratio >= 0.45:
+            return "commentary_guard_game_narration"
+        if penalty >= 0.025:
+            return "commentary_guard_penalty"
+        if primary != "creator_commentary" and creator_ratio < 0.25:
+            return "commentary_guard_weak_creator_evidence"
+    return ""
+
+
+def _multi_signal_text_ai(evaluation: dict) -> float:
+    ai = _ai_classification_for_scoring(evaluation)
+    eligibility = _ai_moment_scoring_eligibility(ai, evaluation, confidence_floor=0.70)
+    if not eligibility.get("eligible"):
+        return 0.0
+    if _ai_has_game_narration_label(ai):
+        confidence = _safe_float(ai.get("ai_confidence"), _safe_float(ai.get("confidence"), 0.0)) or 0.0
+        return max(-1.0, min(-0.35, -0.55 * confidence))
+    return _ai_moment_signal(ai)
+
+
+def _multi_signal_voice(evaluation: dict) -> float:
+    scoring = evaluation.get("voice_scoring") if isinstance(evaluation.get("voice_scoring"), dict) else {}
+    if not scoring.get("ranking_enabled") or scoring.get("voice_reason") != "scored":
+        return 0.0
+    confidence = _safe_float(scoring.get("voice_confidence"), None)
+    if confidence is None:
+        return 0.0
+    return max(-1.0, min(1.0, (confidence - 0.5) * 2.0))
+
+
+def _multi_signal_category(evaluation: dict) -> float:
+    scoring = evaluation.get("moment_category_scoring") if isinstance(evaluation.get("moment_category_scoring"), dict) else {}
+    if scoring.get("ranking_enabled") and scoring.get("category_signal") is not None:
+        return max(-1.0, min(1.0, _safe_float(scoring.get("category_signal"), 0.0) or 0.0))
+    return _moment_category_signal(_categories_for_scoring(evaluation))
+
+
+def _source_game_context_nudge(evaluation: dict) -> dict:
+    """Small verified game-context nudge for mature multi-signal selection."""
+    moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+    context = evaluation.get("game_context") if isinstance(evaluation.get("game_context"), dict) else {}
+    if not context and isinstance(moment.get("game_context"), dict):
+        context = moment["game_context"]
+    base = {
+        "schema_version": GAME_CONTEXT_NUDGE_SCHEMA_VERSION,
+        "enabled": bool(
+            evaluation.get("accepted") or evaluation.get("reject_reason") == "low_transcript_quality"
+        ),
+        "status": "not_started",
+        "selection_impact": "capped_game_context_adjustment",
+        "max_adjustment": round(GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT, 4),
+        "verified_context": False,
+        "game_qid": str(context.get("qid") or "")[:40] if isinstance(context, dict) else "",
+        "game_label": str(context.get("label") or "")[:140] if isinstance(context, dict) else "",
+        "primary_category": "",
+        "context_families": [],
+        "cue_hits": [],
+        "signal": 0.0,
+        "adjustment": 0.0,
+        "reason": "",
+    }
+    if not evaluation.get("accepted") and evaluation.get("reject_reason") != "low_transcript_quality":
+        base["status"] = "candidate_not_accepted"
+        base["reason"] = "Only accepted or near-quality candidates receive game-context selection nudges."
+        return base
+    if not context or not context.get("qid") or context.get("status") not in {"ok", "cache_hit"}:
+        base["status"] = "unverified_game_context"
+        base["reason"] = "No verified game identity/context was available."
+        return base
+
+    categories = _categories_for_scoring(evaluation)
+    primary = str(categories.get("primary") or moment.get("primary_category") or evaluation.get("primary_category") or "").strip()
+    base["primary_category"] = primary
+    base["verified_context"] = True
+    transcript = " ".join(
+        str(part or "")
+        for part in (
+            evaluation.get("transcript"),
+            moment.get("transcript"),
+            (evaluation.get("ai_moment_classification") or {}).get("primary_category")
+            if isinstance(evaluation.get("ai_moment_classification"), dict)
+            else "",
+        )
+    ).lower()
+    visual_blob = _game_context_visual_blob(evaluation, moment)
+    game_blob = _game_context_blob(context)
+
+    signal = 0.0
+    horror_context = _contains_any(game_blob, ("horror", "survival horror", "psychological", "thriller", "supernatural", "dark fantasy"))
+    action_context = _contains_any(game_blob, ("action", "shooter", "combat", "survival", "stealth", "adventure"))
+    story_context = _contains_any(game_blob, ("story", "narrative", "adventure", "role-playing", "rpg", "mystery"))
+    systems_context = _contains_any(game_blob, ("simulation", "strategy", "puzzle", "management", "sandbox", "construction"))
+    families = []
+    cue_hits = []
+
+    def add(amount: float, family: str, cue: str):
+        nonlocal signal
+        signal += amount
+        if family and family not in families:
+            families.append(family)
+        if cue:
+            cue_hits.append(cue)
+
+    if horror_context:
+        if "horror_survival" not in families:
+            families.append("horror_survival")
+        if primary in {"high_energy", "death_or_failure", "atmosphere_or_visual"}:
+            add(0.45, "horror_survival", f"{primary}_fits_horror")
+        elif primary == "lore_or_story":
+            add(0.25, "horror_survival", "lore_story_can_work_in_horror")
+        if _contains_any(transcript, ("behind me", "run", "hide", "scary", "please", "oh my god", "what was that")):
+            add(0.25, "horror_survival", "panic_or_threat_dialogue")
+        if _contains_any(visual_blob, ("dark", "shadow", "chase", "enemy", "monster", "threat", "flashlight")):
+            add(0.20, "horror_survival", "dark_threat_visuals")
+
+    if action_context:
+        if "action_shooter" not in families:
+            families.append("action_shooter")
+        if primary in {"high_energy", "death_or_failure"}:
+            add(0.35, "action_shooter", f"{primary}_fits_action")
+        if _contains_any(transcript + " " + visual_blob, ("fight", "combat", "enemy", "attack", "shot", "weapon", "kill", "boss")):
+            add(0.22, "action_shooter", "combat_or_enemy_pressure")
+
+    if story_context:
+        if "story_heavy" not in families:
+            families.append("story_heavy")
+        if primary == "lore_or_story":
+            add(0.35, "story_heavy", "lore_story_primary")
+        elif primary in {"tutorial_or_explainer", "commentary_or_review"}:
+            add(0.12, "story_heavy", "creator_context_can_explain_story")
+        if _contains_any(transcript, ("story", "lore", "chapter", "character", "why", "because", "remember")):
+            add(0.15, "story_heavy", "story_supporting_commentary")
+
+    if systems_context:
+        if "systems_or_tutorial" not in families:
+            families.append("systems_or_tutorial")
+        if primary == "tutorial_or_explainer":
+            add(0.38, "systems_or_tutorial", "tutorial_primary")
+        if _contains_any(transcript, ("how to", "you need", "build", "craft", "upgrade", "strategy", "go here")):
+            add(0.20, "systems_or_tutorial", "instructional_commentary")
+
+    if primary == "tutorial_or_explainer" and _contains_any(
+        transcript,
+        ("how to", "you need", "go here", "this is how", "the trick is", "what you do", "upgrade", "equip", "use this"),
+    ):
+        add(0.18, "instructional_commentary", "clear_tutorial_language")
+
+    if primary == "low_value" and signal < 0.25:
+        add(-0.35, "quality_guard", "low_value_without_matching_game_context")
+
+    clamped = max(-1.0, min(1.0, signal))
+    base["status"] = "scored" if abs(clamped) > 0.0001 else "no_matching_game_cues"
+    base["context_families"] = families[:6]
+    base["cue_hits"] = cue_hits[:10]
+    base["signal"] = round(clamped, 4)
+    if base["status"] == "scored":
+        base["reason"] = "Verified game context slightly adjusted a close-ranking candidate."
+    else:
+        base["reason"] = "Verified game context was available, but this candidate did not match useful game-aware cues."
+    return base
+
+
+def _game_context_blob(context: dict) -> str:
+    pieces: list[str] = []
+    for key in ("label", "description"):
+        pieces.append(str(context.get(key) or ""))
+    aliases = context.get("aliases") if isinstance(context.get("aliases"), list) else []
+    pieces.extend(str(item or "") for item in aliases[:8])
+    facts = context.get("facts") if isinstance(context.get("facts"), dict) else {}
+    for value in facts.values():
+        if isinstance(value, list):
+            pieces.extend(str(item or "") for item in value[:12])
+        else:
+            pieces.append(str(value or ""))
+    return " ".join(pieces).lower()
+
+
+def _game_context_visual_blob(evaluation: dict, moment: dict) -> str:
+    pieces: list[str] = []
+    for source in (evaluation, moment):
+        multimodal = source.get("multimodal_analysis") if isinstance(source.get("multimodal_analysis"), dict) else {}
+        for key in ("metadata_keywords", "visual_labels", "summary", "primary_visual_label"):
+            value = multimodal.get(key)
+            if isinstance(value, list):
+                pieces.extend(str(item or "") for item in value[:12])
+            else:
+                pieces.append(str(value or ""))
+        visual = source.get("visual_diagnostics") if isinstance(source.get("visual_diagnostics"), dict) else {}
+        for key in ("visual_labels", "metadata_keywords", "summary"):
+            value = visual.get(key)
+            if isinstance(value, list):
+                pieces.extend(str(item or "") for item in value[:12])
+            else:
+                pieces.append(str(value or ""))
+    return " ".join(pieces).lower()
+
+
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    haystack = str(text or "").lower()
+    return any(needle in haystack for needle in needles)
+
+
+def _audio_scene_confirmation_signal(evaluation: dict) -> float:
+    candidate = evaluation.get("candidate") if isinstance(evaluation.get("candidate"), dict) else {}
+    moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+    detector_scores = (
+        candidate.get("detector_scores")
+        if isinstance(candidate.get("detector_scores"), dict)
+        else moment.get("detector_scores")
+        if isinstance(moment.get("detector_scores"), dict)
+        else {}
+    )
+    audio = _safe_float(detector_scores.get("audio", candidate.get("audio_score", moment.get("audio_score"))), None)
+    variance = _safe_float(detector_scores.get("variance", candidate.get("variance_score", moment.get("variance_score"))), None)
+    scene = _safe_float(detector_scores.get("scene", candidate.get("scene_score", moment.get("scene_score"))), None)
+    weighted = []
+    if audio is not None:
+        weighted.append((audio, 0.45))
+    if variance is not None:
+        weighted.append((variance, 0.25))
+    if scene is not None:
+        weighted.append((scene, 0.30))
+    if not weighted:
+        return 0.0
+    total_weight = sum(weight for _, weight in weighted)
+    if total_weight <= 0:
+        return 0.0
+    score = sum(value * weight for value, weight in weighted) / total_weight
+    return max(-1.0, min(1.0, (score - 0.50) * 2.0))
+
+
+def _ai_vision_agreement_signal(evaluation: dict) -> float:
+    ai = _ai_classification_for_scoring(evaluation)
+    ai_ok = _ai_moment_scoring_eligibility(ai, evaluation, confidence_floor=0.70).get("eligible")
+    vision = evaluation.get("multimodal_scoring") if isinstance(evaluation.get("multimodal_scoring"), dict) else {}
+    vision_ok = bool(vision.get("ranking_enabled") and vision.get("scoring_eligible"))
+    if not ai_ok or not vision_ok:
+        return 0.0
+    ai_primary = str(ai.get("primary_category") or "").strip()
+    visual_primary = str(vision.get("primary_visual_label") or "").strip()
+    high_value = {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual"}
+    if ai_primary == visual_primary and ai_primary in high_value:
+        return 1.0
+    if ai_primary == "low_value" and visual_primary == "low_value":
+        return -1.0
+    if ai_primary in high_value and visual_primary in high_value:
+        return 0.45
+    if (ai_primary == "low_value" and visual_primary in high_value) or (visual_primary == "low_value" and ai_primary in high_value):
+        return -0.35
+    return 0.0
 
 
 def _build_shadow_profile(personalization: dict) -> dict:
@@ -2969,6 +4409,7 @@ def _add_feedback_signal(profile: dict, signal: dict):
         text_parts.append(str(snapshot.get("transcript") or ""))
         text_parts.append(_category_signal_text(snapshot.get("moment_categories")))
         text_parts.append(str(snapshot.get("primary_category") or ""))
+        text_parts.append(_ai_visual_feedback_text(snapshot))
     learning_terms = _learning_terms_from_feedback_container(signal)
     if learning_terms:
         text_parts.append(" ".join(learning_terms))
@@ -3021,6 +4462,33 @@ def _learning_terms_from_feedback_container(container: dict) -> list[str]:
     return terms
 
 
+def _ai_visual_feedback_text(container: dict | None) -> str:
+    """Compact label text used by local feedback learning."""
+    if not isinstance(container, dict):
+        return ""
+    parts: list[str] = []
+    ai = container.get("ai_moment_classification")
+    if isinstance(ai, dict):
+        parts.append(str(ai.get("primary_category") or ""))
+        for key in ("fine_labels", "supporting_labels"):
+            values = ai.get(key)
+            if isinstance(values, list):
+                parts.extend(str(value or "") for value in values[:8])
+    visual = container.get("visual_diagnostics")
+    if isinstance(visual, dict):
+        values = visual.get("labels")
+        if isinstance(values, list):
+            parts.extend(str(value or "") for value in values[:8])
+    multimodal = container.get("multimodal_analysis")
+    if isinstance(multimodal, dict):
+        parts.append(str(multimodal.get("primary_visual_label") or ""))
+        for key in ("visual_labels", "detected_events", "title_hooks", "metadata_keywords"):
+            values = multimodal.get(key)
+            if isinstance(values, list):
+                parts.extend(str(value or "") for value in values[:8])
+    return " ".join(part for part in parts if str(part or "").strip())
+
+
 def _score_shadow_candidate(evaluation: dict, profile: dict, source_id: str, source_stem: str) -> dict:
     base_score = _safe_float(evaluation.get("quality_score"), 0.0) or 0.0
     moment = evaluation.get("selection_moment") or evaluation.get("moment") or {}
@@ -3030,6 +4498,8 @@ def _score_shadow_candidate(evaluation: dict, profile: dict, source_id: str, sou
             str(moment.get("transcript") or ""),
             _category_signal_text(moment.get("moment_categories")),
             str(moment.get("primary_category") or ""),
+            _ai_visual_feedback_text(moment),
+            _ai_visual_feedback_text(evaluation),
         ] if part
     )
     normal = _normal_text(transcript)
@@ -3240,6 +4710,28 @@ def _ai_moment_selection_summary(evaluation: dict) -> dict:
     }
 
 
+def _multi_signal_ai_selection_summary(evaluation: dict) -> dict:
+    moment = evaluation.get("selection_moment") or evaluation.get("moment", {})
+    scoring = evaluation.get("multi_signal_ai_scoring", {})
+    return {
+        "candidate_rank": evaluation.get("candidate", {}).get("candidate_rank"),
+        "candidate_kind": evaluation.get("candidate", {}).get("candidate_kind", ""),
+        "start": moment.get("start"),
+        "end": moment.get("end"),
+        "base_score": scoring.get("base_score"),
+        "multi_signal_ai_quality_score": scoring.get("multi_signal_ai_quality_score"),
+        "multi_signal_adjustment": scoring.get("multi_signal_adjustment"),
+        "signals": scoring.get("signals"),
+        "contributions": scoring.get("contributions"),
+        "baseline_rank": scoring.get("baseline_rank"),
+        "multi_signal_rank": scoring.get("multi_signal_rank"),
+        "rank_delta": scoring.get("rank_delta"),
+        "selection_delta": scoring.get("selection_delta", ""),
+        "primary_category": moment.get("primary_category"),
+        "transcript_preview": _preview_text(moment.get("transcript", "")),
+    }
+
+
 def _preview_text(text: str, limit: int = 120) -> str:
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(text) <= limit:
@@ -3366,7 +4858,7 @@ def _ai_classification_for_scoring(evaluation: dict) -> dict:
 def _ai_moment_scoring_eligibility(ai: dict, evaluation: dict, *, confidence_floor: float) -> dict:
     if not isinstance(ai, dict) or not ai:
         return {"eligible": False, "reason": "missing_ai_classification"}
-    if not evaluation.get("accepted"):
+    if not evaluation.get("accepted") and not evaluation.get("ai_rescue_candidate"):
         return {"eligible": False, "reason": "candidate_not_accepted"}
     if str(ai.get("status") or "") != "ok":
         return {"eligible": False, "reason": "ai_status_not_ok"}
@@ -3416,6 +4908,18 @@ def _ai_moment_signal(ai: dict) -> float:
     if primary == "low_value":
         signal = min(signal, -0.25 * confidence)
     return max(-1.0, min(1.0, signal))
+
+
+def _ai_has_game_narration_label(ai: dict) -> bool:
+    if not isinstance(ai, dict) or str(ai.get("status") or "") != "ok":
+        return False
+    labels = ai.get("fine_labels") if isinstance(ai.get("fine_labels"), list) else []
+    normalized = {
+        str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
+        for label in labels
+    }
+    primary = str(ai.get("primary_category") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return "game_narration" in normalized or primary == "game_narration"
 
 
 def _compact_ai_moment_classification(classification) -> dict:
@@ -3504,6 +5008,9 @@ def _moment_summary(moment: dict | None, quality_score: float | None = None) -> 
         "start": moment.get("start"),
         "end": moment.get("end"),
         "duration": moment.get("duration"),
+        "game_title": moment.get("game_title"),
+        "game_identity": moment.get("game_identity"),
+        "game_context": moment.get("game_context"),
         "quality_score": score,
         "quality_floor": moment.get("quality_floor"),
         "detection_preference": moment.get("detection_preference"),
@@ -3516,6 +5023,9 @@ def _moment_summary(moment: dict | None, quality_score: float | None = None) -> 
         "voice_adjustment": moment.get("voice_adjustment"),
         "voice_profile_quality_score": moment.get("voice_profile_quality_score"),
         "voice_scoring": moment.get("voice_scoring"),
+        "multimodal_adjustment": moment.get("multimodal_adjustment"),
+        "multimodal_quality_score": moment.get("multimodal_quality_score"),
+        "multimodal_scoring": moment.get("multimodal_scoring"),
         "selection_score_source": moment.get("selection_score_source"),
         "word_count": moment.get("word_count"),
         "analysis_word_count": moment.get("analysis_word_count"),
@@ -3528,11 +5038,15 @@ def _moment_summary(moment: dict | None, quality_score: float | None = None) -> 
         "primary_category": moment.get("primary_category"),
         "ai_moment_classification": moment.get("ai_moment_classification"),
         "visual_diagnostics": moment.get("visual_diagnostics"),
+        "multimodal_analysis": moment.get("multimodal_analysis"),
         "commentary_guard": moment.get("commentary_guard"),
         "commentary_guard_selection": (moment.get("commentary_guard") or {}).get("selection"),
         "commentary_guard_selection_penalty": (moment.get("commentary_guard") or {}).get("selection_penalty"),
         "music_lyrics_guard": moment.get("music_lyrics_guard"),
         "music_lyrics_penalty": moment.get("music_lyrics_penalty"),
+        "speech_source": moment.get("speech_source"),
+        "speech_source_selection": (moment.get("speech_source") or {}).get("selection"),
+        "speech_source_penalty": moment.get("speech_source_penalty"),
         "voice_profile": moment.get("voice_profile"),
         "transcript": moment.get("transcript", ""),
         "ranker": moment.get("ranker", {}),

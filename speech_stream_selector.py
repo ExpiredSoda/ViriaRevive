@@ -15,6 +15,10 @@ from pathlib import Path
 
 from audio_streams import get_audio_streams
 from clipper import extract_audio_clip
+from speech_source_classifier import (
+    classify_speech_source,
+    positive_boost_block_reason as speech_source_positive_boost_block_reason,
+)
 from transcriber import transcribe_clips
 
 
@@ -466,16 +470,6 @@ def score_stream_profile(
             selection_score -= 8.0
         if lyric_likelihood >= 0.45 and creator_exception_score < 0.62:
             selection_score -= min(180.0, float(words_total or 0) * 0.78 * lyric_likelihood + 24.0)
-    diagnostic_score = (
-        selection_score
-        + (natural_score * 1.2)
-        + (creator_score * 0.55)
-        - (scripted_score * 0.85)
-        - (game_score * 0.45)
-        - (game_bed_score * 7.0)
-        - (lyric_likelihood * 28.0)
-        + (creator_exception_score * 8.0)
-    )
     confidence = _profile_confidence(
         words_total=words_total,
         voice_hints=voice_hints,
@@ -486,7 +480,7 @@ def score_stream_profile(
         game_bed_score=game_bed_score,
         sample_hits=sample_hits,
     )
-    return {
+    profile = {
         "ordinal": int(ordinal),
         "title": title,
         "words": int(words_total or 0),
@@ -510,10 +504,42 @@ def score_stream_profile(
         "creator_likeness_score": round(float(creator_likeness), 4),
         "mic_creator_preference_bonus": round(float(mic_creator_preference_bonus), 4),
         "selection_score": round(float(selection_score), 4),
-        "diagnostic_score": round(float(diagnostic_score), 4),
+        "diagnostic_score": 0.0,
         "confidence": round(float(confidence), 4),
         "transcript_preview": transcript[:220],
     }
+    speech_source = classify_speech_source(
+        transcript=transcript,
+        stream_profile=profile,
+        subtitle_policy="creator",
+    )
+    creator_probability = float(speech_source.get("creator_probability") or 0.0)
+    game_probability = float(speech_source.get("game_or_npc_probability") or 0.0)
+    music_probability = float(speech_source.get("music_or_lyrics_probability") or 0.0)
+    source_margin = creator_probability - max(game_probability, music_probability)
+    source_selection_adjustment = max(-18.0, min(14.0, source_margin * 18.0))
+    if speech_source_positive_boost_block_reason(speech_source):
+        source_selection_adjustment = min(source_selection_adjustment, -8.0)
+    selection_score += source_selection_adjustment
+    diagnostic_score = (
+        selection_score
+        + (natural_score * 1.2)
+        + (creator_score * 0.55)
+        - (scripted_score * 0.85)
+        - (game_score * 0.45)
+        - (game_bed_score * 7.0)
+        - (lyric_likelihood * 28.0)
+        + (creator_exception_score * 8.0)
+    )
+    profile.update(
+        {
+            "speech_source": speech_source,
+            "speech_source_selection_adjustment": round(float(source_selection_adjustment), 4),
+            "selection_score": round(float(selection_score), 4),
+            "diagnostic_score": round(float(diagnostic_score), 4),
+        }
+    )
+    return profile
 
 
 def choose_stream_from_profiles(
@@ -594,11 +620,29 @@ def should_accept_alternate_stream(
     scripted = float(profile.get("scripted_game_score") or 0.0)
     lyric_likelihood = float(profile.get("lyric_likelihood") or 0.0)
     creator_exception = float(profile.get("creator_exception_score") or 0.0)
+    speech_source = profile.get("speech_source") if isinstance(profile.get("speech_source"), dict) else {}
+    speech_block = speech_source_positive_boost_block_reason(speech_source, policy=policy)
+    creator_probability = float(speech_source.get("creator_probability") or 0.0)
+    game_probability = float(speech_source.get("game_or_npc_probability") or 0.0)
+    music_probability = float(speech_source.get("music_or_lyrics_probability") or 0.0)
 
     if lyric_likelihood >= 0.62 and creator_exception < 0.58:
         return _retry_acceptance(False, "music_lyrics_not_creator_commentary", profile, policy)
     if game_bed_score >= 0.72 and not has_voice_hint:
         return _retry_acceptance(False, "background_bed_suggests_game_audio", profile, policy)
+    if speech_block == "speech_source_music_or_lyrics":
+        return _retry_acceptance(False, "source_confidence_music_or_lyrics", profile, policy)
+    if speech_block == "speech_source_game_or_npc":
+        return _retry_acceptance(False, "source_confidence_game_or_npc", profile, policy)
+    if speech_block == "speech_source_weak_creator_evidence" and not has_voice_hint:
+        return _retry_acceptance(False, "source_confidence_weak_creator", profile, policy)
+    if not has_voice_hint:
+        if creator_probability < 0.58:
+            return _retry_acceptance(False, "alternate_lacks_creator_confidence", profile, policy)
+        if game_probability >= 0.26 and game_probability > creator_probability - 0.34:
+            return _retry_acceptance(False, "alternate_has_game_speech_risk", profile, policy)
+        if music_probability >= 0.34 and music_probability > creator_probability - 0.30:
+            return _retry_acceptance(False, "alternate_has_music_speech_risk", profile, policy)
     if has_game_hint and not has_voice_hint and creator_likeness < 0.62:
         return _retry_acceptance(False, "game_track_not_creator_like", profile, policy)
     if scripted > natural + 1.5 and creator_likeness < 0.58:
@@ -679,6 +723,8 @@ def _retry_acceptance(accepted: bool, reason: str, profile: dict, policy: str) -
         "acoustic_game_bed_score": profile.get("acoustic_game_bed_score", 0.0),
         "lyric_likelihood": profile.get("lyric_likelihood", 0.0),
         "creator_exception_score": profile.get("creator_exception_score", 0.0),
+        "speech_source": profile.get("speech_source"),
+        "speech_source_selection_adjustment": profile.get("speech_source_selection_adjustment", 0.0),
         "voice_title_hints": profile.get("voice_title_hints", []),
         "game_title_hints": profile.get("game_title_hints", []),
     }
@@ -693,6 +739,15 @@ def _selection_reason(best: dict, runner_up: dict | None) -> str:
                 return "mic_creator_signal_over_more_words"
             return "mic_title_hint_over_more_words"
         return "mic_title_hint_and_speech"
+    source = best.get("speech_source") if isinstance(best.get("speech_source"), dict) else {}
+    if (
+        source.get("creator_safe")
+        and float(best.get("speech_source_selection_adjustment") or 0.0) > 0
+        and not best.get("game_title_hints")
+    ):
+        if runner_up and runner_up.get("words", 0) > best.get("words", 0):
+            return "creator_source_confidence_over_more_words"
+        return "creator_source_confidence"
     if best.get("creator_phrase_score", 0.0) > best.get("game_system_phrase_score", 0.0):
         return "creator_phrase_signal"
     if runner_up and best.get("words", 0) > runner_up.get("words", 0):

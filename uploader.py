@@ -22,7 +22,6 @@ _SCOPES = [
 
 # Cache: account_id -> youtube service
 _service_cache: dict = {}
-_FALLBACK_CATEGORIES = [{"id": DEFAULT_VIDEO_CATEGORY_ID, "title": "Gaming"}]
 _NON_ACCOUNT_TOKEN_FILES = {
     "client_secret.json",
     "client_secrets.json",
@@ -32,6 +31,7 @@ _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 YOUTUBE_HTTP_TIMEOUT_SECONDS = 120
 YOUTUBE_UPLOAD_TIMEOUT_SECONDS = 2 * 60 * 60
 YOUTUBE_UPLOAD_MAX_CHUNKS = 2048
+YOUTUBE_UPLOAD_CHUNK_RETRIES = 3
 YOUTUBE_PUBLISH_BUFFER = timedelta(minutes=10)
 
 
@@ -83,9 +83,17 @@ def _build_service(creds):
         import httplib2
         from google_auth_httplib2 import AuthorizedHttp
 
-        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=YOUTUBE_HTTP_TIMEOUT_SECONDS))
+        http_client = httplib2.Http(timeout=YOUTUBE_HTTP_TIMEOUT_SECONDS)
+        # Google resumable uploads use HTTP 308 as "Resume Incomplete".
+        # Newer httplib2 releases treat 308 as a normal redirect and raise
+        # when the upload progress response does not include Location.
+        http_client.redirect_codes = frozenset(
+            code for code in getattr(http_client, "redirect_codes", ()) if code != 308
+        )
+        http = AuthorizedHttp(creds, http=http_client)
         return build("youtube", "v3", http=http)
-    except Exception:
+    except Exception as exc:
+        print(f"[youtube] Patched httplib2 transport unavailable; resumable upload reliability may be reduced: {exc}")
         return build("youtube", "v3", credentials=creds)
 
 
@@ -225,7 +233,7 @@ def add_account() -> dict:
     return {"id": account_id, "title": account_title}
 
 
-def list_accounts() -> list[dict]:
+def list_accounts(validate: bool = False) -> list[dict]:
     """Return all connected accounts (from tokens/ folder)."""
     _ensure_tokens_dir()
     accounts = []
@@ -238,19 +246,28 @@ def list_accounts() -> list[dict]:
                 account_id = _validate_account_id(data.get("_account_id", f.stem))
             except ValueError:
                 continue
-            accounts.append({
+            account = {
                 "id": account_id,
                 "title": data.get("_account_title", f.stem),
-            })
+            }
+            if validate:
+                creds = None
+                try:
+                    creds = _load_creds(account_id)
+                except Exception:
+                    creds = None
+                account["usable"] = bool(creds)
+                account["status"] = "ready" if creds else "needs_reauth"
+            accounts.append(account)
         except Exception:
             continue
     return accounts
 
 
 def is_connected() -> bool:
-    """Check if at least one account is connected."""
+    """Check if at least one account has usable credentials."""
     _ensure_tokens_dir()
-    return len(list_accounts()) > 0
+    return any(bool(account.get("usable")) for account in list_accounts(validate=True))
 
 
 def disconnect(account_id: str = None):
@@ -273,7 +290,7 @@ def disconnect(account_id: str = None):
         _service_cache.clear()
 
 
-# ── Channel & Category listing ───────────────────────────────────────────────
+# ── Channel listing ──────────────────────────────────────────────────────────
 
 
 def list_channels() -> list[dict]:
@@ -300,26 +317,6 @@ def list_channels() -> list[dict]:
         except Exception as e:
             print(f"[!] Failed to list channels for {acct['title']}: {e}")
     return all_channels
-
-
-def list_categories(region: str = "US") -> list[dict]:
-    """Return assignable YouTube video categories."""
-    accounts = list_accounts()
-    if not accounts:
-        return _FALLBACK_CATEGORIES
-    try:
-        yt = get_youtube_service(accounts[0]["id"])
-        resp = yt.videoCategories().list(part="snippet", regionCode=region).execute()
-        categories = [
-            {"id": cat["id"], "title": cat["snippet"]["title"]}
-            for cat in resp.get("items", [])
-            if cat["snippet"].get("assignable")
-        ]
-        if not any(cat["id"] == DEFAULT_VIDEO_CATEGORY_ID for cat in categories):
-            categories.insert(0, _FALLBACK_CATEGORIES[0])
-        return categories or _FALLBACK_CATEGORIES
-    except Exception:
-        return _FALLBACK_CATEGORIES
 
 
 def _normalize_tags(tags: list | str | None) -> list[str]:
@@ -369,7 +366,6 @@ def upload_to_youtube(
     title: str,
     description: str = "",
     tags: list = None,
-    category_id: str = DEFAULT_VIDEO_CATEGORY_ID,
     privacy: str = "private",
     scheduled_time: datetime = None,
     channel_id: str = None,
@@ -399,7 +395,6 @@ def upload_to_youtube(
     if "#Shorts" not in description and "#shorts" not in description:
         description = f"{description}\n\n#Shorts".strip() if description else "#Shorts"
     tags = _normalize_tags(tags)
-    category_id = DEFAULT_VIDEO_CATEGORY_ID
 
     status_privacy = privacy
     if publish_at:
@@ -410,7 +405,7 @@ def upload_to_youtube(
             "title": title[:100],
             "description": description,
             "tags": tags,
-            "categoryId": str(category_id),
+            "categoryId": DEFAULT_VIDEO_CATEGORY_ID,
         },
         "status": {
             "privacyStatus": status_privacy,
@@ -442,7 +437,7 @@ def upload_to_youtube(
         if chunks >= YOUTUBE_UPLOAD_MAX_CHUNKS:
             raise TimeoutError("YouTube upload exceeded the maximum chunk count")
         chunks += 1
-        status, response = request.next_chunk()
+        status, response = request.next_chunk(num_retries=YOUTUBE_UPLOAD_CHUNK_RETRIES)
         if response is not None:
             break
         if cancel_check and cancel_check():

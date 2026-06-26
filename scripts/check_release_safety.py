@@ -35,6 +35,8 @@ PRIVATE_FILE_PATTERNS = (
     "processing_history.json",
     "processing_history.*.bak",
     "processing_history.json.*.tmp",
+    "game_context.sqlite3",
+    "game_context.sqlite3-*",
     "*_candidate_debug.json",
     "*_run_debug.json",
 )
@@ -91,6 +93,7 @@ PRIVATE_DIR_NAMES = {
     "analysis_cache",
     "carryover_backups",
     "downloads",
+    "game_context",
     "music",
     "subtitles",
     "tokens",
@@ -105,6 +108,7 @@ ALWAYS_PRIVATE_DIR_NAMES = {
     "carryover_backups",
     "clips",
     "downloads",
+    "game_context",
     "music",
     "tokens",
 }

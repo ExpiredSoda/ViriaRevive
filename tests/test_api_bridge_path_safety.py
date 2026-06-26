@@ -16,7 +16,11 @@ from api_bridge import (  # noqa: E402
     ApiBridge,
     _allowed_media_origin,
     _candidate_model_for_depth,
+    _candidate_transcription_chunks,
+    _transcribe_candidate_wav_chunks,
     _normalize_audio_source_settings,
+    _normalize_generation_mode,
+    _normalize_montage_settings,
     _normalize_processing_depth,
     _processing_depth_profile,
     _subtitle_words_for_render_start,
@@ -27,6 +31,212 @@ from voice_profile import VOICE_PROFILE_FEATURE_COUNT, empty_voice_profile  # no
 
 
 class ApiBridgePathSafetyTests(unittest.TestCase):
+    def test_youtube_download_metadata_feeds_game_identity_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "Alan_Wake_Part_4.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            compact = bridge._compact_download_info(
+                {
+                    "title": "Alan Wake Remastered - Part 4 - Getting Chased",
+                    "uploader": "Expired Soda",
+                    "webpage_url": "https://youtube.com/watch?v=abc",
+                    "categories": ["Gaming"],
+                    "tags": ["Alan Wake", "horror"],
+                    "description": "Blind run. Game: Alan Wake Remastered.",
+                },
+                "https://youtube.com/watch?v=abc",
+            )
+            bridge._download_info_by_path = {str(clip_path.resolve()): compact}
+
+            context = bridge._youtube_context_for_source(clip_path)
+
+        self.assertEqual(context["title"], "Alan Wake Remastered - Part 4 - Getting Chased")
+        self.assertIn("YouTube title: Alan Wake Remastered", context["context_text"])
+        self.assertIn("Game: Alan Wake Remastered", context["context_text"])
+        self.assertEqual(context["tags"], ["Alan Wake", "horror"])
+
+    def test_remembered_source_game_identity_is_reused_without_network(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "Alan_Wake_Part_4.mp4"
+            source_id = ApiBridge.__new__(ApiBridge)._source_id_for(clip_path)
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._source_context = {
+                source_id: {
+                    "source_id": source_id,
+                    "source_path": str(clip_path.resolve()),
+                    "game_title": "Alan Wake",
+                    "game_identity": {
+                        "status": "cache_hit",
+                        "title": "Alan Wake",
+                        "qid": "Q575505",
+                        "confidence": 0.91,
+                        "game_context": {
+                            "status": "cache_hit",
+                            "qid": "Q575505",
+                            "label": "Alan Wake",
+                        },
+                    },
+                    "game_context": {
+                        "status": "cache_hit",
+                        "qid": "Q575505",
+                        "label": "Alan Wake",
+                    },
+                }
+            }
+            bridge._download_info_by_path = {}
+
+            with patch("api_bridge.resolve_game_identity") as resolver:
+                identity = bridge._game_identity_for_source(clip_path, allow_network=True)
+
+        resolver.assert_not_called()
+        self.assertEqual(identity["qid"], "Q575505")
+        self.assertEqual(identity["title"], "Alan Wake")
+
+    def test_source_game_hint_is_passed_to_identity_resolver_and_persisted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "unknown_capture.mp4"
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._source_context = {}
+            bridge._download_info_by_path = {}
+            bridge._infer_game_title_from_path = lambda _path: "Unknown Capture"
+
+            with patch("api_bridge.resolve_game_identity", return_value={
+                "schema_version": 1,
+                "status": "ok",
+                "title": "Alan Wake",
+                "qid": "Q575505",
+                "confidence": 0.94,
+                "game_context": {
+                    "schema_version": 1,
+                    "status": "ok",
+                    "qid": "Q575505",
+                    "label": "Alan Wake",
+                    "facts": {"genres": ["survival horror"]},
+                },
+            }) as resolver:
+                identity = bridge._game_identity_for_source(
+                    clip_path,
+                    allow_network=True,
+                    explicit_title="Alan Wake",
+                )
+
+            kwargs = resolver.call_args.kwargs
+            self.assertEqual(kwargs["explicit_title"], "Alan Wake")
+            self.assertEqual(identity["title"], "Alan Wake")
+            records = list(bridge._source_context.values())
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["game_title_hint"], "Alan Wake")
+            self.assertEqual(records[0]["game_identity"]["qid"], "Q575505")
+
+    def test_game_identity_source_memory_persists_immediately(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "viria_state.json"
+            clip_path = Path(temp_dir) / "alan wake clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._state_lock = threading.RLock()
+            bridge._results = [clip_path]
+            bridge._moments = [{}]
+            bridge._scheduled = []
+            bridge._upload_history = []
+            bridge._delete_after_upload = False
+            bridge._user_settings = {}
+            bridge._download_info_by_path = {}
+            bridge._source_context = {}
+
+            with patch("api_bridge.STATE_FILE", state_file), patch("api_bridge.resolve_game_identity", return_value={
+                "schema_version": 1,
+                "status": "ok",
+                "title": "Alan Wake",
+                "qid": "Q575505",
+                "confidence": 0.94,
+                "game_context": {
+                    "schema_version": 1,
+                    "status": "ok",
+                    "qid": "Q575505",
+                    "label": "Alan Wake",
+                    "facts": {"genres": ["survival horror"]},
+                },
+            }):
+                bridge._game_identity_for_source(
+                    clip_path,
+                    allow_network=True,
+                    explicit_title="Alan Wake",
+                )
+
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            sources = data["source_context"]["sources"]
+            self.assertEqual(len(sources), 1)
+            record = next(iter(sources.values()))
+            self.assertEqual(record["game_title_hint"], "Alan Wake")
+            self.assertEqual(record["game_identity"]["qid"], "Q575505")
+
+    def test_source_context_and_download_info_restore_from_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "viria_state.json"
+            state_file.write_text(json.dumps({
+                "schema_version": 3,
+                "results": [],
+                "moments": [],
+                "scheduled": [],
+                "upload_history": [],
+                "delete_after_upload": False,
+                "user_settings": {},
+                "download_info_by_path": {
+                    str(Path(temp_dir, "video.mp4")): {
+                        "schema_version": 1,
+                        "source": "yt_dlp",
+                        "title": "Alan Wake stream",
+                        "tags": ["Alan Wake"],
+                    }
+                },
+                "source_context": {
+                    "schema_version": 1,
+                    "sources": {
+                        "src_test": {
+                            "source_id": "src_test",
+                            "source_path": str(Path(temp_dir, "video.mp4")),
+                            "game_title_hint": "Alan Wake",
+                            "game_identity": {
+                                "status": "ok",
+                                "title": "Alan Wake",
+                                "qid": "Q575505",
+                                "confidence": 0.9,
+                                "game_context": {
+                                    "status": "ok",
+                                    "qid": "Q575505",
+                                    "label": "Alan Wake",
+                                },
+                            },
+                        }
+                    },
+                },
+            }), encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._state_lock = threading.RLock()
+
+            with patch("api_bridge.STATE_FILE", state_file):
+                bridge._load_state()
+
+        self.assertIn("src_test", bridge._source_context)
+        self.assertEqual(bridge._source_context["src_test"]["game_title_hint"], "Alan Wake")
+        self.assertEqual(bridge._source_context["src_test"]["game_identity"]["qid"], "Q575505")
+        self.assertEqual(len(bridge._download_info_by_path), 1)
+
+    def test_safe_clip_path_rejects_non_video_files_inside_clips_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            video = temp / "clip.mp4"
+            text = temp / "clip.txt"
+            video.write_bytes(b"video")
+            text.write_text("metadata", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+
+            with patch("api_bridge.CLIPS_DIR", temp):
+                self.assertEqual(bridge._safe_clip_path(video), video.resolve())
+                self.assertIsNone(bridge._safe_clip_path(text))
+
     def test_download_path_resolver_prefers_final_merged_filepath(self):
         class FakeYdl:
             @staticmethod
@@ -129,6 +339,134 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(selected_report["ai_viral_potential"]["scored_count"], 1)
         self.assertEqual(selected[0]["ai_moment_classification"]["selection_impact"], "none")
 
+    def test_ai_shadow_shortlist_can_include_safe_near_misses_without_accepted_candidates(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+
+        def near_miss(rank, quality):
+            return {
+                "accepted": False,
+                "reject_reason": "low_transcript_quality",
+                "quality_score": quality,
+                "learned_quality_score": quality,
+                "candidate": {"candidate_rank": rank, "candidate_kind": "primary"},
+                "moment": {
+                    "start": rank * 40,
+                    "end": rank * 40 + 30,
+                    "transcript": "I think this is a useful creator commentary moment worth checking",
+                    "ranker": {"reject_reason": "low_transcript_quality"},
+                },
+                "word_count": 12,
+                "subtitle_word_count": 12,
+                "music_lyrics_guard": {"reject_candidate": False},
+                "speech_source": {
+                    "primary_source": "creator",
+                    "creator_safe": True,
+                    "game_or_npc_probability": 0.04,
+                    "music_or_lyrics_probability": 0.01,
+                },
+                "commentary_guard": {"summary": {"primary_label": "creator_commentary"}},
+            }
+
+        evaluations = [near_miss(1, 0.50), near_miss(2, 0.48), near_miss(3, 0.46)]
+
+        shortlist = bridge._ai_shadow_shortlist(
+            evaluations,
+            max_count=3,
+            score_key="learned_quality_score",
+            include_near_misses=True,
+        )
+
+        self.assertEqual(len(shortlist), 3)
+        self.assertTrue(all(item.get("ai_rescue_candidate") for item in shortlist))
+        self.assertTrue(all(item["moment"]["ranker"].get("ai_rescue_candidate") for item in shortlist))
+
+    def test_multimodal_shortlist_reserves_a_slot_for_safe_near_misses(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._cancel = False
+        bridge._push = lambda *args, **kwargs: None
+        bridge._game_context_for_source = lambda *args, **kwargs: {"label": "Test Game"}
+        bridge._infer_game_title_from_path = lambda path: "Test Game"
+
+        def accepted(rank, quality):
+            return {
+                "accepted": True,
+                "quality_score": quality,
+                "learned_quality_score": quality,
+                "candidate": {
+                    "candidate_rank": rank,
+                    "candidate_kind": "primary",
+                    "start": rank * 40,
+                    "end": rank * 40 + 30,
+                },
+                "moment": {
+                    "start": rank * 40,
+                    "end": rank * 40 + 30,
+                    "duration": 30,
+                    "transcript": "good creator commentary",
+                    "ranker": {},
+                },
+                "word_count": 8,
+            }
+
+        def near_miss(rank, quality):
+            row = accepted(rank, quality)
+            row["accepted"] = False
+            row["reject_reason"] = "low_transcript_quality"
+            row["quality_floor"] = 0.60
+            row["subtitle_word_count"] = 12
+            row["word_count"] = 12
+            row["music_lyrics_guard"] = {"reject_candidate": False}
+            row["speech_source"] = {
+                "primary_source": "creator",
+                "creator_safe": True,
+                "game_or_npc_probability": 0.04,
+                "music_or_lyrics_probability": 0.01,
+            }
+            row["commentary_guard"] = {"summary": {"primary_label": "creator_commentary"}}
+            row["moment"]["ranker"]["reject_reason"] = "low_transcript_quality"
+            return row
+
+        evaluations = [
+            accepted(1, 0.92),
+            accepted(2, 0.88),
+            accepted(3, 0.84),
+            accepted(4, 0.80),
+            accepted(5, 0.76),
+            near_miss(6, 0.54),
+        ]
+
+        with patch("api_bridge.ollama_vision_status", return_value={"model_ready": True, "model": "test-vision"}), patch(
+            "api_bridge.analyze_candidate_frames_with_ollama",
+            return_value={
+                "status": "ok",
+                "model": "test-vision",
+                "frame_count": 3,
+                "sample_times": [0, 10, 20],
+                "primary_visual_label": "creator_moment",
+                "visible_summary": "Creator is talking over gameplay.",
+                "visual_labels": ["creator_moment"],
+                "detected_events": [],
+                "confidence": 0.7,
+                "ranking_adjustment": 0.02,
+                "reject_flags": [],
+            },
+        ):
+            report = bridge._analyze_multimodal_candidate_shortlist(
+                evaluations,
+                [],
+                Path("source.mp4"),
+                enabled=True,
+                score_key="learned_quality_score",
+                video_duration=180,
+                max_count=4,
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["shortlist_count"], 4)
+        self.assertEqual(report["accepted_shortlist_count"], 3)
+        self.assertEqual(report["near_miss_shortlist_count"], 1)
+        self.assertTrue(any(row.get("rescue_candidate") for row in report["rows"]))
+
     def test_delete_clip_does_not_unlink_outside_clips_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             outside = Path(temp_dir) / "outside.mp4"
@@ -176,6 +514,38 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertTrue(outside.exists())
             self.assertEqual(saves, [])
 
+    def test_unlink_clip_file_retries_transient_player_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "locked preview.mp4"
+            clip_path.write_bytes(b"video")
+            bridge = ApiBridge.__new__(ApiBridge)
+            original_unlink = Path.unlink
+            attempts = []
+
+            def flaky_unlink(path_self, *args, **kwargs):
+                if Path(path_self) == clip_path and len(attempts) < 2:
+                    attempts.append(True)
+                    raise PermissionError("locked by preview")
+                return original_unlink(path_self, *args, **kwargs)
+
+            with patch.object(Path, "unlink", flaky_unlink), patch("api_bridge.time.sleep") as sleep_mock:
+                ok, error = bridge._unlink_clip_file(clip_path, attempts=4, delay=0.01)
+
+            self.assertTrue(ok)
+            self.assertEqual(error, "")
+            self.assertFalse(clip_path.exists())
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_unlink_clip_file_returns_friendly_message_for_persistent_player_lock(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        with patch.object(Path, "unlink", side_effect=PermissionError("locked by preview")), patch("api_bridge.time.sleep"):
+            ok, error = bridge._unlink_clip_file(Path("locked.mp4"), attempts=2, delay=0.01)
+
+        self.assertFalse(ok)
+        self.assertIn("preview/player", error)
+        self.assertNotIn("WinError", error)
+
     def test_bulk_library_delete_prunes_state_and_keeps_partial_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_clips = Path(temp_dir)
@@ -184,6 +554,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             clip_c = temp_clips / "charlie.mp4"
             for path in (clip_a, clip_b, clip_c):
                 path.write_text("video", encoding="utf-8")
+                path.with_suffix(".txt").write_text("metadata", encoding="utf-8")
 
             bridge = ApiBridge.__new__(ApiBridge)
             bridge._results = [clip_a, clip_b, clip_c]
@@ -216,10 +587,14 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["deleted"], ["alpha.mp4", "bravo.mp4"])
+            self.assertEqual(result["sidecars_deleted"], ["alpha.txt", "bravo.txt"])
             self.assertEqual(result["failed"], [{"filename": "missing.mp4", "error": "File not found"}])
             self.assertFalse(clip_a.exists())
             self.assertFalse(clip_b.exists())
+            self.assertFalse(clip_a.with_suffix(".txt").exists())
+            self.assertFalse(clip_b.with_suffix(".txt").exists())
             self.assertTrue(clip_c.exists())
+            self.assertTrue(clip_c.with_suffix(".txt").exists())
             self.assertEqual([path.name for path in bridge._results], ["charlie.mp4"])
             self.assertEqual([moment["clip_id"] for moment in bridge._moments], ["clip-c"])
             self.assertEqual([item["clip_id"] for item in bridge._scheduled], ["clip-c"])
@@ -227,6 +602,46 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertTrue(bridge._personalization["clips"]["clip-b"]["rendered_file_deleted"])
             self.assertNotIn("rendered_file_deleted", bridge._personalization["clips"]["clip-c"])
             self.assertEqual(saves, [True])
+
+    def test_bulk_library_delete_prunes_already_missing_state_clip_without_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            missing_clip = temp_clips / "already gone.mp4"
+            missing_clip.with_suffix(".txt").write_text("metadata", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [missing_clip]
+            bridge._moments = [{"clip_id": "clip-gone", "source_id": "source-a"}]
+            bridge._scheduled = [{"clip_id": "clip-gone", "clip_filename": missing_clip.name}]
+            bridge._state_lock = threading.RLock()
+            bridge._personalization_lock = threading.RLock()
+            bridge._personalization = {
+                "schema_version": 1,
+                "events": [],
+                "clips": {
+                    "clip-gone": {
+                        "clip_id": "clip-gone",
+                        "clip_filename": missing_clip.name,
+                    }
+                },
+            }
+            bridge._save_personalization = lambda: None
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                result = bridge.delete_library_files([missing_clip.name])
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["deleted"], [])
+            self.assertEqual(result["missing_pruned"], [missing_clip.name])
+            self.assertEqual(result["failed"], [])
+            self.assertEqual(bridge._results, [])
+            self.assertEqual(bridge._moments, [])
+            self.assertEqual(bridge._scheduled, [])
+            self.assertFalse(missing_clip.with_suffix(".txt").exists())
+            self.assertTrue(bridge._personalization["clips"]["clip-gone"]["rendered_file_deleted"])
+            self.assertTrue(saves)
 
     def test_unique_clip_output_path_does_not_reuse_existing_render(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -258,6 +673,37 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
                     "provider": "ollama",
                     "primary_category": "high_energy",
                 },
+                "game_title_hint": "Alan Wake",
+                "game_title": "Alan Wake",
+                "game_identity": {
+                    "status": "ok",
+                    "title": "Alan Wake",
+                    "qid": "Q575505",
+                    "confidence": 0.94,
+                    "matched_via": "wikidata_search",
+                    "matched_candidate": {
+                        "title": "Alan Wake",
+                        "sources": ["explicit_title"],
+                    },
+                },
+                "game_context": {
+                    "status": "ok",
+                    "qid": "Q575505",
+                    "label": "Alan Wake",
+                },
+                "multi_signal_ai_scoring": {
+                    "game_context_nudge": {
+                        "status": "scored",
+                        "adjustment": 0.009,
+                        "reason": "horror_survival_context_match",
+                    }
+                },
+                "multimodal_analysis": {
+                    "status": "ok",
+                    "model": "llava:7b",
+                    "frame_count": 3,
+                    "metadata_keywords": ["dark hallway"],
+                },
             }]
             bridge._ensure_moment_identity = lambda moment, path: moment
 
@@ -267,6 +713,14 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertEqual(payload["primary_category"], "high_energy")
             self.assertEqual(payload["moment_categories"]["primary"], "high_energy")
             self.assertEqual(payload["ai_moment_classification"]["provider"], "ollama")
+            self.assertEqual(payload["truth_summary"]["game_title"], "Alan Wake")
+            self.assertEqual(payload["truth_summary"]["game_confidence"], 0.94)
+            self.assertEqual(payload["truth_summary"]["game_source"], "user_hint")
+            self.assertEqual(payload["truth_summary"]["game_qid"], "Q575505")
+            self.assertTrue(payload["truth_summary"]["game_context_affected_ranking"])
+            self.assertEqual(payload["truth_summary"]["game_context_score_delta"], 0.009)
+            self.assertTrue(payload["truth_summary"]["visual_analysis_used"])
+            self.assertEqual(payload["truth_summary"]["vision_model"], "llava:7b")
         finally:
             clip_path.unlink(missing_ok=True)
 
@@ -295,6 +749,18 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
                     "primary_category": "commentary_or_review",
                     "selection_impact": "none",
                 },
+                "game_title": "Alan Wake",
+                "game_identity": {
+                    "status": "cache_hit",
+                    "title": "Alan Wake",
+                    "qid": "Q575505",
+                    "confidence": 0.88,
+                    "matched_via": "local_cache",
+                    "matched_candidate": {
+                        "title": "Alan Wake",
+                        "sources": ["source_filename"],
+                    },
+                },
             }]
             bridge._scheduled = []
             bridge._state_lock = threading.RLock()
@@ -313,6 +779,8 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertNotIn("signals", result["clips"][0]["moment_categories"])
             self.assertEqual(result["clips"][0]["ai_moment_classification"]["provider"], "heuristic")
             self.assertEqual(result["clips"][0]["ai_moment_classification"]["selection_impact"], "none")
+            self.assertEqual(result["clips"][0]["truth_summary"]["game_title"], "Alan Wake")
+            self.assertEqual(result["clips"][0]["truth_summary"]["game_source"], "filename")
             for bulky_key in (
                 "transcript",
                 "ranker",
@@ -324,7 +792,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             ):
                 self.assertNotIn(bulky_key, result["clips"][0])
 
-    def test_source_title_context_is_sanitized_and_reaches_metadata_context(self):
+    def test_clip_title_context_is_sanitized_and_reaches_metadata_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             clip_path = Path(temp_dir) / "clip.mp4"
             clip_path.write_text("video", encoding="utf-8")
@@ -335,6 +803,16 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
                 "source_id": "source-1",
                 "source_stem": "source-stem",
                 "transcript": "oh no run",
+                "game_context": {
+                    "status": "ok",
+                    "provider": "wikidata",
+                    "qid": "Q575505",
+                    "label": "Alan Wake",
+                    "description": "2010 video game",
+                    "source_url": "https://www.wikidata.org/wiki/Q575505",
+                    "license": "CC0-1.0",
+                    "facts": {"genres": ["survival horror"]},
+                },
             }]
             bridge._scheduled = [{
                 "clipIdx": 0,
@@ -349,9 +827,10 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             bridge._save_state = lambda: None
             bridge._game_title_for_clip = lambda _idx: "Alan Wake"
 
-            result = bridge.save_source_title_context(
-                "source-1",
-                "source-stem",
+            result = bridge.save_clip_title_context(
+                "clip-1",
+                0,
+                "clip.mp4",
                 r"Blind nursing home chapter C:\Users\ExpiredSoda\client_secrets.json api_key=secret123",
             )
             payload = bridge._clip_payload(0, clip_path, include_url=False)
@@ -366,8 +845,290 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertNotIn("client_secrets.json", result["creator_title_context"])
             self.assertEqual(payload["creator_title_context"], result["creator_title_context"])
             self.assertEqual(context["creator_title_context"], result["creator_title_context"])
+            self.assertEqual(context["game_context"]["qid"], "Q575505")
             self.assertEqual(bridge._scheduled[0]["description_generated"], "")
+            self.assertIs(bridge._scheduled[0]["metadata_stale"], True)
             self.assertIn("Creator Context: Blind nursing home chapter", sidecar_text)
+
+    def test_title_context_uses_source_level_game_hint_memory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "clip_id": "clip-1",
+                "source_id": "src-alan",
+                "source_path": str(clip_path),
+                "transcript": "this is the part where he is right behind me",
+            }]
+            bridge._source_context = {
+                "src-alan": {
+                    "source_id": "src-alan",
+                    "source_path": str(clip_path.resolve()),
+                    "game_title_hint": "Alan Wake",
+                    "game_title": "Alan Wake",
+                    "game_identity": {
+                        "status": "ok",
+                        "title": "Alan Wake",
+                        "qid": "Q575505",
+                        "confidence": 0.94,
+                        "game_context": {
+                            "status": "ok",
+                            "qid": "Q575505",
+                            "label": "Alan Wake",
+                        },
+                    },
+                    "game_context": {
+                        "status": "ok",
+                        "qid": "Q575505",
+                        "label": "Alan Wake",
+                        "facts": {"genres": ["survival horror"]},
+                    },
+                }
+            }
+            bridge._personalization_lock = threading.RLock()
+            bridge._personalization = {"schema_version": 1, "events": [], "clips": {}}
+
+            context = bridge._title_context_for_clip(0)
+
+        self.assertEqual(context["game_title_hint"], "Alan Wake")
+        self.assertEqual(context["game_title"], "Alan Wake")
+        self.assertEqual(context["game_identity"]["qid"], "Q575505")
+        self.assertEqual(context["game_context"]["qid"], "Q575505")
+        self.assertEqual(context["source_context"]["game_title_hint"], "Alan Wake")
+
+    def test_generate_title_for_clip_uses_explicit_creator_context_from_reroll(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            clip_path = temp_clips / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{"transcript": "look at this part"}]
+            bridge._user_settings = {}
+            bridge._ensure_metadata_vision_context = lambda _idx, context: context
+            bridge._game_title_for_clip = lambda _idx: "Alan Wake"
+            seen = {}
+
+            def fake_generate_title(transcript, game_title="", clip_context=None):
+                seen["transcript"] = transcript
+                seen["game_title"] = game_title
+                seen["clip_context"] = clip_context or {}
+                return "Fresh Context Title #shorts"
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips), \
+                    patch("api_bridge.generate_title", side_effect=fake_generate_title), \
+                    patch("api_bridge.generate_ai_description_body", return_value="Context-aware description"):
+                result = bridge.generate_title_for_clip(
+                    0,
+                    save=False,
+                    creator_title_context="after the fact boss fight note",
+                )
+
+            self.assertEqual(result["title"], "Fresh Context Title #shorts")
+            self.assertEqual(result["creator_title_context"], "after the fact boss fight note")
+            self.assertEqual(seen["clip_context"]["creator_title_context"], "after the fact boss fight note")
+            self.assertEqual(bridge._moments[0]["creator_title_context"], "after the fact boss fight note")
+
+    def test_generate_title_for_clip_refreshes_weak_game_identity_from_ai_notes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            clip_path = temp_clips / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "transcript": "the Taken are chasing me",
+                "game_identity": {"status": "no_match", "confidence": 0.0},
+                "game_context": {"status": "cache_miss", "available": False},
+            }]
+            bridge._user_settings = {}
+            bridge._ensure_metadata_vision_context = lambda _idx, context: context
+            seen = {}
+
+            def fake_identity(video_path, **kwargs):
+                seen["identity_kwargs"] = kwargs
+                return {
+                    "status": "ok",
+                    "title": "Alan Wake",
+                    "qid": "Q575505",
+                    "confidence": 0.94,
+                    "matched_via": "wikidata_search",
+                    "game_context": {
+                        "status": "ok",
+                        "qid": "Q575505",
+                        "label": "Alan Wake",
+                        "facts": {"genres": ["survival horror"]},
+                    },
+                }
+
+            bridge._game_identity_for_source = fake_identity
+
+            def fake_generate_title(transcript, game_title="", clip_context=None):
+                seen["title_game"] = game_title
+                seen["title_context"] = clip_context or {}
+                return "Alan Wake Chase #shorts"
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips), \
+                    patch("api_bridge.generate_title", side_effect=fake_generate_title), \
+                    patch("api_bridge.generate_ai_description_body", return_value="AI description"):
+                result = bridge.generate_title_for_clip(
+                    0,
+                    save=False,
+                    creator_title_context="blind Alan Wake run",
+                )
+
+            self.assertEqual(result["game_title"], "Alan Wake")
+            self.assertEqual(seen["title_game"], "Alan Wake")
+            self.assertEqual(seen["title_context"]["game_context"]["qid"], "Q575505")
+            self.assertEqual(seen["identity_kwargs"]["creator_context"], "blind Alan Wake run")
+            self.assertEqual(bridge._moments[0]["game_identity"]["qid"], "Q575505")
+
+    def test_clip_title_context_updates_one_clip_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clip_a = root / "a.mp4"
+            clip_b = root / "b.mp4"
+            clip_a.write_text("video", encoding="utf-8")
+            clip_b.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_a, clip_b]
+            bridge._moments = [
+                {
+                    "clip_id": "clip-a",
+                    "source_id": "source-1",
+                    "source_stem": "same-source",
+                    "generated_metadata": {"title": "stale"},
+                },
+                {
+                    "clip_id": "clip-b",
+                    "source_id": "source-1",
+                    "source_stem": "same-source",
+                    "generated_metadata": {"title": "keep"},
+                },
+            ]
+            bridge._scheduled = [
+                {
+                    "clipIdx": 0,
+                    "clip_id": "clip-a",
+                    "source_id": "source-1",
+                    "source_stem": "same-source",
+                    "description_generated": "stale",
+                    "generated_description": "stale",
+                },
+                {
+                    "clipIdx": 1,
+                    "clip_id": "clip-b",
+                    "source_id": "source-1",
+                    "source_stem": "same-source",
+                    "description_generated": "keep",
+                    "generated_description": "keep",
+                },
+            ]
+            bridge._state_lock = threading.RLock()
+            bridge._save_state = lambda: None
+
+            result = bridge.save_clip_title_context("clip-a", 0, "a.mp4", "specific boss fight note")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["updated_scheduled"], 1)
+            self.assertEqual(bridge._moments[0]["creator_title_context"], "specific boss fight note")
+            self.assertNotIn("creator_title_context", bridge._moments[1])
+            self.assertNotIn("generated_metadata", bridge._moments[0])
+            self.assertEqual(bridge._moments[1]["generated_metadata"]["title"], "keep")
+            self.assertEqual(bridge._scheduled[0]["creator_title_context"], "specific boss fight note")
+            self.assertEqual(bridge._scheduled[0]["description_generated"], "")
+            self.assertIs(bridge._scheduled[0]["metadata_stale"], True)
+            self.assertEqual(bridge._scheduled[1]["description_generated"], "keep")
+
+    def test_clip_title_context_noop_does_not_save_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "clip_id": "clip-1",
+                "source_id": "source-1",
+                "source_stem": "clip",
+                "source_path": str(clip_path),
+                "creator_title_context": "already saved",
+            }]
+            bridge._scheduled = [{
+                "clipIdx": 0,
+                "clip_id": "clip-1",
+                "creator_title_context": "already saved",
+                "description_generated": "",
+                "generated_description": "",
+            }]
+            bridge._state_lock = threading.RLock()
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            result = bridge.save_clip_title_context("clip-1", 0, "clip.mp4", "already saved")
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["changed"])
+            self.assertEqual(saves, [])
+
+    def test_library_clip_game_title_can_be_saved_by_safe_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clips_dir = Path(temp_dir)
+            clip_path = clips_dir / "old_library_clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = []
+            bridge._moments = []
+            bridge._scheduled = []
+            bridge._state_lock = threading.RLock()
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            with patch("api_bridge.CLIPS_DIR", clips_dir):
+                result = bridge.save_clip_game_title(
+                    clip_id="",
+                    clip_index=None,
+                    filename="old_library_clip.mp4",
+                    text="Alan Wake",
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["clip_index"], 0)
+            self.assertEqual(result["game_title"], "Alan Wake")
+            self.assertEqual(bridge._results, [clip_path.resolve()])
+            self.assertEqual(bridge._moments[0]["game_title"], "Alan Wake")
+            self.assertEqual(bridge._moments[0]["truth_summary"]["game_title"], "Alan Wake")
+            self.assertEqual(len(saves), 1)
+
+    def test_library_clip_game_title_rejects_unsafe_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clips_dir = Path(temp_dir) / "clips"
+            outside_dir = Path(temp_dir) / "outside"
+            clips_dir.mkdir()
+            outside_dir.mkdir()
+            outside = outside_dir / "secret.mp4"
+            outside.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = []
+            bridge._moments = []
+            bridge._scheduled = []
+            bridge._state_lock = threading.RLock()
+            saves = []
+            bridge._save_state = lambda: saves.append(True)
+
+            with patch("api_bridge.CLIPS_DIR", clips_dir):
+                result = bridge.save_clip_game_title(
+                    clip_id="",
+                    clip_index=None,
+                    filename=str(outside),
+                    text="Alan Wake",
+                )
+
+            self.assertEqual(result["error"], "Clip not found")
+            self.assertEqual(bridge._results, [])
+            self.assertEqual(bridge._moments, [])
+            self.assertEqual(saves, [])
 
     def test_classify_selected_moments_does_not_fake_ollama_when_skipped(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -409,12 +1170,205 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertIn("http.server.ThreadingHTTPServer", source)
 
     def test_local_video_server_origin_allowlist_is_loopback_only(self):
-        self.assertEqual(_allowed_media_origin("null"), "null")
+        self.assertIsNone(_allowed_media_origin("null"))
         self.assertEqual(_allowed_media_origin("http://localhost:3000"), "http://localhost:3000")
         self.assertEqual(_allowed_media_origin("http://127.0.0.1:3000"), "http://127.0.0.1:3000")
         self.assertEqual(_allowed_media_origin("http://[::1]:3000"), "http://[::1]:3000")
         self.assertIsNone(_allowed_media_origin("https://example.com"))
         self.assertIsNone(_allowed_media_origin("http://192.168.1.10:3000"))
+
+    def test_ollama_model_downloads_are_allowlisted(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+
+        with patch("api_bridge.ensure_model") as ensure_model:
+            text_result = bridge.ensure_ollama_model("unexpected:latest")
+            vision_result = bridge.ensure_ollama_vision_model("unexpected-vision:latest")
+
+        self.assertIn("error", text_result)
+        self.assertIn("error", vision_result)
+        ensure_model.assert_not_called()
+
+    def test_ollama_status_reports_text_and_vision_models(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+
+        with patch("api_bridge.ollama_status", return_value={
+            "running": True,
+            "model": "qwen3.5:4b",
+            "model_ready": True,
+            "using_ollama": True,
+            "models": ["qwen3.5:4b", "qwen3-vl:latest"],
+            "version": "0.9.0",
+        }), patch("api_bridge.ollama_vision_status", return_value={
+            "model_ready": True,
+            "model": "qwen3-vl:latest",
+            "supported_model_hints": ["qwen3-vl"],
+        }), patch("api_bridge.shutil.which", return_value=None):
+            status = bridge.get_ollama_status()
+
+        self.assertTrue(status["text_model"]["model_ready"])
+        self.assertEqual(status["text_model"]["model"], "qwen3.5:4b")
+        self.assertTrue(status["vision"]["model_ready"])
+        self.assertEqual(status["vision"]["model"], "qwen3-vl:latest")
+        self.assertTrue(status["using_ollama_vision"])
+        self.assertFalse(status["installed"])
+
+    def test_ollama_powershell_install_api_is_removed(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+
+        self.assertFalse(hasattr(bridge, "prepare_ollama_install"))
+        self.assertFalse(hasattr(bridge, "install_ollama_with_powershell"))
+
+    def test_rename_clip_rejects_results_outside_clips_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outside = Path(temp_dir) / "outside.mp4"
+            outside.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [outside]
+
+            result = bridge.rename_clip(0, "new title")
+
+            self.assertEqual(result["error"], "File not found")
+            self.assertTrue(outside.exists())
+
+    def test_auto_metadata_renames_fresh_clip_and_rewrites_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            old_clip = temp_clips / "source_viral1.mp4"
+            old_clip.write_text("video", encoding="utf-8")
+            old_sidecar = old_clip.with_suffix(".txt")
+            old_sidecar.write_text("Title: old\n", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [old_clip]
+            bridge._moments = [{"transcript": "wait what happened"}]
+            bridge._cancel = False
+            bridge._user_settings = {}
+            bridge._push = lambda *args, **kwargs: None
+            bridge._title_context_for_clip = lambda _idx: {
+                "transcript": "wait what happened",
+                "quality_score": 0.7,
+            }
+            bridge.generate_title_for_clip = lambda _idx, save=False: {
+                "title": "Better Clip Title #shorts",
+                "description": "Better description",
+                "final_description": "Better description",
+                "generated_description": "Better description",
+                "description_custom_text": "",
+                "description_auto_hashtags": True,
+                "tags": "Better, Clip",
+                "game_title": "Test Game",
+                "creator_title_context": "",
+                "metadata_file": str(old_sidecar),
+            }
+            final_debug = [{"path": str(old_clip)}]
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                metadata = bridge._generate_auto_metadata_for_results(0, 1, final_debug, [])
+
+            new_clip = temp_clips / "Better Clip Title #shorts.mp4"
+            new_sidecar = new_clip.with_suffix(".txt")
+            self.assertTrue(new_clip.exists())
+            self.assertTrue(new_sidecar.exists())
+            self.assertFalse(old_clip.exists())
+            self.assertFalse(old_sidecar.exists())
+            self.assertEqual(bridge._results[0].resolve(), new_clip.resolve())
+            self.assertEqual(metadata[0]["filename"], new_clip.name)
+            self.assertEqual(Path(final_debug[0]["path"]).resolve(), new_clip.resolve())
+            sidecar_text = new_sidecar.read_text(encoding="utf-8")
+            self.assertIn("Title: Better Clip Title #shorts", sidecar_text)
+            self.assertIn(new_clip.name, sidecar_text)
+
+    def test_manual_ai_metadata_reroll_renames_clip_and_removes_stale_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            old_clip = temp_clips / "source_viral1.mp4"
+            old_clip.write_text("video", encoding="utf-8")
+            old_sidecar = old_clip.with_suffix(".txt")
+            old_sidecar.write_text("Title: old\n", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [old_clip]
+            bridge._moments = [{
+                "transcript": "this is a great moment",
+                "creator_title_context": "blind Alan Wake run",
+                "generated_metadata": {"metadata_file": str(old_sidecar)},
+            }]
+            bridge._user_settings = {}
+            bridge._save_state = lambda: None
+            bridge._js = lambda _script: None
+            seen = {}
+
+            def fake_refresh(idx, **_kwargs):
+                bridge._moments[idx]["game_title"] = "Alan Wake"
+                bridge._moments[idx]["game_identity"] = {
+                    "status": "ok",
+                    "title": "Alan Wake",
+                    "qid": "Q575505",
+                    "confidence": 0.94,
+                }
+                bridge._moments[idx]["game_context"] = {
+                    "status": "ok",
+                    "qid": "Q575505",
+                    "label": "Alan Wake",
+                    "facts": {"genres": ["survival horror"]},
+                }
+                return bridge._moments[idx]["game_identity"]
+
+            bridge._refresh_clip_game_identity_for_metadata = fake_refresh
+            bridge._title_context_for_clip = lambda _idx: {
+                "transcript": bridge._moments[0]["transcript"],
+                "game_title": bridge._moments[0].get("game_title"),
+                "game_identity": bridge._moments[0].get("game_identity"),
+                "game_context": bridge._moments[0].get("game_context"),
+                "creator_title_context": bridge._moments[0].get("creator_title_context"),
+                "quality_score": 0.8,
+            }
+            bridge._ensure_metadata_vision_context = lambda _idx, context: {
+                **context,
+                "multimodal_analysis": {"status": "ok", "visible_summary": "dark hallway"},
+            }
+            def fake_generated_description(title, transcript, game_title, clip_context):
+                seen["description_context"] = {
+                    "title": title,
+                    "transcript": transcript,
+                    "game_title": game_title,
+                    "creator_title_context": clip_context.get("creator_title_context"),
+                    "vision": clip_context.get("multimodal_analysis"),
+                }
+                return "AI generated description"
+
+            bridge._generated_description_for_clip = fake_generated_description
+
+            def fake_titles_batch(transcripts, *_args, **kwargs):
+                seen["title_context"] = kwargs["clip_contexts"][0]
+                seen["game_title"] = kwargs["game_titles"][0]
+                return ["Fresh Clip Title #shorts"]
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips), \
+                    patch("api_bridge.is_ollama_model_ready", return_value=True), \
+                    patch("api_bridge.generate_titles_batch", side_effect=fake_titles_batch):
+                bridge._run_title_gen([0])
+
+            new_clip = temp_clips / "Fresh Clip Title #shorts.mp4"
+            new_sidecar = new_clip.with_suffix(".txt")
+            self.assertTrue(new_clip.exists())
+            self.assertTrue(new_sidecar.exists())
+            self.assertFalse(old_clip.exists())
+            self.assertFalse(old_sidecar.exists())
+            self.assertEqual(bridge._results[0].resolve(), new_clip.resolve())
+            self.assertEqual(
+                Path(bridge._moments[0]["generated_metadata"]["metadata_file"]).resolve(),
+                new_sidecar.resolve(),
+            )
+            sidecar_text = new_sidecar.read_text(encoding="utf-8")
+            self.assertIn("Title: Fresh Clip Title #shorts", sidecar_text)
+            self.assertIn("AI generated description", sidecar_text)
+            self.assertEqual(seen["game_title"], "Alan Wake")
+            self.assertEqual(seen["title_context"]["creator_title_context"], "blind Alan Wake run")
+            self.assertEqual(seen["title_context"]["multimodal_analysis"]["status"], "ok")
+            self.assertEqual(seen["description_context"]["game_title"], "Alan Wake")
+            self.assertEqual(seen["description_context"]["creator_title_context"], "blind Alan Wake run")
+            self.assertEqual(seen["description_context"]["vision"]["visible_summary"], "dark hallway")
 
     def test_delete_after_upload_toggle_persists_immediately(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -447,6 +1401,52 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         bridge.save_settings({"processing_depth": "../deep"})
         self.assertEqual(bridge.get_settings()["processing_depth"], "balanced")
 
+        bridge.save_settings({"clip_duration": 220})
+        self.assertEqual(bridge.get_settings()["clip_duration"], 180)
+
+        bridge.save_settings({"clip_duration": -5})
+        self.assertEqual(bridge.get_settings()["clip_duration"], 30)
+
+        bridge.save_settings({"min_gap": 5})
+        self.assertEqual(bridge.get_settings()["min_gap"], 5)
+
+        bridge.save_settings({"min_gap": 999})
+        self.assertEqual(bridge.get_settings()["min_gap"], 60)
+
+        bridge.save_settings({"min_gap": -30})
+        self.assertEqual(bridge.get_settings()["min_gap"], 15)
+
+    def test_generation_mode_and_montage_settings_are_sanitized(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._user_settings = {}
+        bridge._save_state = lambda: None
+
+        self.assertEqual(_normalize_generation_mode("montage"), "montage")
+        self.assertEqual(_normalize_generation_mode("../montage"), "clips")
+        self.assertEqual(_normalize_montage_settings({
+            "template": "death / failure",
+            "target_duration": 999,
+            "prompt": "make it scary\n" * 80,
+        }), {
+            "template": "panic",
+            "target_duration": 60,
+            "prompt": ("make it scary " * 80).strip()[:500],
+        })
+
+        bridge.save_settings({
+            "generation_mode": "montage",
+            "montage": {
+                "template": "story",
+                "target_duration": 90,
+                "prompt": "story recap with a clean payoff",
+            },
+        })
+        settings = bridge.get_settings()
+        self.assertEqual(settings["generation_mode"], "montage")
+        self.assertEqual(settings["montage"]["template"], "story")
+        self.assertEqual(settings["montage"]["target_duration"], 90)
+        self.assertEqual(settings["montage"]["prompt"], "story recap with a clean payoff")
+
     def test_processing_depth_profile_maps_runtime_cost(self):
         fast = _processing_depth_profile("fast", "quality", 7200)
         balanced = _processing_depth_profile("balanced", "quality", 7200)
@@ -472,6 +1472,54 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(_candidate_model_for_depth("deep", "large-v3"), "small")
         self.assertEqual(_candidate_model_for_depth("deep", "medium"), "small")
         self.assertEqual(_candidate_model_for_depth("deep", "base"), "base")
+
+    def test_candidate_transcription_chunks_are_bounded_by_audio_seconds(self):
+        paths = [Path(f"probe_{idx}.wav") for idx in range(5)]
+        durations = {str(path): 90 for path in paths}
+
+        chunks = _candidate_transcription_chunks(paths, durations, max_seconds=180, max_files=8)
+
+        self.assertEqual([[path.name for path in chunk] for chunk in chunks], [
+            ["probe_0.wav", "probe_1.wav"],
+            ["probe_2.wav", "probe_3.wav"],
+            ["probe_4.wav"],
+        ])
+
+    def test_candidate_transcription_chunks_are_bounded_by_file_count(self):
+        paths = [Path(f"probe_{idx}.wav") for idx in range(5)]
+        durations = {str(path): 10 for path in paths}
+
+        chunks = _candidate_transcription_chunks(paths, durations, max_seconds=180, max_files=2)
+
+        self.assertEqual([[path.name for path in chunk] for chunk in chunks], [
+            ["probe_0.wav", "probe_1.wav"],
+            ["probe_2.wav", "probe_3.wav"],
+            ["probe_4.wav"],
+        ])
+
+    def test_candidate_transcription_chunks_preserve_completed_results(self):
+        paths = [Path(f"probe_{idx}.wav") for idx in range(4)]
+        durations = {str(path): 90 for path in paths}
+
+        def fake_transcribe(chunk, model_size, language):
+            if chunk[0].name == "probe_0.wav":
+                return [[{"text": "first", "start": 0, "end": 1}], [{"text": "second", "start": 0, "end": 1}]]
+            return [[], []]
+
+        with patch("api_bridge.transcribe_clips", side_effect=fake_transcribe) as transcribe:
+            words_by_path, chunk_count = _transcribe_candidate_wav_chunks(
+                paths,
+                durations,
+                model_size="base",
+                language=None,
+            )
+
+        self.assertEqual(chunk_count, 2)
+        self.assertEqual(transcribe.call_count, 2)
+        self.assertEqual(words_by_path[str(paths[0])][0]["text"], "first")
+        self.assertEqual(words_by_path[str(paths[1])][0]["text"], "second")
+        self.assertEqual(words_by_path[str(paths[2])], [])
+        self.assertEqual(words_by_path[str(paths[3])], [])
 
     def test_candidate_debug_recovery_rebuilds_selected_rows_in_start_order(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -516,6 +1564,44 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(items[1]["moment"]["music_lyrics_guard"]["status"], "ok")
         self.assertEqual(items[1]["moment"]["visual_diagnostics"]["status"], "ok")
         self.assertEqual(items[0]["words"], [])
+
+    def test_recovered_run_debug_merge_preserves_unselected_candidates(self):
+        payload = {
+            "debug_stage": "candidate_pre_render",
+            "candidate_count": 3,
+            "selected_count": 2,
+            "timing": {"candidate_analysis": 12.5},
+            "candidates": [
+                {"selected": True, "start": 10, "end": 20, "candidate": {"candidate_rank": 1}},
+                {"selected": False, "start": 30, "end": 40, "candidate": {"candidate_rank": 2}},
+                {"selected": True, "start": 50, "end": 60, "candidate": {"candidate_rank": 3}},
+            ],
+        }
+        final_clips = [
+            {"index": 1, "path": "clip1.mp4", "transcript": "first"},
+            {"index": 2, "path": "clip2.mp4", "transcript": "second"},
+        ]
+
+        recovered = ApiBridge._merge_recovered_run_debug_payload(
+            payload,
+            debug_path=Path("A:/ViriaRevive/subtitles/source_candidate_debug.json"),
+            final_clip_debug=final_clips,
+            run_warnings=["rendered_from_candidate_debug"],
+            stage_timings={"final_render": 3.4},
+            auto_metadata_count=2,
+        )
+
+        self.assertEqual(recovered["debug_stage"], "run_post_render")
+        self.assertTrue(recovered["final_render_metadata_included"])
+        self.assertTrue(recovered["recovered_from_candidate_debug"])
+        self.assertEqual(recovered["candidate_count"], 3)
+        self.assertEqual(len(recovered["candidates"]), 3)
+        self.assertFalse(recovered["candidates"][1]["selected"])
+        self.assertEqual(recovered["candidates"][0]["final_render"]["path"], "clip1.mp4")
+        self.assertEqual(recovered["candidates"][2]["final_render"]["path"], "clip2.mp4")
+        self.assertEqual(recovered["timing"]["candidate_analysis"], 12.5)
+        self.assertEqual(recovered["timing"]["stage_timings"]["final_render"], 3.4)
+        self.assertEqual(recovered["auto_metadata_count"], 2)
 
     def test_record_feedback_reuses_stored_learning_terms_after_clip_is_missing(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -680,6 +1766,8 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
     def test_delete_clip_keeps_personalization_and_marks_file_deleted(self):
         clip_path = CLIPS_DIR / "feedback delete persists test.mp4"
         clip_path.write_bytes(b"clip")
+        sidecar_path = clip_path.with_suffix(".txt")
+        sidecar_path.write_text("metadata", encoding="utf-8")
         try:
             bridge = ApiBridge.__new__(ApiBridge)
             bridge._results = [clip_path]
@@ -705,7 +1793,9 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             result = bridge.delete_clip(0)
 
             self.assertTrue(result["ok"])
+            self.assertTrue(result["sidecar_deleted"])
             self.assertFalse(clip_path.exists())
+            self.assertFalse(sidecar_path.exists())
             entry = bridge._personalization["clips"]["clip_delete"]
             self.assertTrue(entry["rendered_file_deleted"])
             self.assertEqual(entry["deleted_filename"], clip_path.name)
@@ -713,22 +1803,84 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         finally:
             try:
                 clip_path.unlink(missing_ok=True)
+                sidecar_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def test_prune_missing_results_deletes_orphan_metadata_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            missing_clip = temp_clips / "folder deleted video.mp4"
+            sidecar_path = missing_clip.with_suffix(".txt")
+            sidecar_path.write_text("metadata", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [missing_clip]
+            bridge._moments = [{"clip_id": "clip_missing", "source_id": "source_1"}]
+            bridge._scheduled = []
+            bridge._state_lock = threading.RLock()
+            bridge._personalization_lock = threading.RLock()
+            bridge._personalization = {
+                "schema_version": 1,
+                "events": [],
+                "clips": {
+                    "clip_missing": {
+                        "clip_id": "clip_missing",
+                        "clip_filename": missing_clip.name,
+                    }
+                },
+            }
+            bridge._save_state = lambda: None
+            bridge._save_personalization = lambda: None
+
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                removed = bridge._prune_missing_results()
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(sidecar_path.exists())
+            self.assertEqual(bridge._results, [])
+            self.assertTrue(bridge._personalization["clips"]["clip_missing"]["rendered_file_deleted"])
+
+    def test_orphan_metadata_sidecar_cleanup_only_removes_generated_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_clips = Path(temp_dir)
+            orphan = temp_clips / "old renamed clip.txt"
+            orphan.write_text(
+                "Title: Old\n\nDescription:\nOld description\n\nAnalysis Context:\nMoment Type: test\n",
+                encoding="utf-8",
+            )
+            notes = temp_clips / "creator notes.txt"
+            notes.write_text("keep this note", encoding="utf-8")
+            matched_video = temp_clips / "current clip.mp4"
+            matched_video.write_text("video", encoding="utf-8")
+            matched_sidecar = matched_video.with_suffix(".txt")
+            matched_sidecar.write_text(
+                "Title: Current\n\nDescription:\nCurrent description\n\nAnalysis Context:\nMoment Type: test\n",
+                encoding="utf-8",
+            )
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            with patch("api_bridge.CLIPS_DIR", temp_clips):
+                removed = bridge._prune_orphan_metadata_sidecars()
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(notes.exists())
+            self.assertTrue(matched_sidecar.exists())
 
     def test_candidate_debug_recovery_defines_and_persists_stage_timings(self):
         source = inspect.getsource(ApiBridge._run_candidate_debug_recovery)
 
         self.assertIn("stage_timings: dict[str, float] = {}", source)
         self.assertIn('stage_timings["final_render"]', source)
-        self.assertIn('recovered["stage_timings"] = dict(stage_timings)', source)
+        self.assertIn("_merge_recovered_run_debug_payload(", source)
         self.assertIn('"trim_adjusted_start": m.get("trim_adjusted_start")', source)
         self.assertIn('"selection_primary_category": selection_primary_category', source)
         self.assertIn('"ranking_primary_category": ranking_primary_category', source)
         self.assertIn('"final_primary_category": final_primary_category', source)
         self.assertIn('"final_moment_categories": final_moment_categories', source)
 
-    def test_final_render_preserves_selected_window_and_records_trim_suggestion(self):
+    def test_final_render_applies_trim_suggestion_and_records_selected_window(self):
         source = inspect.getsource(ApiBridge._run_pipeline)
 
         self.assertIn("selected_start, selected_end = int(m[\"start\"]), int(m[\"end\"])", source)
@@ -736,7 +1888,8 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertIn('m["trim_adjusted_start"] = trim_start', source)
         self.assertIn('m["subtitle_timing_offset"]', source)
         self.assertIn('m["trim_adjusted_from_selected"] = (', source)
-        self.assertIn('m["start"] = selected_start', source)
+        self.assertIn("start, end = trim_start, trim_end", source)
+        self.assertIn('m["start"] = start', source)
         self.assertIn('"selected_start": m.get("selected_start", start)', source)
         self.assertIn('"trim_adjusted_from_selected": m.get("trim_adjusted_from_selected", False)', source)
         self.assertIn('"selection_primary_category": selection_primary_category', source)
@@ -1375,6 +2528,8 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         CLIPS_DIR.mkdir(exist_ok=True)
         clip_path = CLIPS_DIR / "auto delete prune test.mp4"
         clip_path.write_text("video", encoding="utf-8")
+        sidecar_path = clip_path.with_suffix(".txt")
+        sidecar_path.write_text("metadata", encoding="utf-8")
         try:
             bridge = ApiBridge.__new__(ApiBridge)
             bridge._results = [clip_path]
@@ -1389,12 +2544,15 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             bridge._delete_uploaded_clip(0, clip_path)
 
             self.assertFalse(clip_path.exists())
+            self.assertFalse(sidecar_path.exists())
             self.assertEqual(bridge._results, [])
             self.assertEqual(bridge._moments, [])
             self.assertTrue(any("onClipDeleted" in call for call in bridge._pending_js))
+            self.assertTrue(any('"clipId": "clip-delete"' in call for call in bridge._pending_js))
             self.assertTrue(saves)
         finally:
             clip_path.unlink(missing_ok=True)
+            sidecar_path.unlink(missing_ok=True)
 
     def test_start_upload_rejects_when_upload_lock_is_held(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -1402,7 +2560,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         bridge._upload_lock = threading.Lock()
         bridge._upload_lock.acquire()
         try:
-            result = bridge.start_upload([{"title": "Clip", "privacy": "private"}], None, None)
+            result = bridge.start_upload([{"title": "Clip", "privacy": "private"}])
         finally:
             bridge._upload_lock.release()
 

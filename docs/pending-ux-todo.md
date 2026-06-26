@@ -2,6 +2,30 @@
 
 Captured on 2026-06-22 while testing the v2.3.0 release candidate. This file is now status-based: completed items are listed first, and remaining items should be tackled in small follow-up passes.
 
+## Cleanup Sweep 2026-06-24
+
+Completed:
+
+- Removed stale dynamic YouTube category lookup. Upload category is fixed to Gaming in the UI/backend/uploader path.
+- Removed legacy `.scheduled-list*` / `.sched-*` CSS after confirming the active Upload UI uses the calendar/timeline layout.
+- Upload view-load no longer persists an empty schedule when clip scanning returns no visible clips.
+- Missed local-watcher protection now applies to private/unlisted/public rows instead of public-only rows.
+- Ollama setup controls now use normalized text/vision status helpers and keep the download/help action available when the install path is not discoverable.
+- Candidate-debug recovery remains hidden from normal UI and now requires `VIRIAREVIVE_ENABLE_DEBUG_RECOVERY=1`.
+- Visible metadata wording is standardized on **AI Notes** for per-clip title/description hints.
+- Upload clip refresh now only shows the success toast after the scan/fallback completes.
+- `multimodal_analysis.py` and `tests/test_multimodal_analysis.py` are staged for the next commit, and `viria.spec` explicitly includes `multimodal_analysis`.
+- Rebuilt `dist/` and `release/` for v2.3.1, including the ZIP package, latest ZIP copy, installer EXE, and SHA256 files.
+- FFmpeg/dependency license-source signoff completed for this build: release compliance/safety passed, generated notices include FFmpeg GPL/source links, AGPL dependency notes, package licenses, and native media library hashes.
+
+Remaining:
+
+- Consider returning explicit persistence errors from schedule/upload APIs instead of only printing `_save_state()` failures.
+- Add hidden-selection warnings for Results/All Videos bulk delete when filters/search hide selected clips.
+- Decide whether library preview should support delete or hide the shared delete affordance there.
+- Improve calendar channel filtering summaries so filtered timelines and channel tabs count the same row set.
+- Add keyboard semantics to clickable calendar/detail/clip surfaces that are currently `div` click targets.
+
 ## Completed This Run
 
 - Detection wizard fixed-count behavior:
@@ -107,7 +131,7 @@ Captured on 2026-06-22 while testing the v2.3.0 release candidate. This file is 
   - Crop debug screenshots are default-off and, when explicitly enabled, write to app analysis cache instead of beside user videos.
   - Full FFmpeg command echoing is default-off; render logs keep concise phase/status lines unless verbose command logging is explicitly enabled.
 - Validation:
-  - Full unittest discovery passed this run: 277 tests.
+  - Full unittest discovery passed this run: 340 tests.
   - `node --check gui/app.js` passed.
 
 ## Still Pending Next
@@ -165,9 +189,9 @@ Implementation map:
 - `tests/test_feedback_reconciliation.py` or a new focused AI-ranking test file: cap, invalid schema, no model, hard-reject guard, and rank-delta reporting.
 - `README.md`: documented current AI Viral Potential metadata as local/Ollama-dependent, explainable, diagnostic on the label object, and capped/Deep-only when the separate ranking report is enabled.
 
-Open question before implementation:
+Resolved:
 
-- Whether the first active cap should be `+/-0.015` for safer release testing or `+/-0.020` to match deterministic moment-category ranking.
+- The first active AI cap is `+/-0.015` for safer release testing.
 
 ## Scout Sweep: New Edge Cases To Add Before/Alongside AI Graduation
 
@@ -506,9 +530,9 @@ Release verification:
 
 - [x] Run `venv\Scripts\python.exe -B -m unittest discover -s tests -p "test_*.py"`.
 - [x] Run `scripts\check_version_sync.py`.
-- [ ] Before the release commit/tag, ensure untracked runtime modules and tests are staged intentionally, especially `voice_profile.py` and `visual_diagnostics.py`.
+- [ ] Before the release commit/tag, ensure untracked runtime modules and tests are staged intentionally, especially `multimodal_analysis.py` and `tests/test_multimodal_analysis.py`.
 - [ ] Confirm public binary dependency/license posture before uploading broad-distribution installers. Current metadata includes `ultralytics==8.4.71` reporting `AGPL-3.0`, `pystray==0.19.5` reporting `LGPLv3`, and PyInstaller reporting GPL with its bundling exception.
-- [ ] Decide whether this release requires system FFmpeg or should bundle `bin/ffmpeg.exe` and `bin/ffprobe.exe`; current `bin/` contains only `README.md`.
+- [ ] FFmpeg is bundled in `bin/` for the public build; confirm GPL/source-notice posture before uploading broad-distribution installers.
 - [ ] Run `build.bat`.
 - [ ] Run installer build only if shipping a setup EXE for this version.
 
@@ -710,7 +734,7 @@ Test map:
 
 ## Upload Layout Redesign Pass
 
-Status: mostly implemented for the first redesign pass. The readiness strip, safer upload wording, compact schedule status classes, local upload history persistence, shared scheduler/manual success recording, stale schedule-save protection, top account/schedule row, right-side Upload Prep review panel, sticky action bar, derived upload summary, subtle calendar history markers, day-level history drill-down, source-level Optional AI Notes, and regression/static guards are now in place.
+Status: mostly implemented for the first redesign pass. The readiness strip, safer upload wording, compact schedule status classes, local upload history persistence, shared scheduler/manual success recording, stale schedule-save protection, top account/schedule row, right-side Upload Prep review panel, sticky action bar, derived upload summary, subtle calendar history markers, day-level history drill-down, per-clip AI Notes, and regression/static guards are now in place.
 
 Observed current app:
 
@@ -724,7 +748,7 @@ Best ideas to borrow from the generated mockup:
 - Add a lightweight workflow health strip, not a separate-screen wizard. It should highlight/check off the area the user is currently working in and show readiness at a glance.
 - Use this status model:
   - **1. Connect your accounts**: account exists, OAuth token is valid, selected channel is known. Show a green ready state when connected.
-  - **2. Select videos and metadata**: all available clips live here; no separate **Add more clips** affordance is needed for normal use. This is where source/folder rows expose **AI Titles**, **Optional AI Notes**, and per-clip title/description editing.
+  - **2. Select videos and metadata**: all available clips live here; no separate **Add more clips** affordance is needed for normal use. This is where clip rows expose **AI Notes** and per-clip title/description editing.
   - **3. Schedule clips**: Smart Schedule is an action/mode that auto-places selected clips into good slots, while manual drag/drop and adding clips to individual days stays available.
   - **4. Review and upload**: final queue, visibility, description/hashtag behavior, delete-after-upload, and upload start.
 - Readiness behavior should not treat every section as binary:
@@ -743,7 +767,7 @@ Best ideas to borrow from the generated mockup:
 - Preferred beginner-safe upload wording:
   - Completed: renamed the main CTA to **Send Scheduled Clips to YouTube**.
   - Completed: renamed scheduler bar language to **Local Upload Watcher** / `Next send to YouTube`.
-  - Completed: optional source context is now surfaced as **Optional AI Notes**.
+  - Completed: optional clip context is now surfaced as **AI Notes**.
   - Completed: timeline/readiness labels distinguish `Pending locally`, `Sent to YouTube`, `YouTube scheduled`, `Missed time`, `Upload failed`, and interrupted-upload **Check YouTube** states when known.
 - Account for app close/reopen behavior:
   - If the app closes while local calendar items are pending, the local watcher cannot upload while closed.
@@ -769,7 +793,7 @@ Best ideas to borrow from the generated mockup:
   - Completed: `_scheduler_loop()` captures the `upload_to_youtube()` result and calls the same shared uploaded/history path.
   - `_scheduled_upload_active()` already treats uploaded items as inactive; keep that as duplicate prevention, but do not rely on it as the only persistent protection.
   - Completed: `save_scheduled()` merges/preserves backend-owned fields like `uploaded`, `uploaded_at`, `youtube_id`, `youtube_url`, `scheduler_status`, `failure_count`, `last_error`, `missed_at`, upload attempt ids/timestamps, and status fields so stale frontend saves do not resurrect sent or in-progress clips.
-  - Completed: overdue public items become `Missed time` during schedule reads instead of waiting for a scheduler tick.
+  - Completed: overdue local-watcher items become `Missed time` during schedule reads instead of waiting for a scheduler tick.
   - Completed initial status field support: `upload_state` / `send_status` can distinguish `sent_to_youtube` and `youtube_scheduled`, while preserving `uploaded` for migration/backward compatibility.
   - Completed: before manual or local-watcher YouTube sends, backend now writes a durable `upload_attempt_id` / `uploading` marker. Success clears the marker into sent/upload history; known failures clear it into `upload_failed`; reopen after an unfinished attempt marks the row `upload_outcome_unknown` so the UI says **Check YouTube** and does not retry blindly.
   - Completed: single Results delete now refreshes backend schedule state and rerenders upload surfaces, matching bulk delete behavior.
@@ -787,7 +811,7 @@ Best ideas to borrow from the generated mockup:
   - Calendar chips have tight space, so do not add long labels inside chips. Use icon/ring/check/error styling and put detailed text in tooltips/day detail.
   - Active UI uses `#schedule-timeline`; avoid legacy `.scheduled-list*` styles when implementing.
 - Test map for this run:
-  - Completed: `tests/test_upload_scheduling.py` covers upload history recording, scheduler success YouTube id/url/history, stale frontend save preservation, and overdue public missed marking.
+  - Completed: `tests/test_upload_scheduling.py` covers upload history recording, scheduler success YouTube id/url/history, stale frontend save preservation, and overdue local-watcher missed marking.
   - Completed: `tests/test_upload_scheduling.py` covers durable upload-attempt markers, stale frontend-save preservation of attempt fields, success/failure cleanup, and crash/reopen conversion to `upload_outcome_unknown`.
   - Completed: `tests/test_gui_static_guards.py` asserts readiness strip DOM, helper/render functions, wording, shared status classes, and CSS states.
   - Release guards: if upload history becomes a separate file instead of part of `viria_state.json`, add it to private local-data release exclusions.
@@ -795,12 +819,12 @@ Best ideas to borrow from the generated mockup:
 - Completed: treat the middle of the screen as three work zones: **Your Clips/source queue**, **Scheduled Calendar**, and **Upload Prep/Review**.
 - Completed: keep the Upload Prep area in the right-side review/prep position from the mockup instead of as a disconnected bottom strip.
 - Completed: put an **Upload Summary** in that same panel: clips selected/scheduled, channel, visibility, start date, and estimated upload span.
-- Completed: keep a sticky bottom action bar with concise summary plus **Preview Queue** and **Send Scheduled Clips to YouTube**.
+- Completed: keep a sticky bottom action bar with concise summary plus **View Calendar Plan** and **Send Scheduled Clips to YouTube**.
 - Completed: readiness items focus the matching account, clip, calendar, or review area on the same screen.
 - Completed: calendar days can show subtle upload-history markers for previous successful sends that are not already visible as sent schedule chips.
 - Completed: added a day-level upload-history detail section for historical markers.
-- Completed: improved **Your Clips** with local search/filter, clearer source rows, and source-level actions like **Schedule**, **AI Titles**, and **Optional AI Notes**.
-- Completed: source-level **Optional AI Notes** now sit near folder AI Titles; per-clip overrides live in the metadata modal.
+- Completed: improved **Your Clips** with local search/filter, clearer source rows, and per-clip actions like **AI Notes**.
+- Completed: per-clip **AI Notes** live on clip rows and in the metadata modal.
 
 Avoid copying:
 
@@ -816,15 +840,53 @@ Implementation map:
 - `gui/app.js`: reuse `renderClipTray()`, `renderCalendar()`, `renderTimeline()`, `updateDescriptionOptionsStatus()`, `refreshScheduleFromBackend()`, and `startUpload()`.
 - Add a derived upload summary renderer from existing `state.scheduled`, `state.channels`, selected visibility, and start date.
 - Avoid new backend APIs for layout-only work, but the upload history/readiness pass does require backend state support via `upload_history`, merged schedule saves, and `load_persisted_state()` returning enough history/status data for the calendar.
-- Tests: static guard for layout classes, summary uses real state, upload button still calls `startUpload()`, and Optional AI Notes remain source-scoped.
+- Tests: static guard for layout classes, summary uses real state, upload button still calls `startUpload()`, and Optional AI Notes remain clip-scoped.
 
 ## Game Knowledge For Metadata
 
-Status: provider-backed Game Knowledge remains queued. The local creator-provided context slice below is completed; online/provider-backed game facts still need a separate privacy, licensing, attribution, and UX pass.
+Status: first Wikidata-backed Game Knowledge slice is implemented. ViriaRevive can resolve likely game identity from local title hints and YouTube metadata, fetch/cache compact game facts, then feed those facts into AI moment labels, Deep Analysis vision prompts, title/description prompts, sidecars, and run debug. Broader wiki/walkthrough-style sources still need a separate privacy, licensing, attribution, and UX pass.
+
+### Wikidata One-Game DB Prototype
+
+Status: sample built for schema discovery only. A one-query Alan Wake pull was written to ignored runtime data at `analysis_cache/game_context_sample.sqlite3`.
+
+Implemented runtime slice:
+
+- `game_context.py` stores a small SQLite cache under app data `game_context/game_context.sqlite3`.
+- `game_identity.py` resolves likely game identity before fact lookup by combining explicit/user hints, source filename/folder hints, YouTube title/description/tag metadata, local cache hits, Wikidata search results, and QID-validated game context.
+- Recent-game seeding supports pagination/offsets, de-dupes query results by QID, and skips already-cached games by default.
+- The first provider is Wikidata only, using compact CC0 facts instead of raw wiki pages or walkthrough prose.
+- Prompt context is capped and includes game identity fields such as release year, genre, developer, publisher, platform, series, fictional universe, characters, narrative locations, environment, and game mode.
+- `api_bridge.py` resolves identity/context once per source during analysis and passes it through candidate evaluation, AI labels, multimodal vision analysis, selected moments, metadata sidecars, and run debug.
+- `title_generator.py` and `multimodal_analysis.py` use game knowledge as background only and keep "do not invent" rules in the prompts.
+- Release safety now blocks local game-context caches from packaged builds.
+
+Findings:
+
+- The sample game row was `Alan Wake (Q575505)`.
+- The query returned 156 fact rows across 112 distinct Wikidata properties.
+- A fixed wide table would get brittle quickly because games have many optional IDs, ratings, stores, review scores, awards, languages, platforms, characters, and external references.
+- Use a hybrid schema instead:
+  - `games`: `qid`, `label`, `description`, `sitelinks`, `source_url`, `license`, `license_url`, `fetched_at`.
+  - `game_aliases`: `qid`, `alias`.
+  - `game_facts`: `qid`, `property_id`, `property_label`, `value_kind`, `value_id`, `value_label`, `value_text`, `datatype`, `source_url`, `fetched_at`.
+  - `game_fact_columns`: curated mapping from important properties to app-facing prompt fields.
+- First prompt-worthy mapped fields:
+  - `P577` -> `first_release_date`
+  - `P178` -> `developers`
+  - `P123` -> `publishers`
+  - `P136` -> `genres`
+  - `P400` -> `platforms`
+  - `P179` -> `series`
+  - `P674` -> `characters` (only use when supported by transcript/vision)
+  - `P840` -> `narrative_locations`
+  - `P31` -> `instance_of`
+  - `P856` -> `official_website` (source/link only)
+- Some Wikidata entity values can still return only QIDs in one broad query. Keep both `value_id` and `value_label`, and add a small label-enrichment fallback before prompt use.
 
 ### Creator-Provided Video Context
 
-Status: completed for the first local-only slice. Source-level Optional AI Notes and per-clip metadata overrides now save sanitized `creator_title_context`, feed the compact title prompt/sidecar pipeline, and avoid copying those notes into final descriptions.
+Status: completed for the first local-only slice. Per-clip Optional AI Notes and scheduled metadata overrides now save sanitized `creator_title_context`, feed the compact title prompt/sidecar pipeline, and avoid copying those notes into final descriptions.
 
 Concept:
 
@@ -836,11 +898,10 @@ Concept:
 
 Recommended UI placement:
 
-1. **Primary home: Upload > clip source/folder rows**
-   - Completed: added an **Optional AI Notes** control beside each source folder's `AI Titles` button.
-   - Best match for the user's wording: they can say what the video/session is before generating titles for that source.
-   - Completed: scope is source/session, keyed by `source_id` or `source_stem`, then copied to matching moments/scheduled rows.
-   - This prevents one global hint from accidentally applying to unrelated batches.
+1. **Primary home: Upload > individual clip rows**
+   - Completed: added an **AI Notes** control on each clip row.
+   - Best match for mixed-source batches: the user can explain a specific clip without accidentally applying that hint to unrelated videos.
+   - Completed: scope is clip-level, keyed by `clip_id`/filename and copied to matching scheduled rows.
 2. **Companion home: scheduled Edit Clip modal**
    - Completed: added a compact **Optional AI Notes** field under the title area near the `AI Title` button.
    - This lets the user override the source/session hint for one clip.
@@ -857,10 +918,10 @@ Frontend implementation map:
 - `gui/index.html`
   - Upload page controls: `#section-upload`, `#btn-gen-ai-titles`, folder/tray rows.
   - Scheduled metadata modal: `#meta-modal`, `#modal-meta-title`, `#modal-meta-desc`, `#modal-description-preview`.
-  - Completed: added a small source-level **Optional AI Notes** action near folder `AI Titles`.
+  - Completed: added a compact per-clip **AI Notes** action in the clip tray.
   - Completed: added a per-clip **Optional AI Notes** textarea in `#meta-modal`.
 - `gui/app.js`
-  - Folder/source UI: `_buildClipTrayFolder()` / tray folder actions around `AI Titles`.
+  - Clip tray UI: `_createTrayClipEl()` and the per-clip `AI Notes` action.
   - Title entry points: `generateAITitlesManual()`, `generateAITitlesForFolder(stem, btn)`, `regenerateTitle(schedIdx)`.
   - Schedule helpers: `_scheduleClipIndices()`, `descriptionFieldsForClip()`, `applyGeneratedMetadataToSchedule()`, `openMetaModal()`, `saveMetaModal()`, `normalizeScheduledMetadata()`.
   - Completed: added state/payload handling for `creator_title_context`.
@@ -872,7 +933,7 @@ Backend/data implementation map:
 - `api_bridge.py`
   - Completed: normalized context is stored on persisted moments as `moment["creator_title_context"]`.
   - Completed: added a sanitizer/truncator for creator context.
-  - Completed: added `save_source_title_context(source_id/source_stem, text)` to update matching `_moments`, matching scheduled rows, and save state.
+  - Completed: added `save_clip_title_context(clip_id, clip_index, filename, text)` to update the matching moment, matching scheduled rows, and save state.
   - Completed: `_title_context_for_clip()` includes `creator_title_context`.
   - Completed: `_store_generated_metadata()` and the title context summary inherit sanitized creator context.
   - Completed: `_write_metadata_sidecar()` adds a compact `Creator Context:` line under `Analysis Context`.
@@ -911,7 +972,7 @@ Concept:
 
 - This is a strong idea, but the safe version is not "scrape GameFAQs and feed the whole guide to Ollama." It should be a provider-backed game-context/RAG layer for titles, descriptions, tags, and AI moment labels.
 - The app should use the same clip analysis it already has, then retrieve a few compact game/story facts from licensed/attributable online sources.
-- Knowledge should enrich metadata only at first. Do not let it change clip detection/ranking until the metadata path is proven stable.
+- First runtime slice now enriches metadata and reinforces the middle of analysis: AI moment labels, Deep Analysis vision prompts, heuristic context scoring, sidecars, and debug. Keep the influence compact and auditable before allowing broader wiki/story retrieval to affect ranking.
 - The goal is to help Ollama know things like game title, enemy/location/mechanic/story-beat names, and broad story context without inventing details that are not visible in the clip.
 - Do not require users to build or import local knowledge packs.
 
@@ -929,7 +990,7 @@ Recommended product shape:
 
 1. Start with an opt-in online **Game Knowledge** provider layer, not local imports.
    - Default can stay off until the user enables **Use online game context for metadata**.
-   - The feature should clearly say it only helps titles/descriptions/tags at first.
+   - The feature should clearly say when it helps titles/descriptions/tags versus candidate analysis/ranking.
    - No arbitrary URL scraping.
    - No GameFAQs ingestion unless we later have an explicit license, public API, or partner-approved path.
    - User should not need to curate files.
@@ -970,7 +1031,7 @@ Recommended product shape:
    - Put this in **Settings > Data & Privacy > Advanced Features** as a new **Game Knowledge** tab.
    - Add a lighter **Local AI** status line: `Game Knowledge: Off / Online context ready / Sources cached`.
    - Upload metadata and AI title flows should show whether Game Knowledge influenced generated metadata.
-   - Do not add another Generate wizard step unless this later affects detection/ranking.
+   - Do not add another Generate wizard step; expose status and clearing controls in Data & Privacy / Local AI instead.
 7. Metadata behavior:
    - Titles should use context to get more specific, not longer.
    - Descriptions should stay viewer-facing and never expose prompt/debug phrasing.
@@ -1072,3 +1133,29 @@ Test map:
   - Data & Privacy.
   - Debugging And State.
   - Optional Game Knowledge setup with opt-in network, provider, attribution, copyright, and privacy wording.
+
+## Upload Reliability Sweep - 2026-06-25
+
+Status: targeted reliability fixes in progress after the first real YouTube upload attempt failed on a Google resumable-upload 308 response.
+
+Completed in this pass:
+
+- `uploader.py`: call `request.next_chunk(num_retries=YOUTUBE_UPLOAD_CHUNK_RETRIES)` so transient chunk/network failures get the Google client library retry path.
+- `uploader.py` / `viria.spec`: keep the patched `httplib2` transport visible in packaged builds and log loudly if the patched path is unavailable.
+- `api_bridge.py`: reject non-video files from `_safe_clip_path()` even if a tampered state file points inside `CLIPS_DIR`.
+- `api_bridge.py`: when a schedule slot changes, clear stale backend upload success/failure/missed fields instead of preserving old row state.
+- `api_bridge.py`: retry-ready `upload_failed` rows no longer become `missed` just because the original local calendar time is outside the grace window.
+- `api_bridge.py`: upload attempts now store a slot fingerprint and success/failure/clear paths require the same attempt id plus unchanged slot fingerprint, so an in-flight upload cannot mark a rescheduled slot as uploaded.
+- `game_context.py`: cache/connect failures now return soft `query_error` payloads instead of risking an undefined cached QID.
+- `gui/index.html` / `README.md`: Game Knowledge privacy wording now explicitly says Wikidata may be contacted for compact game facts and that raw clips are not uploaded for local learning.
+- `gui/app.js`: clip tray scheduled badges/counts refresh after picker scheduling, metadata save, and schedule removal.
+- `gui/app.js`: editing a row title/time/privacy clears stale missed/failed/uploading fields for that row.
+- `gui/app.js`: upload summary now reports multi-channel queues instead of showing only the first channel.
+
+Still open after this pass:
+
+- Add friendlier permanent-error classes for YouTube quota, revoked OAuth, invalid privacy, invalid title/description/tags, and daily upload-limit responses instead of treating every `HttpError` as a transient retry.
+- Decide whether `Clear All` should be renamed `Clear Pending` or should also archive/remove sent rows from the active calendar plan.
+- Render disconnected/legacy scheduled channel ids in calendar filter tabs, or reset those filters to `All` with a clear note.
+- Add direct retry/reschedule actions and visible `last_error` detail for failed calendar/timeline rows.
+- Add keyboard/focus support for clickable upload calendar cells, tray folders, clip picker items, and day-detail rows.

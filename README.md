@@ -53,10 +53,35 @@ It is especially useful for:
 
 - Choose **Fast**, **Balanced**, or **Deep Analysis** depending on how much time
   you want the app to spend looking.
+  - **Fast** keeps heavier AI/vision passes off so quick batches finish sooner.
+  - **Balanced** uses stronger transcript, scene, and label ranking without the
+    full vision-model pass.
+  - **Deep Analysis** inspects more candidates and can use local vision context
+    when Ollama's vision model is ready.
 - Uses audio peaks, scene signals, transcript quality, category labels, and
   local feedback to rank clips.
+- In **Deep Analysis**, can use an installed local Ollama vision model to inspect
+  sampled frames so rankings and metadata are grounded in what is actually on
+  screen. Close near-misses can be rescued when transcript quality is just under
+  the bar but the frames show a strong visual moment.
+- Resolves likely game identity from source names, YouTube metadata, and an
+  optional **Game** hint in the Generate wizard, then adds compact Wikidata
+  facts such as series, genre, developer, release year, and setting-related
+  labels so AI labels and metadata have more context without needing walkthrough
+  text.
+- Remembers resolved source/game context locally, so later title rerolls,
+  descriptions, upload metadata, and debug reports can reuse the same source
+  identity instead of guessing again.
+- In Deep Analysis, verified game context adds a small capped ranking nudge
+  after candidates already exist. Horror/survival, action, story-heavy, and
+  instructional moments can win close calls, but the cap keeps game knowledge
+  from overpowering actual clip quality.
 - Can prefer fewer stronger clips instead of padding a batch with weak moments.
 - Learns from local like, dislike, favorite, and reason feedback.
+- The Generate page now has a staged **Short Clips / Montage** mode switch.
+  Montage settings are wired through the wizard and run debug as planning
+  intent; stitched montage rendering is being built from the staged plan in
+  [docs/montage-plan.md](docs/montage-plan.md).
 
 ### Handle Gameplay Audio
 
@@ -79,20 +104,43 @@ It is especially useful for:
 
 - Results and All Videos show playable clip cards, thumbnails, labels, and local
   feedback controls.
-- Feedback stays on your machine and can nudge future detection.
+- Likes, dislikes, favorites, reason chips, and optional notes stay on your
+  machine and can nudge future detection.
 - Optional creator voice profile stores numeric local features only, not raw
-  audio, and can be used as a small opt-in ranking nudge.
+  audio. It needs enough usable creator-speech samples before the ranking nudge
+  becomes active.
+- Deep Analysis can combine several capped nudges: feedback, creator voice,
+  transcript labels, scene/audio evidence, and local vision-frame context.
 
 ### Titles, Descriptions, And Uploads
 
 - Generates titles, descriptions, tags, and sidecar `.txt` files for manual
   posting.
-- Uses optional local Ollama for richer AI titles and moment labels.
-- Supports creator-provided AI notes so titles can understand the game/session
-  context better.
+- Batch and per-clip AI metadata rerolls refresh the matching `.txt` file; batch
+  filename rerolls also remove stale metadata sidecars from the old filename.
+- Uses optional local Ollama for richer AI titles, moment labels, and Deep
+  Analysis vision context when a vision-capable model is installed.
+- Uses cached game context as background only, helping titles and descriptions
+  stay game-aware while avoiding invented enemy names, locations, or story beats.
+- The optional Generate wizard **Game** field is run-only: "Leave blank for
+  auto-detect. Add the game name if you want stronger titles, labels, and clip
+  ranking."
+- Result cards, All Videos cards, preview windows, and run debug JSON include a
+  compact truth summary: detected game, confidence, source of the match
+  (user hint, YouTube metadata, filename, Wikidata, or auto), whether game
+  context moved ranking, the score delta, and whether visual analysis was used.
+- Reuses analysis-generated titles, descriptions, tags, vision keywords, and
+  creator notes when clips are added to the upload scheduler.
+- Supports creator-provided AI notes per clip so title and description rerolls
+  can understand the exact moment.
+- If game identity was missing or weak, those AI notes can help refresh the
+  local game match before rerolling metadata.
 - Can connect YouTube accounts with your own Google OAuth credentials.
 - Includes a calendar scheduler, upload readiness checks, and local upload
   history.
+- Calendar entries are local plans until you send them to YouTube. The app can
+  also watch due scheduled items while it is open, and it marks missed, failed,
+  or uncertain uploads so you can repair them before retrying.
 
 ---
 
@@ -100,11 +148,16 @@ It is especially useful for:
 
 ViriaRevive is designed to keep creator data local.
 
-- Clips, debug reports, feedback, voice profile data, settings, and YouTube
-  tokens are stored on your PC.
+- Clips, debug reports, feedback, source/game memory, voice profile data,
+  settings, and YouTube tokens are stored on your PC.
 - Clip detection, transcript ranking, local labels, and feedback learning do not
   upload your raw media to a cloud service.
 - Ollama is optional and runs locally when installed.
+- Optional game knowledge resolves the likely game title through Wikidata using
+  local filenames, YouTube titles/descriptions/tags when available, and user
+  hints. These compact game lookups can contact Wikidata over the network. The
+  app stores a small local fact cache, but does not upload your videos or cache
+  walkthroughs/raw wiki pages.
 - YouTube upload is optional and only uses Google APIs after you connect your own
   account.
 
@@ -149,11 +202,31 @@ label fallbacks.
 In the app, open **Settings > Local AI**:
 
 1. **Install Ollama** opens the official Ollama download page.
-2. **Install via PowerShell** asks first, then runs Ollama's official Windows
-   installer command in a visible PowerShell window.
-3. **Download AI Model** pulls the local model used for AI titles and labels.
-4. The footer status only says Ollama is ready when the local Ollama API and
-   selected model are actually detected.
+2. After Ollama is installed and running, **Download Text Model** appears for
+   the approved local model used for AI titles, descriptions, and moment labels.
+3. After Ollama is installed and running, **Download Vision Model** appears for
+   the approved local model used by Deep Analysis to inspect sampled gameplay
+   frames.
+4. The footer and Settings card show separate text-model and vision-model
+   readiness, including the actual model names detected locally.
+
+ViriaRevive does not run remote PowerShell installer scripts from inside the
+app. It sends you to Ollama's official download page, then lets Ollama download
+the approved local models once the local service is running.
+
+Deep Analysis can also use a local Ollama vision model, if you install one. The
+recommended local setup is:
+
+```bat
+ollama pull qwen3.5:4b
+ollama pull qwen3-vl:latest
+```
+
+`qwen3.5:4b` powers local titles, descriptions, and AI moment labels.
+`qwen3-vl:latest` lets Deep Analysis inspect sampled gameplay frames. If no
+local vision model is detected, Deep Analysis keeps using the normal transcript,
+audio, scene, visual-stat, feedback, voice-profile, and category ranking path.
+The app only downloads these approved models from its UI.
 
 ### Optional YouTube Upload
 
@@ -183,7 +256,8 @@ Do not commit `client_secrets.json`, `tokens/`, or generated OAuth files.
 3. **Analyze** - ViriaRevive finds and ranks candidate moments.
 4. **Review** - watch clips, favorite the good ones, and dislike the misses.
 5. **Prepare** - generate titles, descriptions, tags, and metadata sidecars.
-6. **Schedule** - drag clips onto the upload calendar.
+6. **Schedule** - choose a connected channel, then drag clips onto the upload
+   calendar or let Smart Schedule place them.
 7. **Publish** - upload through YouTube scheduling or post clips manually.
 
 ---
@@ -218,9 +292,13 @@ CLI mode is available for simpler runs:
 ```bat
 python main.py "https://youtube.com/watch?v=VIDEO_ID"
 python main.py "URL" --clips 5 --duration 30 --style bold
+python main.py "URL" --upload --schedule 24
 ```
 
-The desktop app is the main experience. CLI mode is intentionally leaner.
+The desktop app is the main experience. CLI mode is intentionally leaner, but
+it still uses transcript-aware ranking, local feedback scoring, generated
+titles/descriptions/tags for `--upload`, and the optional
+`--moment-category-ranking` flag for deterministic category nudging.
 
 ---
 
@@ -301,6 +379,10 @@ ViriaRevive/
 ├── detector.py                # Candidate detection
 ├── transcriber.py             # Faster-Whisper integration
 ├── clipper.py                 # FFmpeg clip rendering
+├── multimodal_analysis.py     # Optional local Ollama vision-frame context
+├── game_context.py            # Compact Wikidata-backed game facts/cache
+├── game_identity.py           # Game title/source identity resolver
+├── speech_source_classifier.py # Creator/game speech-source classifier
 ├── title_generator.py         # Titles, descriptions, tags, AI labels
 ├── uploader.py                # YouTube OAuth and uploads
 ├── version.py                 # Central app version metadata

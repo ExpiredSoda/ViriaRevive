@@ -29,10 +29,12 @@ class GuiStaticGuardTests(unittest.TestCase):
 
     def test_candidate_debug_recovery_is_not_user_facing(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        bridge = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
 
         self.assertNotIn("Render Last Analysis", html)
         self.assertNotIn("btn-resume-analysis", html)
         self.assertNotIn("recoverLastAnalysis", self.app_js)
+        self.assertIn("VIRIAREVIVE_ENABLE_DEBUG_RECOVERY", bridge)
 
     def test_upload_completion_refreshes_schedule_from_backend(self):
         self.assertIn("await refreshScheduleFromBackend(false);", self.app_js)
@@ -45,6 +47,7 @@ class GuiStaticGuardTests(unittest.TestCase):
     def test_upload_readiness_strip_is_wired(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+        api = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
 
         self.assertIn('id="upload-readiness-strip"', html)
         self.assertIn("focusUploadReadiness", self.app_js)
@@ -53,6 +56,8 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("schedulerStatus === 'upload_outcome_unknown'", self.app_js)
         self.assertIn("label: 'Check YouTube'", self.app_js)
         self.assertIn("function uploadReadinessState", self.app_js)
+        self.assertIn("metadata_stale", self.app_js)
+        self.assertIn("Needs reroll", self.app_js)
         self.assertIn("function renderUploadReadinessStrip", self.app_js)
         self.assertIn("renderUploadReadinessStrip();", self.app_js)
         self.assertIn(".upload-readiness-step.is-ready", css)
@@ -83,6 +88,14 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn(".upload-summary-row", css)
         self.assertIn(".upload-action-bar", css)
         self.assertIn(".upload-action-controls .btn-upload-go", css)
+        self.assertIn("const queuedChannelIds = [...new Set(", self.app_js)
+        self.assertIn("Multiple channels", self.app_js)
+
+    def test_upload_schedule_edits_refresh_tray_and_clear_stale_status(self):
+        self.assertIn("const SCHEDULE_BACKEND_STATUS_KEYS = [", self.app_js)
+        self.assertIn("function clearScheduleBackendStatus", self.app_js)
+        self.assertIn("clearScheduleBackendStatus(item);", self.app_js)
+        self.assertGreaterEqual(self.app_js.count("renderClipTray();"), 10)
 
     def test_upload_calendar_uses_history_markers_without_fake_status(self):
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
@@ -123,7 +136,11 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn(".day-detail-status.youtube-scheduled", css)
         self.assertIn("scheduleItemStatus(s).key === 'unknown'", self.app_js)
         self.assertIn("Check YouTube Studio", self.app_js)
+        self.assertIn("function uploadRetryReady", self.app_js)
+        self.assertIn("key: 'retry_ready'", self.app_js)
+        self.assertIn("One or more failed uploads is waiting for its retry time", self.app_js)
         self.assertIn("['missed', 'failed', 'unknown', 'disconnected', 'invalid']", self.app_js)
+        self.assertIn("['missed', 'disconnected', 'invalid']", self.app_js)
 
     def test_empty_schedule_clears_stale_upload_ui(self):
         self.assertIn("if (!state.scheduled.length) {", self.app_js)
@@ -139,21 +156,44 @@ class GuiStaticGuardTests(unittest.TestCase):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
 
-        self.assertIn("AI Context", html)
+        self.assertIn("AI Notes", html)
         self.assertIn('id="source-context-modal"', html)
         self.assertIn('id="source-context-text"', html)
         self.assertIn('id="modal-meta-creator-context"', html)
         self.assertIn("function creatorTitleContextForClip", self.app_js)
-        self.assertIn("function openSourceTitleContextModal", self.app_js)
-        self.assertIn("function saveSourceTitleContextModal", self.app_js)
-        self.assertIn("pywebview.api.save_source_title_context", self.app_js)
+        self.assertIn("function openClipTitleContextModal", self.app_js)
+        self.assertIn("function openLibraryTitleContextModal", self.app_js)
+        self.assertIn("function saveAiContextModal", self.app_js)
+        self.assertIn("pywebview.api.save_clip_title_context", self.app_js)
+        self.assertIn("pywebview.api.save_clip_game_title", self.app_js)
+        self.assertIn('id="game-title-modal"', html)
+        self.assertIn("function openClipGameTitleModal", self.app_js)
+        self.assertIn("function openLibraryGameTitleModal", self.app_js)
+        self.assertNotIn("pywebview.api.save_source_title_context", self.app_js)
+        self.assertNotIn("openSourceTitleContextModal", self.app_js)
         self.assertIn("creator_title_context: creatorTitleContextForClip(idx)", self.app_js)
         self.assertIn("creator_title_context: s.creator_title_context || ''", self.app_js)
         self.assertIn("const hasGeneratedDescription = Object.prototype.hasOwnProperty.call(item, 'description_generated')", self.app_js)
         self.assertIn("await pywebview.api.save_scheduled(state.scheduled);", self.app_js)
-        self.assertIn(".tray-folder-context-btn", css)
-        self.assertIn(".tray-folder-context-btn.has-context", css)
+        self.assertIn("pywebview.api.generate_title_for_clip(s.clipIdx, true, s.creator_title_context)", self.app_js)
+        self.assertIn(".tray-clip-context-btn", css)
+        self.assertIn(".tray-clip-context-btn.has-context", css)
+        self.assertNotIn(".tray-folder-context-btn", css)
         self.assertIn(".source-context-copy", css)
+
+    def test_ai_metadata_reroll_wording_is_clear(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("Generate / Reroll AI Metadata", html)
+        self.assertIn("titles, descriptions, tags, filenames, and matching .txt files", html)
+        self.assertIn("Batch AI metadata updates titles, descriptions, tags, clip filenames, and the matching .txt files.", html)
+        self.assertIn("Reroll AI Metadata", html)
+        self.assertIn("Reroll updates this clip's title, generated description, tags, and .txt file.", html)
+        self.assertIn("Generate / Reroll AI Metadata", self.app_js)
+        self.assertIn("AI metadata rerolled", self.app_js)
+        self.assertIn("AI Metadata</button>", self.app_js)
+        self.assertIn(".metadata-reroll-note", css)
 
     def test_upload_clip_tray_has_local_search_filter(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
@@ -197,6 +237,8 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn('id="smart-sched-custom-perday"', html)
         self.assertIn('oninput="_renderPeakTimesLegend(); renderUploadSummary()"', html)
         self.assertIn("await refreshScheduleFromBackend(false);\n                await loadResults();", self.app_js)
+        self.assertNotIn("state.scheduled = [];\n        persistSchedule();", self.app_js)
+        self.assertIn("preserveUnresolved: !state.results.length", self.app_js)
 
     def test_schedule_rendering_escapes_persisted_text_fields(self):
         self.assertIn('class="cal-chip-time">${escHtml(s.time || \'\')}</span>', self.app_js)
@@ -209,13 +251,29 @@ class GuiStaticGuardTests(unittest.TestCase):
 
     def test_ollama_setup_buttons_are_status_aware(self):
         self.assertIn("id=\"btn-ollama-download\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
-        self.assertIn("id=\"btn-ollama-install\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
         self.assertIn("id=\"btn-ollama-model\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("id=\"btn-ollama-vision-model\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("id=\"settings-ollama-text-model\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("id=\"settings-ollama-vision-model\"", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
         self.assertIn("function updateOllamaActionButtons", self.app_js)
+        self.assertIn("function normalizedOllamaTextStatus", self.app_js)
+        self.assertIn("function normalizedOllamaVisionStatus", self.app_js)
         self.assertIn("Open Ollama Folder", self.app_js)
-        self.assertIn("Ollama Installed", self.app_js)
-        self.assertIn("AI Model Ready", self.app_js)
-        self.assertIn("Download AI Model", (ROOT / "gui" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("Open Ollama Download", self.app_js)
+        self.assertIn("Ollama Running", self.app_js)
+        self.assertIn("Text Model Ready", self.app_js)
+        self.assertIn("Vision Model Ready", self.app_js)
+        self.assertIn("Vision Ready", self.app_js)
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('class="btn-secondary btn-sm hidden" id="btn-ollama-model"', html)
+        self.assertIn('class="btn-secondary btn-sm hidden" id="btn-ollama-vision-model"', html)
+        self.assertIn("modelBtn.classList.add('hidden');", self.app_js)
+        self.assertIn("visionModelBtn.classList.add('hidden');", self.app_js)
+        self.assertIn("modelBtn.classList.remove('hidden');", self.app_js)
+        self.assertIn("visionModelBtn.classList.remove('hidden');", self.app_js)
+        self.assertNotIn("Start Ollama First", self.app_js)
+        self.assertNotIn("openOllamaInstallerPage", self.app_js)
+        self.assertIn("Opened official Ollama download page", self.app_js)
 
     def test_subtitle_none_option_is_available_in_settings_and_wizard(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
@@ -227,11 +285,15 @@ class GuiStaticGuardTests(unittest.TestCase):
 
     def test_detection_preference_and_subtitle_snapshot_preview_are_wired(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+        api = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
 
         self.assertIn('id="set-detection-preference"', html)
         self.assertIn('id="wizard-detection-preference"', html)
         self.assertIn('id="wizard-detection-preference-fixed"', html)
         self.assertIn('id="wizard-depth-presets"', html)
+        self.assertIn('id="wizard-game-title-hint"', html)
+        self.assertIn("For mixed-game batches, leave this blank unless every queued video is the same game.", html)
         self.assertIn('data-depth="fast"', html)
         self.assertIn('data-depth="balanced"', html)
         self.assertIn('data-depth="deep"', html)
@@ -244,6 +306,25 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("pickedNumClips === 'auto'", self.app_js)
         self.assertIn("settings.processing_depth = pickedProcessingDepth;", self.app_js)
         self.assertIn("settings.detection_preference = pickedDetectionPreference;", self.app_js)
+        self.assertIn("settings.game_title_hint = pickedGameTitleHint;", self.app_js)
+        self.assertIn("function normalizeGameTitleHint", self.app_js)
+        self.assertIn("function truthSummaryForClip", self.app_js)
+        self.assertIn("function clipTruthMarkup", self.app_js)
+        self.assertIn("truth_summary", api)
+        self.assertIn("_clip_truth_summary", api)
+        self.assertIn("game_context_affected_ranking", api)
+        self.assertIn("visual_analysis_used", api)
+        self.assertIn(".truth-summary-row", css)
+        self.assertIn("Edit game", self.app_js)
+        self.assertIn("Game: ${gameTitle || 'Unknown'}", self.app_js)
+        self.assertNotIn("Game nudge", self.app_js)
+        self.assertNotIn("formatTruthConfidence", self.app_js)
+        self.assertNotIn("formatTruthDelta", self.app_js)
+        self.assertNotIn(".truth-chip.is-vision", css)
+        self.assertIn(".wizard-field-help", css)
+        self.assertIn("GAME_CONTEXT_SELECTION_MAX_ADJUSTMENT", api)
+        self.assertIn('"game_context_nudge_max_adjustment"', api)
+        self.assertIn('"game_context_nudge": multi_signal_scoring.get("game_context_nudge")', (ROOT / "candidate_ranker.py").read_text(encoding="utf-8"))
         self.assertIn('value="quality"', html)
         self.assertIn('value="quantity"', html)
         self.assertIn('id="subtitle-placement-snapshot-empty"', html)
@@ -262,6 +343,9 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("recordLibraryFeedback(clip, btn.dataset.feedback)", self.app_js)
         self.assertIn("state.previewLibraryClip", self.app_js)
         self.assertIn("renderCardFeedbackState(item, clip)", self.app_js)
+        self.assertIn("const truthLabel = clipTruthMarkup(clip, clip, { editable: true });", self.app_js)
+        self.assertIn("openLibraryTitleContextModal(clip)", self.app_js)
+        self.assertIn("openLibraryGameTitleModal(clip)", self.app_js)
         self.assertIn(".library-item-overlay .play-btn", css)
         self.assertIn('id="feedback-modal"', html)
         self.assertIn("FEEDBACK_REASON_PRESETS", self.app_js)
@@ -316,6 +400,13 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("resultsSelectedFilenames", self.app_js)
         self.assertIn("resultsVisibleFilenames", self.app_js)
         self.assertIn("function requestDeleteSelectedResults", self.app_js)
+        self.assertIn("function ensureEmptyState", self.app_js)
+        self.assertIn("ensureEmptyState('results-empty'", self.app_js)
+        self.assertIn("ensureEmptyState('library-empty'", self.app_js)
+        self.assertIn("async function releaseLocalVideoHandlesBeforeDelete", self.app_js)
+        self.assertIn("await releaseLocalVideoHandlesBeforeDelete([state.pendingDeleteFilename]);", self.app_js)
+        self.assertIn("await releaseLocalVideoHandlesBeforeDelete(filenames);", self.app_js)
+        self.assertIn("_activeThumbVideos", self.app_js)
         self.assertIn("state.pendingDeleteSource = 'results-bulk';", self.app_js)
         self.assertIn("delete_library_files(filenames)", self.app_js)
         self.assertIn('id="results-select-visible"', html)
@@ -353,18 +444,15 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("function momentLabelMarkup", self.app_js)
         self.assertIn("function aiMomentForClip", self.app_js)
         self.assertIn("function renderPreviewMomentLabel", self.app_js)
-        self.assertIn("source: 'Detected'", self.app_js)
-        self.assertIn("source = isOllama ? 'Ollama' : 'Fallback'", self.app_js)
-        self.assertIn("const chips = [];", self.app_js)
-        self.assertIn("if (detectedChip && (!aiChip || disagrees)) chips.push(detectedChip);", self.app_js)
+        self.assertIn("const displayLabel = info.fineLabels[0] || info.primaryLabel;", self.app_js)
+        self.assertNotIn("const chips = [];", self.app_js)
         self.assertIn("renderPreviewMomentLabel();", self.app_js)
         self.assertIn("const momentLabel = momentLabelMarkup(clip, m);", self.app_js)
         self.assertIn("momentLabelMarkup(clip, m)", self.app_js)
         self.assertIn("const momentLabel = momentLabelMarkup(clip, clip);", self.app_js)
         self.assertIn("momentLabelMarkup(clip, clip)", self.app_js)
-        self.assertIn(".moment-chip.is-ai", css)
-        self.assertIn(".moment-chip.is-local", css)
         self.assertIn(".moment-chip.is-category", css)
+        self.assertNotIn(".moment-chip.is-fine", css)
 
     def test_moment_label_filters_are_local_review_controls(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
@@ -377,10 +465,11 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("function renderMomentFilterBar", self.app_js)
         self.assertIn("function clipMatchesMomentFilter", self.app_js)
         self.assertIn("function normalizeAvailableMomentFilter", self.app_js)
-        self.assertIn("let categoryCount = 0;", self.app_js)
-        self.assertIn("sourceParts.push(`${aiCount} Ollama`)", self.app_js)
-        self.assertIn("sourceParts.push(`${localCount} fallback`)", self.app_js)
-        self.assertIn("sourceParts.push(`${categoryCount} detected`)", self.app_js)
+        self.assertIn("momentFilterKeyForClip(clip, moment)", self.app_js)
+        self.assertIn("moment-filter-summary", self.app_js)
+        self.assertNotIn("sourceParts.push(`${aiCount} Ollama`)", self.app_js)
+        self.assertNotIn("sourceParts.push(`${localCount} fallback`)", self.app_js)
+        self.assertNotIn("sourceParts.push(`${categoryCount} detected`)", self.app_js)
         self.assertIn("(!labeled && active === 'all')", self.app_js)
         self.assertIn("key === 'unlabeled' ? 'Unlabeled'", self.app_js)
         self.assertIn("renderMomentFilterBar(\n        'results-moment-filters'", self.app_js)
@@ -404,17 +493,19 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("el.innerHTML = '';", self.app_js)
 
     def test_ollama_status_only_shows_ready_when_using_ollama(self):
-        using_idx = self.app_js.index("if (status.using_ollama)")
-        on_idx = self.app_js.index("label.textContent = 'Ollama on'", using_idx)
-        running_idx = self.app_js.index("} else if (status.running)", using_idx)
-        missing_idx = self.app_js.index("label.textContent = 'Model missing'", running_idx)
+        using_idx = self.app_js.index("if (textReady && visionReady)")
+        on_idx = self.app_js.index("label.textContent = 'AI full'", using_idx)
+        running_idx = self.app_js.index("} else if (status.running && textReady)", using_idx)
+        missing_idx = self.app_js.index("label.textContent = 'Models missing'", running_idx)
 
         self.assertLess(using_idx, on_idx)
         self.assertLess(on_idx, running_idx)
         self.assertLess(running_idx, missing_idx)
-        self.assertIn("const isOllama = ai.status === 'ok' && ai.provider === 'ollama';", self.app_js)
-        self.assertIn("const source = isOllama ? 'Ollama' : 'Fallback';", self.app_js)
-        self.assertIn("source: 'Detected'", self.app_js)
+        self.assertIn("Text AI", self.app_js)
+        self.assertIn("Vision model missing for Deep Analysis", self.app_js)
+        self.assertNotIn("const isOllama = ai.status === 'ok' && ai.provider === 'ollama';", self.app_js)
+        self.assertNotIn("const source = isOllama ? 'Ollama' : 'Fallback';", self.app_js)
+        self.assertNotIn("source: 'Detected'", self.app_js)
 
     def test_progress_callbacks_are_monotonic_for_active_processing(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
@@ -480,6 +571,9 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn('"ai_moment_scoring": item.get("ai_moment_scoring") or m.get("ai_moment_scoring")', api)
         self.assertIn('"moment_category_diversity_adjustment": item.get("moment_category_scoring", {}).get("category_diversity_adjustment")', api)
         self.assertIn('"source_path": m.get("source_path")', api)
+        self.assertIn('"game_title": m.get("game_title")', api)
+        self.assertIn('"game_identity": {', api)
+        self.assertIn('"game_context": compact_game_context_for_prompt(', api)
 
     def test_pipeline_completion_cleanup_survives_ui_notification_failures(self):
         self.assertIn("Pipeline completion UI update failed; finishing queue cleanup anyway", self.app_js)
@@ -512,8 +606,9 @@ class GuiStaticGuardTests(unittest.TestCase):
     def test_data_privacy_modal_uses_wrapped_tabs_instead_of_horizontal_scroll(self):
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
 
-        self.assertIn("width: min(96vw, 980px)", css)
+        self.assertIn("width: min(100%, 980px)", css)
         self.assertIn("max-height: calc(100vh - 32px)", css)
+        self.assertIn("overflow-x: hidden", css)
         self.assertIn("flex-wrap: wrap", css)
         self.assertIn("overflow: visible", css)
         self.assertIn(".wizard-static-value", css)
@@ -521,7 +616,7 @@ class GuiStaticGuardTests(unittest.TestCase):
     def test_audio_sources_wizard_step_is_wired(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
 
-        self.assertIn('data-step="2"><span class="wizard-step-num">2</span><span>Detection</span>', html)
+        self.assertIn('data-step="2"><span class="wizard-step-num">2</span><span id="wizard-step-2-label">Detection</span>', html)
         self.assertIn('data-step="3"><span class="wizard-step-num">3</span><span>Audio</span>', html)
         self.assertIn('id="wizard-step-3"', html)
         self.assertIn('id="wizard-audio-source-status"', html)
@@ -606,6 +701,8 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("Moment-label ranking", html)
         self.assertIn("separate opt-in", html)
         self.assertIn("candidate voice scores are available", html)
+        self.assertIn("may query Wikidata for compact game facts", html)
+        self.assertIn("Game Knowledge may query Wikidata", html)
         self.assertIn('id="processing-history-runs"', html)
         self.assertIn("function renderLocalAnalysisStatus", self.app_js)
         self.assertIn("feature_statuses", self.app_js)
@@ -635,6 +732,38 @@ class GuiStaticGuardTests(unittest.TestCase):
 
         self.assertIn("deeper targeted scene analysis", html)
         self.assertNotIn("full scene scan", html)
+
+    def test_montage_mode_is_wired_through_generate_wizard(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+        css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
+        bridge = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
+
+        self.assertIn('data-mode="montage"', html)
+        self.assertIn('id="wizard-montage-plan-panel"', html)
+        self.assertIn('id="wizard-montage-duration"', html)
+        self.assertIn('id="wizard-montage-prompt"', html)
+        self.assertIn("function selectGenerationMode", self.app_js)
+        self.assertIn("settings.generation_mode = pickedGenerationMode;", self.app_js)
+        self.assertIn("settings.montage = pickedMontage;", self.app_js)
+        self.assertIn("generation_mode: item.generationMode", self.app_js)
+        self.assertIn(".generation-mode-card.active", css)
+        self.assertIn(".montage-template-card.active", css)
+        self.assertIn('"generation_mode": "clips"', bridge)
+        self.assertIn('"montage_renderer_ready": False', bridge)
+
+    def test_clip_duration_controls_are_shorts_bounded(self):
+        html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="set-clip-duration" min="10" max="180"', html)
+        self.assertIn('id="wizard-clip-duration" min="10" max="180"', html)
+        self.assertIn("function clampClipDuration", self.app_js)
+        self.assertIn("clip_duration: clampClipDuration", self.app_js)
+        self.assertNotIn('max="3000"', html)
+
+    def test_cancel_button_shows_immediate_cancelling_state(self):
+        self.assertIn("cancelBtn.textContent = 'Cancelling...';", self.app_js)
+        self.assertIn("setProgress(state.progress?.percent || 0, 'Cancelling current run...', true);", self.app_js)
+        self.assertIn("cancelBtn.textContent = 'Cancel';", self.app_js)
 
 
 if __name__ == "__main__":

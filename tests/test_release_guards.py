@@ -249,6 +249,19 @@ class ReleaseGuardTests(unittest.TestCase):
 
             self.assertTrue(any(path.name == "analysis_cache" for path in violations))
 
+    def test_release_safety_blocks_game_context_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = root / "game_context"
+            cache.mkdir()
+            db = cache / "game_context.sqlite3"
+            db.write_bytes(b"SQLite format 3\0")
+
+            violations = check_release_safety.scan(root)
+
+            self.assertTrue(any(path.name == "game_context" for path in violations))
+            self.assertIn(db, violations)
+
     def test_release_safety_allows_third_party_internal_subtitles_package(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -9,20 +10,46 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from title_generator import (  # noqa: E402
+    TIMEOUT,
+    _ask_ollama,
     _build_moment_classification_prompt,
     _build_ollama_prompt,
+    ask_ollama_json,
     classify_moment_ai,
     compose_description,
+    generate_ai_description_body,
     generate_description,
     generate_tags,
+    generate_titles_batch,
     recommended_hashtags,
     summarize_clip_context,
 )
 
 
+def _game_context():
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "provider": "wikidata",
+        "qid": "Q575505",
+        "label": "Alan Wake",
+        "description": "2010 video game",
+        "source_url": "https://www.wikidata.org/wiki/Q575505",
+        "license": "CC0-1.0",
+        "facts": {
+            "first_release_date": "2010-05-14T00:00:00Z",
+            "genres": ["action-adventure game", "survival horror"],
+            "developers": ["Remedy Entertainment"],
+            "series": ["Alan Wake"],
+            "fictional_universes": ["Remedy Connected Universe"],
+        },
+    }
+
+
 def _clip_context():
     return {
         "game_title": "Alan Wake",
+        "game_context": _game_context(),
         "start": 120,
         "end": 150,
         "duration": 30,
@@ -46,10 +73,126 @@ def _clip_context():
             "last_word_end": 14.2,
             "reject_reason": "",
         },
+        "multimodal_analysis": {
+            "status": "ok",
+            "provider": "ollama",
+            "model": "qwen3-vl:latest",
+            "primary_visual_label": "high_energy",
+            "visible_summary": "The player is being chased through a dark hallway.",
+            "visual_labels": ["chase_or_panic", "visible_enemy_or_threat"],
+            "detected_events": ["enemy visible behind the player"],
+            "title_hooks": ["Chased through the dark"],
+            "metadata_keywords": ["chase", "dark hallway"],
+            "confidence": 0.88,
+            "ranking_adjustment": 0.02,
+        },
     }
 
 
+class _FakeOllamaResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class TitleContextTests(unittest.TestCase):
+    def test_title_ollama_request_disables_thinking_and_keeps_model_warm(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return _FakeOllamaResponse({"response": "Specific Chase Title"})
+
+        with patch("title_generator.urllib.request.urlopen", side_effect=fake_urlopen):
+            title = _ask_ollama("oh no he is right behind me", game_title="Alan Wake")
+
+        self.assertEqual(title, "Specific Chase Title")
+        self.assertEqual(captured["timeout"], TIMEOUT)
+        self.assertFalse(captured["body"]["think"])
+        self.assertEqual(captured["body"]["keep_alive"], "10m")
+
+    def test_ollama_json_request_parses_message_content_without_thinking(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return _FakeOllamaResponse({
+                "message": {"content": "{\"primary_category\":\"high_energy\"}"}
+            })
+
+        with patch("title_generator.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = ask_ollama_json("return json", timeout=22)
+
+        self.assertEqual(result, {"primary_category": "high_energy"})
+        self.assertEqual(captured["timeout"], 22)
+        self.assertFalse(captured["body"]["think"])
+        self.assertEqual(captured["body"]["keep_alive"], "10m")
+
+    def test_ai_description_uses_ollama_without_footer_or_hashtags(self):
+        context = _clip_context()
+        with patch("title_generator.is_ollama_model_ready", return_value=True), \
+                patch("title_generator.ask_ollama_json", return_value={
+                    "description": "The chase gets way too close as the darkness closes in and the panic takes over."
+                }) as ask_json:
+            description = generate_ai_description_body(
+                "Alan Wake Had Me Running",
+                context["transcript"],
+                "Alan Wake",
+                context,
+            )
+
+        self.assertEqual(
+            description,
+            "The chase gets way too close as the darkness closes in and the panic takes over.",
+        )
+        prompt = ask_json.call_args.args[0]
+        self.assertIn("Vision model analysis:", prompt)
+        self.assertIn("Return ONLY valid JSON", prompt)
+        self.assertNotIn("#shorts", description)
+
+    def test_ai_description_rejects_prompt_or_detector_sounding_copy(self):
+        context = _clip_context()
+        with patch("title_generator.is_ollama_model_ready", return_value=True), \
+                patch("title_generator.ask_ollama_json", return_value={
+                    "description": "A high-energy Alan Wake moment selected from action, panic, or reaction cues."
+                }):
+            description = generate_ai_description_body(
+                "Alan Wake Had Me Running",
+                context["transcript"],
+                "Alan Wake",
+                context,
+            )
+
+        self.assertEqual(description, "")
+
+    def test_batch_title_generation_warms_model_before_parallel_titles(self):
+        def fake_ask(transcript, model, game_title=None, clip_context=None):
+            return f"{game_title} {transcript}"
+
+        with patch("title_generator.is_ollama_model_ready", return_value=True), \
+                patch("title_generator._warm_ollama_model", return_value=True) as warm, \
+                patch("title_generator._ask_ollama", side_effect=fake_ask):
+            titles = generate_titles_batch(
+                ["chase moment", "boss fight"],
+                game_titles=["Alan Wake", "Alan Wake"],
+            )
+
+        warm.assert_called_once()
+        self.assertEqual(len(titles), 2)
+        self.assertTrue(all("#shorts #AlanWake" in title for title in titles))
+
     def test_prompt_uses_clip_generation_analysis(self):
         transcript = "Oh my god he is right behind me please run and hide"
 
@@ -67,6 +210,11 @@ class TitleContextTests(unittest.TestCase):
         self.assertIn("candidate_kind=pre_event", prompt)
         self.assertIn("audio=0.72", prompt)
         self.assertIn("Scene detection status: ok", prompt)
+        self.assertIn("Vision model analysis:", prompt)
+        self.assertIn("chased through a dark hallway", prompt)
+        self.assertIn("primary_visual=high_energy", prompt)
+        self.assertIn("Game knowledge:", prompt)
+        self.assertIn("Remedy Connected Universe", prompt)
         self.assertIn('Transcript: "Oh my god', prompt)
 
     def test_prompt_uses_sanitized_creator_title_context(self):
@@ -95,6 +243,34 @@ class TitleContextTests(unittest.TestCase):
         self.assertLessEqual(len(summary["creator_title_context"]), 420)
         self.assertNotIn("Blind Alan Wake nursing home run", description)
 
+    def test_prompt_uses_compact_feedback_learning_context(self):
+        context = {
+            **_clip_context(),
+            "feedback_learning_context": {
+                "enabled": True,
+                "positive_feedback_count": 3,
+                "negative_feedback_count": 1,
+                "favorite_count": 1,
+                "positive_terms": ["panic chase", "right behind"],
+                "negative_terms": ["menu pause", "song lyrics"],
+                "guidance": "prefer panic chase; avoid menu pause",
+            },
+        }
+
+        prompt = _build_ollama_prompt(
+            context["transcript"],
+            game_title="Alan Wake",
+            clip_context=context,
+        )
+        label_prompt = _build_moment_classification_prompt(context["transcript"], "Alan Wake", context)
+
+        self.assertIn("Creator feedback learning:", prompt)
+        self.assertIn("likes=panic chase, right behind", prompt)
+        self.assertIn("dislikes=menu pause, song lyrics", prompt)
+        self.assertIn('"creator_learning"', label_prompt)
+        self.assertIn("panic chase", label_prompt)
+        self.assertIn("song lyrics", label_prompt)
+
     def test_description_and_tags_use_analysis_context(self):
         context = _clip_context()
 
@@ -107,9 +283,12 @@ class TitleContextTests(unittest.TestCase):
         tags = generate_tags("Alan Wake", context["transcript"], clip_context=context)
 
         self.assertEqual(summary["moment_type"], "chase/panic")
-        self.assertIn("A tense Alan Wake chase/panic moment", description)
+        self.assertTrue(summary["game_knowledge"]["available"])
+        self.assertEqual(summary["game_knowledge"]["release_year"], 2010)
+        self.assertIn("Alan Wake gets tense here", description)
         self.assertIn("#shorts #AlanWake #gaming", description)
         self.assertIn("chase gameplay", tags)
+        self.assertIn("dark hallway", tags)
         self.assertIn("right behind me", tags)
 
     def test_description_composition_keeps_custom_text_and_hashtags_separate(self):
@@ -293,10 +472,14 @@ class TitleContextTests(unittest.TestCase):
             "voice_profile": {"centroid": [0.1, 0.2, 0.3]},
             "review_filter": "death_or_failure",
             "feedback_state": {"like": True, "reason": "private note"},
+            "feedback_learning_context": {"enabled": True, "positive_terms": ["useful panic"], "guidance": "private note"},
         }
         prompt = _build_moment_classification_prompt("word " * 1000, "Alan Wake", context)
 
         self.assertIn("transcript_preview", prompt)
+        self.assertIn('"game_knowledge"', prompt)
+        self.assertIn("Remedy Connected Universe", prompt)
+        self.assertIn("useful panic", prompt)
         self.assertNotIn("raw segment text", prompt)
         self.assertNotIn("centroid", prompt)
         self.assertNotIn("review_filter", prompt)
