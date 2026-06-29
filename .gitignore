@@ -61,6 +61,9 @@ voice_profile.json.*.tmp
 processing_history.json
 processing_history.*.bak
 processing_history.json.*.tmp
+run_learning.json
+run_learning.*.bak
+run_learning.json.*.tmp
 *_candidate_debug.json
 *_run_debug.json
 

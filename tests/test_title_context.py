@@ -177,6 +177,21 @@ class TitleContextTests(unittest.TestCase):
 
         self.assertEqual(description, "")
 
+    def test_ai_description_removes_title_echo_when_model_repeats_title_first(self):
+        context = _clip_context()
+        with patch("title_generator.is_ollama_model_ready", return_value=True), \
+                patch("title_generator.ask_ollama_json", return_value={
+                    "description": "Alan Wake Had Me Running. The chase gets too close as the darkness closes in."
+                }):
+            description = generate_ai_description_body(
+                "Alan Wake Had Me Running #shorts #AlanWake",
+                context["transcript"],
+                "Alan Wake",
+                context,
+            )
+
+        self.assertEqual(description, "The chase gets too close as the darkness closes in.")
+
     def test_batch_title_generation_warms_model_before_parallel_titles(self):
         def fake_ask(transcript, model, game_title=None, clip_context=None):
             return f"{game_title} {transcript}"
@@ -251,6 +266,8 @@ class TitleContextTests(unittest.TestCase):
                 "positive_feedback_count": 3,
                 "negative_feedback_count": 1,
                 "favorite_count": 1,
+                "run_learning_signal_count": 5,
+                "montage_learning_signal_count": 2,
                 "positive_terms": ["panic chase", "right behind"],
                 "negative_terms": ["menu pause", "song lyrics"],
                 "guidance": "prefer panic chase; avoid menu pause",
@@ -267,6 +284,8 @@ class TitleContextTests(unittest.TestCase):
         self.assertIn("Creator feedback learning:", prompt)
         self.assertIn("likes=panic chase, right behind", prompt)
         self.assertIn("dislikes=menu pause, song lyrics", prompt)
+        self.assertIn("run_memory=5", prompt)
+        self.assertIn("montage_memory=2", prompt)
         self.assertIn('"creator_learning"', label_prompt)
         self.assertIn("panic chase", label_prompt)
         self.assertIn("song lyrics", label_prompt)
@@ -290,6 +309,23 @@ class TitleContextTests(unittest.TestCase):
         self.assertIn("chase gameplay", tags)
         self.assertIn("dark hallway", tags)
         self.assertIn("right behind me", tags)
+
+    def test_fallback_description_prefers_context_over_title_copy(self):
+        context = {
+            **_clip_context(),
+            "multimodal_analysis": {},
+            "transcript": "Run run run",
+        }
+
+        description = generate_description(
+            "Alan Wake Shadow Tornado Killed The Cops In Seconds #shorts #AlanWake",
+            "Alan Wake",
+            clip_context=context,
+            auto_hashtags=False,
+        )
+
+        self.assertNotEqual(description, "Alan Wake Shadow Tornado Killed The Cops In Seconds")
+        self.assertIn("Alan Wake turns tense fast", description)
 
     def test_description_composition_keeps_custom_text_and_hashtags_separate(self):
         context = _clip_context()
@@ -350,9 +386,89 @@ class TitleContextTests(unittest.TestCase):
             "tutorial_or_explainer",
             "commentary_or_review",
             "lore_or_story",
+            "cinematic_dialogue",
             "atmosphere_or_visual",
             "low_value",
         })
+
+    def test_cinematic_dialogue_context_avoids_horror_streamer_tags(self):
+        context = {
+            "game_title": "Star Wars Outlaws",
+            "game_context": {
+                "schema_version": 1,
+                "status": "ok",
+                "label": "Star Wars Outlaws",
+                "facts": {"genres": ["action-adventure game"]},
+            },
+            "transcript": "Mission updated. Kay needs to meet the contact before the checkpoint.",
+            "primary_category": "cinematic_dialogue",
+            "moment_categories": {
+                "primary": "cinematic_dialogue",
+                "confidence": 0.63,
+                "scores": {"cinematic_dialogue": 0.67},
+            },
+            "speech_source": {
+                "primary_source": "game",
+                "creator_probability": 0.08,
+                "game_or_npc_probability": 0.76,
+                "music_or_lyrics_probability": 0.02,
+                "creator_safe": False,
+            },
+            "ai_moment_classification": {
+                "primary_category": "cinematic_dialogue",
+                "fine_labels": ["npc_dialogue"],
+                "confidence": 0.72,
+            },
+        }
+
+        summary = summarize_clip_context(context["transcript"], "Star Wars Outlaws", context)
+        tags = generate_tags("Star Wars Outlaws", context["transcript"], clip_context=context)
+        result = classify_moment_ai(
+            context["transcript"],
+            "Star Wars Outlaws",
+            context,
+            enabled=True,
+            ollama_ready=False,
+        )
+
+        self.assertEqual(summary["moment_type"], "cinematic/dialogue")
+        self.assertEqual(result["primary_category"], "cinematic_dialogue")
+        self.assertIn("npc_dialogue", result["fine_labels"])
+        self.assertIn("cinematic gameplay", tags)
+        self.assertIn("story moment", tags)
+        self.assertNotIn("horror gaming", tags)
+        self.assertNotIn("streamer moments", tags)
+
+    def test_title_context_carries_creator_speech_policy_warning(self):
+        context = {
+            **_clip_context(),
+            "speech_policy": {
+                "subtitle_policy": "creator",
+                "status": "no_selected_commentary_speech",
+                "warning": "No commentary transcript was found on the selected track.",
+                "metadata_transcript_source": "none_selected_track",
+                "selected_track_has_speech": False,
+                "selected_track_word_count": 0,
+                "analysis_word_count": 42,
+                "selected_stream": 1,
+                "selected_title": "Microphone",
+                "render_audio": "all_source_streams_mixed",
+                "mixed_speech_without_selected_track": True,
+                "metadata_backfill_blocked": True,
+            },
+            "metadata_warning": "No commentary transcript was found on the selected track.",
+            "metadata_needs_context": True,
+        }
+
+        summary = summarize_clip_context("", "Star Wars Outlaws", context)
+        prompt = _build_ollama_prompt("short selected transcript", "Star Wars Outlaws", context)
+
+        self.assertTrue(summary["metadata_needs_context"])
+        self.assertEqual(summary["speech_policy"]["metadata_transcript_source"], "none_selected_track")
+        self.assertIn("Speech policy", prompt)
+        self.assertIn("selected creator-commentary transcript", prompt)
+        self.assertIn("no selected creator speech", prompt)
+        self.assertIn("fan favorite", prompt)
 
     def test_ai_moment_visual_only_failure_uses_possible_failure_label(self):
         context = {

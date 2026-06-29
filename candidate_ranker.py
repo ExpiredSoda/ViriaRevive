@@ -77,6 +77,38 @@ LAID_BACK_COMMENTARY_WEIGHTS = (
     ("maybe", 1.0),
 )
 
+RICH_CONTEXT_WEIGHTS = (
+    ("that's hilarious", 3.0),
+    ("thats hilarious", 3.0),
+    ("that's funny", 2.8),
+    ("thats funny", 2.8),
+    ("that's crazy", 2.6),
+    ("thats crazy", 2.6),
+    ("that's insane", 2.6),
+    ("thats insane", 2.6),
+    ("of course", 2.0),
+    ("how convenient", 2.2),
+    ("that's convenient", 2.0),
+    ("thats convenient", 2.0),
+    ("that figures", 2.2),
+    ("because of course", 2.8),
+    ("i love how", 2.8),
+    ("i like how", 2.6),
+    ("look at the way", 2.6),
+    ("this is chaos", 3.0),
+    ("so chaotic", 2.8),
+    ("what is happening", 2.6),
+    ("what's happening", 2.6),
+    ("whats happening", 2.6),
+    ("i can't even", 2.4),
+    ("i cant even", 2.4),
+    ("no way", 2.2),
+    ("are you serious", 2.4),
+    ("are you kidding", 2.4),
+    ("that was perfect", 2.2),
+    ("that was amazing", 2.2),
+)
+
 MIN_QUALITY_SCORE = 0.50
 DETECTION_PREFERENCES = {"auto", "quality", "quantity"}
 QUALITY_FLOORS = {
@@ -288,6 +320,17 @@ CATEGORY_PHRASES = {
         ("narrator", 2.0),
         ("backstory", 3.0),
         ("the dark presence", 4.0),
+    ),
+    "cinematic_dialogue": (
+        ("cutscene", 4.0),
+        ("dialogue", 3.0),
+        ("conversation", 3.0),
+        ("objective updated", 3.0),
+        ("checkpoint reached", 2.8),
+        ("mission", 2.0),
+        ("chapter", 1.8),
+        ("quest", 1.8),
+        ("npc", 2.4),
     ),
     "atmosphere_or_visual": (
         ("beautiful", 3.0),
@@ -1112,7 +1155,7 @@ def _commentary_guard_segments(words: list[dict]) -> list[list[dict]]:
     return segments
 
 
-def _speech_source_evidence(normal: str) -> dict:
+def _speech_source_evidence(normal: str, *, visual_context: dict | None = None) -> dict:
     """Score whether transcript language looks creator-spoken or game/system-spoken."""
     normal = str(normal or "")
     creator_score = _weighted_score(normal, CREATOR_COMMENTARY_PHRASES)
@@ -1130,13 +1173,20 @@ def _speech_source_evidence(normal: str) -> dict:
     if first_person_hits and formal_hits:
         creator_score += 0.4
         game_score += 0.4
-    source_report = classify_speech_source(transcript=normal, subtitle_policy="creator")
+    source_report = classify_speech_source(
+        transcript=normal,
+        subtitle_policy="creator",
+        visual_context=visual_context,
+    )
     scripted_dialogue_risk = _score01(source_report.get("scripted_dialogue_risk", 0.0))
     creator_meta_score = _score01(source_report.get("creator_meta_score", 0.0))
+    visual_dialogue_scene_score = _score01(source_report.get("visual_dialogue_scene_score", 0.0))
     if scripted_dialogue_risk >= 0.45 and creator_meta_score < 0.38:
         game_score += min(3.2, 1.0 + scripted_dialogue_risk * 2.4)
     elif creator_meta_score >= 0.35:
         creator_score += min(1.6, creator_meta_score * 1.8)
+    if visual_dialogue_scene_score >= 0.35 and creator_meta_score < 0.35:
+        game_score += min(1.8, visual_dialogue_scene_score * 2.0)
 
     total = max(0.01, creator_score + game_score)
     creator_norm = creator_score / total if total else 0.0
@@ -1169,6 +1219,8 @@ def _speech_source_evidence(normal: str) -> dict:
         signals.append("scripted_dialogue_risk")
     if creator_meta_score >= 0.35:
         signals.append("creator_meta_context")
+    if visual_dialogue_scene_score >= 0.35:
+        signals.append("visual_dialogue_scene")
 
     return {
         "label": label,
@@ -1185,6 +1237,7 @@ def _speech_source_evidence(normal: str) -> dict:
         "formal_hits": formal_hits,
         "scripted_dialogue_risk": round(float(scripted_dialogue_risk), 4),
         "creator_meta_score": round(float(creator_meta_score), 4),
+        "visual_dialogue_scene_score": round(float(visual_dialogue_scene_score), 4),
         "signals": signals[:8],
     }
 
@@ -1266,6 +1319,62 @@ def _laid_back_commentary_signal(
     }
 
 
+def _rich_context_signal(
+    normal: str,
+    *,
+    word_count: int,
+    duration: float,
+    moment_categories: dict | None = None,
+    visual_diagnostics: dict | None = None,
+) -> dict:
+    """Reward creator commentary with context, humor, sarcasm, or coherent chaos."""
+    normal = str(normal or "")
+    categories = moment_categories if isinstance(moment_categories, dict) else {}
+    category_scores = categories.get("scores") if isinstance(categories.get("scores"), dict) else {}
+    visual = visual_diagnostics if isinstance(visual_diagnostics, dict) else {}
+    phrase_score = min(_weighted_score(normal, RICH_CONTEXT_WEIGHTS) / 8.0, 1.0)
+    density = word_count / max(1.0, duration)
+    density_score = 1.0 if 0.18 <= density <= 1.85 else max(0.0, 1.0 - abs(density - 0.85) / 1.8)
+    context_category = max(
+        float(category_scores.get("commentary_or_review", 0.0) or 0.0),
+        float(category_scores.get("death_or_failure", 0.0) or 0.0) * 0.85,
+        float(category_scores.get("lore_or_story", 0.0) or 0.0) * 0.75,
+        float(category_scores.get("cinematic_dialogue", 0.0) or 0.0) * 0.70,
+        float(category_scores.get("tutorial_or_explainer", 0.0) or 0.0) * 0.65,
+        float(category_scores.get("atmosphere_or_visual", 0.0) or 0.0) * 0.55,
+    )
+    visual_context = max(
+        _score01(visual.get("visual_energy", 0.0)),
+        _score01(visual.get("possible_failure_score", 0.0)) * 0.85,
+        _score01(visual.get("scenic_score", 0.0)) * 0.65,
+        _score01(visual.get("ui_density", 0.0)) * 0.45,
+    )
+    connective_thought = 0.0
+    if re.search(r"\b(?:because|but|though|actually|apparently|of course|somehow|why|how|what)\b", normal):
+        connective_thought += 0.35
+    if re.search(r"\b(?:funny|hilarious|crazy|insane|chaos|chaotic|serious|kidding|perfect|amazing)\b", normal):
+        connective_thought += 0.35
+    if 10 <= word_count <= 130:
+        connective_thought += 0.20
+    signal = _score01(
+        phrase_score * 0.48
+        + min(connective_thought, 1.0) * 0.24
+        + context_category * 0.18
+        + visual_context * 0.07
+        + density_score * 0.08
+    )
+    return {
+        "schema_version": 1,
+        "signal": round(float(signal), 4),
+        "phrase_score": round(float(phrase_score), 4),
+        "density_score": round(float(density_score), 4),
+        "context_category_score": round(float(context_category), 4),
+        "visual_context_score": round(float(visual_context), 4),
+        "connective_thought_score": round(float(min(connective_thought, 1.0)), 4),
+        "selection_impact": "quality_boost" if signal >= 0.20 else "none",
+    }
+
+
 def _classify_commentary_segment(segment: list[dict]) -> dict:
     text = transcript_text(segment)
     normal = _normal_text(text)
@@ -1342,12 +1451,21 @@ def evaluate_candidate(
         moment_categories=moment_categories,
     )
     laid_back_boost = min(0.16, 0.16 * float(laid_back_commentary.get("signal") or 0.0))
+    rich_context = _rich_context_signal(
+        normal,
+        word_count=word_count,
+        duration=duration,
+        moment_categories=moment_categories,
+        visual_diagnostics=visual_diagnostics,
+    )
+    rich_context_boost = min(0.14, 0.14 * float(rich_context.get("signal") or 0.0))
 
     quality = (
         0.25 * detector_score
         + 0.28 * density_score
         + 0.52 * hook_score
         + laid_back_boost
+        + rich_context_boost
         - weak_penalty
         - late_penalty
     )
@@ -1482,12 +1600,16 @@ def evaluate_candidate(
         "music_lyrics_penalty": round(float(music_lyrics_penalty), 4),
         "laid_back_commentary": laid_back_commentary,
         "laid_back_commentary_boost": round(float(laid_back_boost), 4),
+        "rich_context": rich_context,
+        "rich_context_boost": round(float(rich_context_boost), 4),
         "ranker": {
             "hook_points": hook_points,
             "weak_points": weak_points,
             "aftermath_points": aftermath_points,
             "laid_back_commentary": laid_back_commentary,
             "laid_back_commentary_boost": round(float(laid_back_boost), 4),
+            "rich_context": rich_context,
+            "rich_context_boost": round(float(rich_context_boost), 4),
             "commentary_guard_selection_penalty": round(float(commentary_guard_penalty), 4),
             "music_lyrics_penalty": round(float(music_lyrics_penalty), 4),
             "speech_source_penalty": round(float(speech_source_penalty), 4),
@@ -1525,6 +1647,8 @@ def evaluate_candidate(
         "speech_source_penalty": speech_source_penalty,
         "laid_back_commentary": laid_back_commentary,
         "laid_back_commentary_boost": laid_back_boost,
+        "rich_context": rich_context,
+        "rich_context_boost": rich_context_boost,
         "words": subtitle_words,
         "analysis_words": render_words,
         "transcript": text,
@@ -1570,9 +1694,20 @@ def score_moment_categories(
         key: _category_phrase_score(normal, phrases)
         for key, phrases in CATEGORY_PHRASES.items()
     }
-    source = _speech_source_evidence(normal)
+    source = _speech_source_evidence(normal, visual_context=visual_diagnostics)
     creator_signal = _score01(source.get("creator_signal", 0.0))
     game_signal = _score01(source.get("game_signal", 0.0))
+    scripted_dialogue = _score01(source.get("scripted_dialogue_risk", 0.0))
+    visual_dialogue_scene = _score01(source.get("visual_dialogue_scene_score", 0.0))
+    visual_labels = {
+        str(label or "").strip().lower()
+        for label in (visual_diagnostics.get("labels") or visual_diagnostics.get("visual_labels") or [])
+    }
+    if "dialogue_scene" in visual_labels:
+        visual_dialogue_scene = max(visual_dialogue_scene, 0.72)
+    visual_primary = str(visual_diagnostics.get("primary_visual_label") or "").strip().lower()
+    if visual_primary in {"lore_or_story", "commentary_or_review"}:
+        visual_dialogue_scene = max(visual_dialogue_scene, 0.45)
     hook_signal = _score01(float(hook_points or 0.0) / 10.0)
     weak_signal = _score01(float(weak_points or 0.0) / 8.0)
     aftermath_signal = _score01(float(aftermath_points or 0.0) / 8.0)
@@ -1580,6 +1715,7 @@ def score_moment_categories(
     tutorial_phrase = phrase_scores["tutorial_or_explainer"]
     commentary_phrase = phrase_scores["commentary_or_review"]
     lore_phrase = phrase_scores["lore_or_story"]
+    cinematic_phrase = phrase_scores["cinematic_dialogue"]
     high_energy_phrase = phrase_scores["high_energy"]
     high_energy_hook = hook_signal
     technical_explainer = _score01(
@@ -1625,6 +1761,13 @@ def score_moment_categories(
     if commentary_phrase >= 0.35 and action_evidence < 0.25:
         high_energy_multiplier *= 0.75
         evidence_notes.append("commentary_context_tempered_high_energy")
+    if (
+        max(game_signal, scripted_dialogue, visual_dialogue_scene) >= 0.42
+        and creator_signal < 0.36
+        and action_visual < 0.30
+    ):
+        high_energy_multiplier *= 0.60
+        evidence_notes.append("cinematic_dialogue_tempered_high_energy")
 
     tutorial_multiplier = 1.0
     if game_signal > creator_signal + 0.20 and creator_signal < 0.25:
@@ -1664,6 +1807,15 @@ def score_moment_categories(
         if commentary_phrase > 0 or creator_signal >= 0.25 else 0.0,
         "lore_or_story": _score01(0.70 * lore_phrase + 0.12 * density + 0.12 * game_signal + 0.06 * (1.0 - audio))
         if lore_phrase > 0 or game_signal >= 0.25 else 0.0,
+        "cinematic_dialogue": _score01(
+            (0.26 * cinematic_phrase)
+            + (0.22 * game_signal)
+            + (0.20 * scripted_dialogue)
+            + (0.18 * visual_dialogue_scene)
+            + (0.08 * lore_phrase)
+            + (0.06 * scene)
+        )
+        if cinematic_phrase > 0 or game_signal >= 0.34 or scripted_dialogue >= 0.34 or visual_dialogue_scene >= 0.34 else 0.0,
         "atmosphere_or_visual": _score01(
             0.40 * phrase_scores["atmosphere_or_visual"]
             + 0.20 * scene
@@ -1720,6 +1872,8 @@ def score_moment_categories(
             "speech_source_confidence": source.get("confidence", 0.0),
             "creator_speech": round(creator_signal, 4),
             "game_speech": round(game_signal, 4),
+            "scripted_dialogue": round(scripted_dialogue, 4),
+            "visual_dialogue_scene": round(visual_dialogue_scene, 4),
             "technical_explainer": round(technical_explainer, 4),
             "ambient_energy_weight": round(ambient_energy_weight, 4),
         },
@@ -1991,6 +2145,7 @@ def select_near_quality_fallback_candidates(
     existing_selected: list[dict] | None = None,
     allow_partial: bool = False,
     reason: str = "strict_quality_selected_zero",
+    subtitle_policy: str | None = "creator",
 ) -> list[dict]:
     """Promote creator-safe near-misses when strict quality under-fills a run."""
     existing_selected = list(existing_selected or [])
@@ -2015,6 +2170,7 @@ def select_near_quality_fallback_candidates(
     if allow_partial and candidate_qualities:
         relative_idx = min(len(candidate_qualities) - 1, max(0, int(len(candidate_qualities) * 0.55)))
         relative_floor = max(0.30, min(QUALITY_FLOORS["auto"], candidate_qualities[relative_idx]))
+    policy = normalize_commentary_subtitle_policy(subtitle_policy)
     eligible: list[tuple[float, float, dict, float]] = []
     for evaluation in evaluations:
         if evaluation.get("reject_reason") != "low_transcript_quality":
@@ -2022,12 +2178,30 @@ def select_near_quality_fallback_candidates(
         word_count = int(evaluation.get("subtitle_word_count") or evaluation.get("word_count") or 0)
         if word_count < max(MIN_WORDS, 8):
             continue
+        moment = evaluation.get("moment") if isinstance(evaluation.get("moment"), dict) else {}
+        if policy == "creator":
+            speech_policy = moment.get("speech_policy") if isinstance(moment.get("speech_policy"), dict) else {}
+            if (
+                speech_policy.get("metadata_backfill_blocked")
+                or str(speech_policy.get("status") or "").lower() == "no_selected_commentary_speech"
+                or moment.get("metadata_needs_context") is True
+            ):
+                continue
 
         quality = _safe_float(evaluation.get("quality_score"), 0.0) or 0.0
         floor = _safe_float(evaluation.get("quality_floor"), MIN_QUALITY_SCORE) or MIN_QUALITY_SCORE
         relaxed_floor = max(QUALITY_FLOORS["quantity"], floor - 0.12)
         if allow_partial:
             relaxed_floor = min(relaxed_floor, relative_floor)
+        rich_context = (
+            evaluation.get("rich_context")
+            if isinstance(evaluation.get("rich_context"), dict)
+            else moment.get("rich_context") if isinstance(moment.get("rich_context"), dict)
+            else {}
+        )
+        rich_signal = _safe_float(rich_context.get("signal"), 0.0) or 0.0
+        if allow_partial and rich_signal >= 0.30:
+            relaxed_floor = max(QUALITY_FLOORS["quantity"] - 0.04, relaxed_floor - min(0.06, rich_signal * 0.06))
         if quality < relaxed_floor:
             continue
 
@@ -2049,6 +2223,9 @@ def select_near_quality_fallback_candidates(
         commentary_summary = commentary_guard.get("summary") if isinstance(commentary_guard.get("summary"), dict) else {}
         if str(commentary_summary.get("primary_label") or "").lower() == "game_narration":
             continue
+        commentary_application = commentary_guard.get("application") if isinstance(commentary_guard.get("application"), dict) else {}
+        if policy == "creator" and commentary_application.get("reason") == "no_creator_commentary_after_filter":
+            continue
         commentary_penalty = _safe_float(evaluation.get("commentary_guard_selection_penalty"), 0.0) or 0.0
         speech_penalty = _safe_float(evaluation.get("speech_source_penalty"), 0.0) or 0.0
         if commentary_penalty >= 0.15 or speech_penalty >= 0.15:
@@ -2060,6 +2237,8 @@ def select_near_quality_fallback_candidates(
         )
         if rank_score is None:
             rank_score = quality
+        if rich_signal >= 0.30:
+            rank_score += min(0.04, rich_signal * 0.04)
         eligible.append((rank_score, quality, evaluation, relaxed_floor))
 
     eligible.sort(
@@ -2119,11 +2298,12 @@ def apply_learned_scoring(
     evaluations: list[dict],
     personalization: dict | None,
     *,
+    run_learning: dict | None = None,
     source_id: str = "",
     source_stem: str = "",
     max_adjustment: float = LEARNED_SELECTION_MAX_ADJUSTMENT,
 ) -> dict:
-    profile = _build_shadow_profile(personalization or {})
+    profile = _build_shadow_profile(personalization or {}, run_learning=run_learning)
     accepted = [e for e in evaluations if e.get("accepted")]
     baseline_order = sorted(
         accepted,
@@ -2729,10 +2909,11 @@ def build_multi_signal_ai_ranking_report(
 def build_learning_status(
     personalization: dict | None,
     *,
+    run_learning: dict | None = None,
     max_adjustment: float = LEARNED_SELECTION_MAX_ADJUSTMENT,
 ) -> dict:
     """Return the same local-learning signal summary used by candidate scoring."""
-    profile = _build_shadow_profile(personalization or {})
+    profile = _build_shadow_profile(personalization or {}, run_learning=run_learning)
     cap = max(0.0, float(max_adjustment or 0.0))
     scoring_signal_count = int(profile.get("signal_count") or 0)
     return {
@@ -2747,9 +2928,14 @@ def build_learning_status(
     }
 
 
-def build_learning_prompt_context(personalization: dict | None, *, term_limit: int = 8) -> dict:
+def build_learning_prompt_context(
+    personalization: dict | None,
+    *,
+    run_learning: dict | None = None,
+    term_limit: int = 8,
+) -> dict:
     """Return a compact, non-raw feedback summary safe for local AI prompts."""
-    profile = _build_shadow_profile(personalization or {})
+    profile = _build_shadow_profile(personalization or {}, run_learning=run_learning)
 
     def top_terms(values: dict) -> list[str]:
         if not isinstance(values, dict):
@@ -2771,6 +2957,8 @@ def build_learning_prompt_context(personalization: dict | None, *, term_limit: i
         "positive_feedback_count": int(profile.get("positive_feedback_count") or 0),
         "negative_feedback_count": int(profile.get("negative_feedback_count") or 0),
         "favorite_count": int(profile.get("favorite_count") or 0),
+        "run_learning_signal_count": int(profile.get("run_learning_signal_count") or 0),
+        "montage_learning_signal_count": int(profile.get("montage_learning_signal_count") or 0),
         "positive_terms": positive_terms,
         "negative_terms": negative_terms,
         "guidance": "; ".join(guidance),
@@ -2782,6 +2970,7 @@ def build_shadow_scoring_report(
     selected: list[dict],
     personalization: dict | None,
     *,
+    run_learning: dict | None = None,
     source_id: str = "",
     source_stem: str = "",
     max_count: int = 0,
@@ -2793,13 +2982,14 @@ def build_shadow_scoring_report(
         prepared = apply_learned_scoring(
             evaluations,
             personalization,
+            run_learning=run_learning,
             source_id=source_id,
             source_stem=source_stem,
             max_adjustment=max_adjustment,
         )
         profile = prepared["profile"]
     else:
-        profile = _build_shadow_profile(personalization or {})
+        profile = _build_shadow_profile(personalization or {}, run_learning=run_learning)
 
     accepted = [e for e in evaluations if e.get("accepted")]
     target_count = max(0, int(max_count or len(selected) or len(accepted)))
@@ -4035,8 +4225,8 @@ def _source_game_context_nudge(evaluation: dict) -> dict:
             families.append("horror_survival")
         if primary in {"high_energy", "death_or_failure", "atmosphere_or_visual"}:
             add(0.45, "horror_survival", f"{primary}_fits_horror")
-        elif primary == "lore_or_story":
-            add(0.25, "horror_survival", "lore_story_can_work_in_horror")
+        elif primary in {"lore_or_story", "cinematic_dialogue"}:
+            add(0.25, "horror_survival", "story_dialogue_can_work_in_horror")
         if _contains_any(transcript, ("behind me", "run", "hide", "scary", "please", "oh my god", "what was that")):
             add(0.25, "horror_survival", "panic_or_threat_dialogue")
         if _contains_any(visual_blob, ("dark", "shadow", "chase", "enemy", "monster", "threat", "flashlight")):
@@ -4053,8 +4243,8 @@ def _source_game_context_nudge(evaluation: dict) -> dict:
     if story_context:
         if "story_heavy" not in families:
             families.append("story_heavy")
-        if primary == "lore_or_story":
-            add(0.35, "story_heavy", "lore_story_primary")
+        if primary in {"lore_or_story", "cinematic_dialogue"}:
+            add(0.35, "story_heavy", "story_or_dialogue_primary")
         elif primary in {"tutorial_or_explainer", "commentary_or_review"}:
             add(0.12, "story_heavy", "creator_context_can_explain_story")
         if _contains_any(transcript, ("story", "lore", "chapter", "character", "why", "because", "remember")):
@@ -4167,7 +4357,7 @@ def _ai_vision_agreement_signal(evaluation: dict) -> float:
         return 0.0
     ai_primary = str(ai.get("primary_category") or "").strip()
     visual_primary = str(vision.get("primary_visual_label") or "").strip()
-    high_value = {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual"}
+    high_value = {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "cinematic_dialogue", "atmosphere_or_visual"}
     if ai_primary == visual_primary and ai_primary in high_value:
         return 1.0
     if ai_primary == "low_value" and visual_primary == "low_value":
@@ -4179,7 +4369,7 @@ def _ai_vision_agreement_signal(evaluation: dict) -> float:
     return 0.0
 
 
-def _build_shadow_profile(personalization: dict) -> dict:
+def _build_shadow_profile(personalization: dict, *, run_learning: dict | None = None) -> dict:
     events = personalization.get("events", [])
     clips = personalization.get("clips", {})
     if not isinstance(events, list):
@@ -4196,17 +4386,53 @@ def _build_shadow_profile(personalization: dict) -> dict:
         "favorite_count": 0,
         "positive_terms": {},
         "negative_terms": {},
+        "pairwise_positive_terms": {},
+        "pairwise_negative_terms": {},
         "positive_sources": {},
         "negative_sources": {},
+        "run_learning_event_count": 0,
+        "run_learning_outcome_count": 0,
+        "montage_learning_signal_count": 0,
+        "montage_learning_outcome_count": 0,
+        "run_learning_signal_count": 0,
+        "pairwise_source_count": 0,
         "signal_count": 0,
     }
 
-    for signal in _current_feedback_signals(events, clips):
+    feedback_signals = _current_feedback_signals(events, clips)
+    for signal in feedback_signals:
         _add_feedback_signal(profile, signal)
+
+    personalization_clip_ids = {
+        str(signal.get("clip_id") or "").strip()
+        for signal in feedback_signals
+        if str(signal.get("clip_id") or "").strip()
+    }
+    run_signals = _current_run_learning_signals(run_learning or {}, skip_clip_ids=personalization_clip_ids)
+    profile["run_learning_signal_count"] = len(run_signals)
+    if isinstance(run_learning, dict):
+        events_value = run_learning.get("events", [])
+        outcomes_value = run_learning.get("clip_outcomes", {})
+        montage_outcomes_value = run_learning.get("montage_outcomes", {})
+        profile["run_learning_event_count"] = len(events_value) if isinstance(events_value, list) else 0
+        profile["run_learning_outcome_count"] = len(outcomes_value) if isinstance(outcomes_value, dict) else 0
+        profile["montage_learning_outcome_count"] = (
+            len(montage_outcomes_value) if isinstance(montage_outcomes_value, dict) else 0
+        )
+    montage_signals = _current_montage_learning_signals(run_learning or {})
+    profile["montage_learning_signal_count"] = len(montage_signals)
+    run_signals.extend(montage_signals)
+    profile["run_learning_signal_count"] = len(run_signals)
+    for signal in run_signals:
+        _add_feedback_signal(profile, signal)
+
+    _add_pairwise_preference_signals(profile, feedback_signals + run_signals)
 
     profile["signal_count"] = (
         len(profile["positive_terms"])
         + len(profile["negative_terms"])
+        + len(profile["pairwise_positive_terms"])
+        + len(profile["pairwise_negative_terms"])
         + len(profile["positive_sources"])
         + len(profile["negative_sources"])
     )
@@ -4384,6 +4610,168 @@ def _signals_from_event_replay(events: list[dict]) -> list[dict]:
     )
 
 
+def _current_run_learning_signals(run_learning: dict, *, skip_clip_ids: set[str] | None = None) -> list[dict]:
+    if not isinstance(run_learning, dict):
+        return []
+    skip_clip_ids = skip_clip_ids or set()
+    outcomes = run_learning.get("clip_outcomes", {})
+    if not isinstance(outcomes, dict):
+        return []
+    signals: list[dict] = []
+    for clip_id, outcome in outcomes.items():
+        if not isinstance(outcome, dict):
+            continue
+        clean_clip_id = str(outcome.get("clip_id") or clip_id or "").strip()
+        if clean_clip_id in skip_clip_ids:
+            continue
+        base = {
+            "clip_id": clean_clip_id,
+            "source_id": outcome.get("source_id", ""),
+            "source_stem": outcome.get("source_stem", ""),
+            "clip_snapshot": outcome.get("clip_snapshot") if isinstance(outcome.get("clip_snapshot"), dict) else {},
+            "learning_terms": _learning_terms_from_feedback_container(outcome),
+            "weight_scale": 0.70,
+            "signal_source": "run_learning",
+        }
+        if outcome.get("like"):
+            signals.append({**base, "event_type": "like", "reason": str(outcome.get("reason") or "")})
+        if outcome.get("favorite"):
+            signals.append({**base, "event_type": "favorite", "reason": str(outcome.get("reason") or "")})
+        if outcome.get("dislike"):
+            signals.append({**base, "event_type": "dislike", "reason": str(outcome.get("reason") or "")})
+    return signals
+
+
+def _current_montage_learning_signals(run_learning: dict) -> list[dict]:
+    if not isinstance(run_learning, dict):
+        return []
+    outcomes = run_learning.get("montage_outcomes", {})
+    if not isinstance(outcomes, dict):
+        return []
+    signals: list[dict] = []
+    for storyboard_id, outcome in outcomes.items():
+        if not isinstance(outcome, dict):
+            continue
+        base = {
+            "clip_id": f"montage:{storyboard_id}",
+            "source_id": outcome.get("source_id", ""),
+            "source_stem": outcome.get("source_stem", ""),
+            "clip_snapshot": _montage_snapshot_as_clip_snapshot(outcome.get("montage_snapshot")),
+            "learning_terms": _learning_terms_from_feedback_container(outcome),
+            "weight_scale": 0.45,
+            "signal_source": "montage_learning",
+        }
+        if outcome.get("like"):
+            signals.append({**base, "event_type": "like", "reason": str(outcome.get("reason") or "")})
+        if outcome.get("favorite"):
+            signals.append({**base, "event_type": "favorite", "reason": str(outcome.get("reason") or "")})
+        if outcome.get("dislike"):
+            signals.append({**base, "event_type": "dislike", "reason": str(outcome.get("reason") or "")})
+        beat_outcomes = outcome.get("beat_outcomes")
+        if not isinstance(beat_outcomes, dict):
+            continue
+        for beat_id, beat in beat_outcomes.items():
+            if not isinstance(beat, dict):
+                continue
+            beat_base = {
+                "clip_id": beat.get("clip_id") or f"montage:{storyboard_id}:{beat_id}",
+                "source_id": beat.get("source_id") or outcome.get("source_id", ""),
+                "source_stem": outcome.get("source_stem", ""),
+                "clip_snapshot": _montage_beat_as_clip_snapshot(beat),
+                "learning_terms": _learning_terms_from_feedback_container(beat),
+                "weight_scale": 0.55,
+                "signal_source": "montage_beat_learning",
+            }
+            if beat.get("like"):
+                signals.append({**beat_base, "event_type": "like", "reason": str(beat.get("reason") or "")})
+            if beat.get("favorite"):
+                signals.append({**beat_base, "event_type": "favorite", "reason": str(beat.get("reason") or "")})
+            if beat.get("dislike"):
+                signals.append({**beat_base, "event_type": "dislike", "reason": str(beat.get("reason") or "")})
+    return signals
+
+
+def _montage_snapshot_as_clip_snapshot(snapshot: dict | None) -> dict:
+    if not isinstance(snapshot, dict):
+        return {}
+    categories = snapshot.get("category_counts") if isinstance(snapshot.get("category_counts"), dict) else {}
+    return {
+        "primary_category": "montage",
+        "moment_categories": {"primary": "montage", "scores": categories},
+        "learning_terms": snapshot.get("learning_terms") if isinstance(snapshot.get("learning_terms"), list) else [],
+        "quality_score": snapshot.get("planned_duration_seconds"),
+    }
+
+
+def _montage_beat_as_clip_snapshot(beat: dict | None) -> dict:
+    if not isinstance(beat, dict):
+        return {}
+    category = str(beat.get("category") or "").strip()
+    label = str(beat.get("label") or "").strip()
+    terms = beat.get("learning_terms") if isinstance(beat.get("learning_terms"), list) else []
+    return {
+        "primary_category": category,
+        "moment_categories": {"primary": category, "scores": {category: 1.0} if category else {}},
+        "learning_terms": terms,
+        "quality_score": beat.get("score"),
+        "ai_moment_classification": {
+            "primary_category": category,
+            "fine_labels": [label] if label else [],
+        },
+    }
+
+
+def _add_pairwise_preference_signals(profile: dict, signals: list[dict]):
+    by_source: dict[str, dict[str, list[dict]]] = {}
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        event_type = str(signal.get("event_type") or "").strip().lower()
+        source_key = str(signal.get("source_id") or signal.get("source_stem") or "").strip()
+        if not source_key or event_type not in {"like", "favorite", "dislike"}:
+            continue
+        bucket = by_source.setdefault(source_key, {"positive": [], "negative": []})
+        if event_type in {"like", "favorite"}:
+            bucket["positive"].append(signal)
+        elif event_type == "dislike":
+            bucket["negative"].append(signal)
+
+    for source_key, bucket in by_source.items():
+        positive = bucket.get("positive") or []
+        negative = bucket.get("negative") or []
+        if not positive or not negative:
+            continue
+        profile["pairwise_source_count"] += 1
+        positive_terms = _terms_from_preference_signals(positive)
+        negative_terms = _terms_from_preference_signals(negative)
+        for term, weight in positive_terms.items():
+            if term not in negative_terms:
+                _bump(profile["pairwise_positive_terms"], term, min(2.0, weight))
+        for term, weight in negative_terms.items():
+            if term not in positive_terms:
+                _bump(profile["pairwise_negative_terms"], term, min(2.0, weight))
+
+
+def _terms_from_preference_signals(signals: list[dict]) -> dict[str, float]:
+    terms: dict[str, float] = {}
+    for signal in signals:
+        text_parts = [str(signal.get("reason") or "")]
+        snapshot = signal.get("clip_snapshot")
+        if isinstance(snapshot, dict):
+            text_parts.append(str(snapshot.get("transcript") or ""))
+            text_parts.append(_category_signal_text(snapshot.get("moment_categories")))
+            text_parts.append(str(snapshot.get("primary_category") or ""))
+            text_parts.append(_ai_visual_feedback_text(snapshot))
+        learning_terms = _learning_terms_from_feedback_container(signal)
+        if learning_terms:
+            text_parts.append(" ".join(learning_terms))
+        text = " ".join(part for part in text_parts if part)
+        scale = max(0.1, min(2.0, _safe_float(signal.get("weight_scale"), 1.0) or 1.0))
+        for term in _extract_shadow_terms(text):
+            _bump(terms, term, scale)
+    return terms
+
+
 def _add_feedback_signal(profile: dict, signal: dict):
     event_type = str(signal.get("event_type") or "").lower()
     weight = 0.0
@@ -4396,6 +4784,7 @@ def _add_feedback_signal(profile: dict, signal: dict):
         weight = -1.15
     if weight == 0:
         return
+    weight *= max(0.1, min(2.0, _safe_float(signal.get("weight_scale"), 1.0) or 1.0))
 
     profile["active_event_count"] += 1
     if weight > 0:
@@ -4507,15 +4896,26 @@ def _score_shadow_candidate(evaluation: dict, profile: dict, source_id: str, sou
 
     positive_matches = _match_shadow_terms(profile["positive_terms"], normal, candidate_terms)
     negative_matches = _match_shadow_terms(profile["negative_terms"], normal, candidate_terms)
+    pairwise_positive_matches = _match_shadow_terms(profile["pairwise_positive_terms"], normal, candidate_terms)
+    pairwise_negative_matches = _match_shadow_terms(profile["pairwise_negative_terms"], normal, candidate_terms)
     positive_points = sum(item["weight"] for item in positive_matches)
     negative_points = sum(item["weight"] for item in negative_matches)
+    pairwise_positive_points = sum(item["weight"] for item in pairwise_positive_matches)
+    pairwise_negative_points = sum(item["weight"] for item in pairwise_negative_matches)
 
     positive_adjustment = min(positive_points * 0.018, 0.14)
     negative_adjustment = min(negative_points * 0.020, 0.14)
+    pairwise_adjustment = max(
+        -0.04,
+        min(0.04, pairwise_positive_points * 0.012 - pairwise_negative_points * 0.014),
+    )
     source_adjustment = _shadow_source_adjustment(profile, source_id, source_stem)
     adjustment = max(
         -SHADOW_MAX_ADJUSTMENT,
-        min(SHADOW_MAX_ADJUSTMENT, positive_adjustment - negative_adjustment + source_adjustment),
+        min(
+            SHADOW_MAX_ADJUSTMENT,
+            positive_adjustment - negative_adjustment + pairwise_adjustment + source_adjustment,
+        ),
     )
     shadow_score = max(0.0, min(1.0, base_score + adjustment))
 
@@ -4526,9 +4926,14 @@ def _score_shadow_candidate(evaluation: dict, profile: dict, source_id: str, sou
         "signals": {
             "positive_matches": positive_matches[:8],
             "negative_matches": negative_matches[:8],
+            "pairwise_positive_matches": pairwise_positive_matches[:8],
+            "pairwise_negative_matches": pairwise_negative_matches[:8],
             "source_adjustment": round(source_adjustment, 4),
+            "pairwise_adjustment": round(pairwise_adjustment, 4),
             "positive_points": round(positive_points, 3),
             "negative_points": round(negative_points, 3),
+            "pairwise_positive_points": round(pairwise_positive_points, 3),
+            "pairwise_negative_points": round(pairwise_negative_points, 3),
         },
     }
 
@@ -4607,8 +5012,16 @@ def _shadow_profile_summary(profile: dict) -> dict:
         "negative_feedback_count": profile["negative_feedback_count"],
         "favorite_count": profile["favorite_count"],
         "signal_count": profile["signal_count"],
+        "run_learning_signal_count": profile.get("run_learning_signal_count", 0),
+        "run_learning_event_count": profile.get("run_learning_event_count", 0),
+        "run_learning_outcome_count": profile.get("run_learning_outcome_count", 0),
+        "montage_learning_signal_count": profile.get("montage_learning_signal_count", 0),
+        "montage_learning_outcome_count": profile.get("montage_learning_outcome_count", 0),
+        "pairwise_source_count": profile.get("pairwise_source_count", 0),
         "positive_terms": _top_shadow_terms(profile["positive_terms"]),
         "negative_terms": _top_shadow_terms(profile["negative_terms"]),
+        "pairwise_positive_terms": _top_shadow_terms(profile.get("pairwise_positive_terms", {})),
+        "pairwise_negative_terms": _top_shadow_terms(profile.get("pairwise_negative_terms", {})),
     }
 
 
@@ -4814,6 +5227,13 @@ def _moment_category_signal(categories: dict) -> float:
         return 0.72
     if primary == "lore_or_story":
         return 0.60
+    if primary == "cinematic_dialogue":
+        signals = categories.get("signals") if isinstance(categories.get("signals"), dict) else {}
+        game_speech = _safe_float(signals.get("game_speech"), 0.0) or 0.0
+        creator_speech = _safe_float(signals.get("creator_speech"), 0.0) or 0.0
+        if game_speech > creator_speech + 0.12:
+            return -0.25
+        return 0.18
     if primary == "atmosphere_or_visual":
         return 0.45
     if primary == "low_value":
@@ -4836,7 +5256,7 @@ def _moment_category_diversity_adjustment(
     if confidence < 0.45:
         return 0.0
     existing = int(baseline_category_counts.get(primary, 0) or 0)
-    if existing <= 0 and primary in {"tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual", "death_or_failure"}:
+    if existing <= 0 and primary in {"tutorial_or_explainer", "lore_or_story", "cinematic_dialogue", "atmosphere_or_visual", "death_or_failure"}:
         return max_adjustment
     if existing >= 2 and primary == "high_energy":
         return -max_adjustment * 0.5
@@ -4900,7 +5320,7 @@ def _ai_moment_signal(ai: dict) -> float:
     category_bonus = 0.0
     if primary in {"high_energy", "death_or_failure"}:
         category_bonus = 0.15
-    elif primary in {"tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual"}:
+    elif primary in {"tutorial_or_explainer", "lore_or_story", "cinematic_dialogue", "atmosphere_or_visual"}:
         category_bonus = 0.08
     elif primary == "low_value":
         category_bonus = -0.35

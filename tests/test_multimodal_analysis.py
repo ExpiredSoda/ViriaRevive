@@ -1,4 +1,5 @@
 import json
+import base64
 import sys
 import unittest
 from pathlib import Path
@@ -12,10 +13,14 @@ if str(ROOT) not in sys.path:
 from candidate_ranker import select_best_candidates  # noqa: E402
 from multimodal_analysis import (  # noqa: E402
     MULTIMODAL_SELECTION_MAX_ADJUSTMENT,
+    _VISION_TEST_IMAGE,
     _ask_ollama_vision_json,
     _build_vision_prompt,
+    _candidate_frame_packet_times,
     apply_multimodal_scoring,
+    analyze_candidate_frames_with_ollama,
     build_multimodal_ranking_report,
+    preflight_ollama_vision_model,
     sanitize_vision_analysis,
     select_ollama_vision_model,
 )
@@ -100,6 +105,38 @@ class MultimodalAnalysisTests(unittest.TestCase):
         self.assertIn("Remedy Connected Universe", prompt)
         self.assertIn("wikidata", prompt)
 
+    def test_vision_prompt_includes_frame_packet_timestamps(self):
+        prompt = _build_vision_prompt(
+            {"start": 10, "end": 40, "peak_time": 25},
+            "look at this chase",
+            "Star Wars Outlaws",
+            frames=[
+                {"time": 12.5, "source": "setup", "visual_summary": {"visual_energy": 0.2}},
+                {"time": 25.0, "source": "candidate_peak", "visual_summary": {"visual_energy": 0.8}},
+            ],
+        )
+
+        self.assertIn('"frame_packet"', prompt)
+        self.assertIn('"candidate_peak"', prompt)
+        self.assertIn('"time": 25.0', prompt)
+
+    def test_candidate_frame_packet_times_are_ordered_and_richer_than_default(self):
+        times = _candidate_frame_packet_times(
+            {
+                "start": 100,
+                "end": 140,
+                "peak_time": 126,
+                "visual_diagnostics": {"sample_times": [105, 126, 136]},
+            },
+            1000,
+        )
+
+        self.assertGreaterEqual(len(times), 6)
+        self.assertEqual(times, sorted(times, key=lambda row: row[0]))
+        sources = {source for _, source in times}
+        self.assertIn("early_context", sources)
+        self.assertIn("candidate_peak", sources)
+
     def test_select_ollama_vision_model_prefers_known_vision_models(self):
         model = select_ollama_vision_model([
             "qwen3.5:4b",
@@ -119,6 +156,12 @@ class MultimodalAnalysisTests(unittest.TestCase):
         model = select_ollama_vision_model(["custom-llama3.2-vision:latest"])
 
         self.assertEqual(model, "custom-llama3.2-vision:latest")
+
+    def test_preflight_test_image_is_valid_base64(self):
+        decoded = base64.b64decode(_VISION_TEST_IMAGE, validate=True)
+
+        self.assertGreater(len(decoded), 20)
+        self.assertEqual(decoded[:8], b"\x89PNG\r\n\x1a\n")
 
     def test_vision_json_request_disables_thinking_and_parses_message_content(self):
         captured = {}
@@ -167,6 +210,52 @@ class MultimodalAnalysisTests(unittest.TestCase):
 
         self.assertEqual(result["primary_visual_label"], "atmosphere_or_visual")
         self.assertEqual(result["confidence"], 0.9)
+
+    def test_preflight_vision_model_returns_ok_for_valid_json(self):
+        with patch("multimodal_analysis._VISION_PREFLIGHT_CACHE", {}), patch(
+            "multimodal_analysis._ask_ollama_vision_json",
+            return_value={"primary_visual_label": "unclear", "confidence": 0.5},
+        ) as ask:
+            result = preflight_ollama_vision_model("qwen3-vl:latest")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        ask.assert_called_once()
+
+    def test_analyze_candidate_retries_smaller_frame_packet_after_bad_json(self):
+        frames = [
+            {"time": 1.0, "source": "setup", "image": "a"},
+            {"time": 2.0, "source": "peak", "image": "b"},
+            {"time": 3.0, "source": "payoff", "image": "c"},
+            {"time": 4.0, "source": "late", "image": "d"},
+        ]
+        calls = []
+
+        def fake_ask(prompt, images, model, timeout=0):
+            calls.append(list(images))
+            if len(calls) == 1:
+                return None
+            return {
+                "primary_visual_label": "high_energy",
+                "confidence": 0.8,
+                "ranking_adjustment": 0.01,
+            }
+
+        with patch("multimodal_analysis.select_ollama_vision_model", return_value="qwen3-vl:latest"), patch(
+            "multimodal_analysis._extract_frame_images", return_value=frames
+        ), patch("multimodal_analysis._ask_ollama_vision_json", side_effect=fake_ask):
+            result = analyze_candidate_frames_with_ollama(
+                "video.mp4",
+                {"start": 0, "end": 10, "peak_time": 5},
+                enabled=True,
+                timeout=20,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["initial_status"], "bad_json")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls[1]), 3)
 
     def test_sanitize_vision_analysis_clamps_adjustment_and_lists(self):
         result = sanitize_vision_analysis(

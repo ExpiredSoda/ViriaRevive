@@ -31,18 +31,21 @@ STATE_FILE = APP_DATA_DIR / "viria_state.json"
 STATE_SCHEMA_VERSION = 3
 PERSONALIZATION_FILE = APP_DATA_DIR / "personalization.json"
 PERSONALIZATION_SCHEMA_VERSION = 1
+RUN_LEARNING_FILE = APP_DATA_DIR / "run_learning.json"
+RUN_LEARNING_SCHEMA_VERSION = 1
 VOICE_PROFILE_FILE = APP_DATA_DIR / "voice_profile.json"
 VOICE_PROFILE_SCHEMA_VERSION = 1
 PROCESSING_HISTORY_FILE = APP_DATA_DIR / "processing_history.json"
 PROCESSING_HISTORY_SCHEMA_VERSION = 1
 ANALYSIS_CACHE_DIR = APP_DATA_DIR / "analysis_cache"
+MONTAGES_DIR = ANALYSIS_CACHE_DIR / "montages"
 GAME_CONTEXT_DIR = APP_DATA_DIR / "game_context"
 GAME_CONTEXT_DB_FILE = GAME_CONTEXT_DIR / "game_context.sqlite3"
 
 MUSIC_DIR = APP_DATA_DIR / "music"
 TOKENS_DIR = APP_DATA_DIR / "tokens"
 
-for d in [APP_DATA_DIR, DOWNLOADS_DIR, CLIPS_DIR, SUBTITLES_DIR, ANALYSIS_CACHE_DIR, GAME_CONTEXT_DIR, MUSIC_DIR, TOKENS_DIR]:
+for d in [APP_DATA_DIR, DOWNLOADS_DIR, CLIPS_DIR, SUBTITLES_DIR, ANALYSIS_CACHE_DIR, MONTAGES_DIR, GAME_CONTEXT_DIR, MUSIC_DIR, TOKENS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -79,6 +82,7 @@ def _migrate_legacy_runtime_data():
     for name in (
         "viria_state.json",
         "personalization.json",
+        "run_learning.json",
         "voice_profile.json",
         "processing_history.json",
         "client_secrets.json",

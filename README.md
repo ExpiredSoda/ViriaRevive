@@ -9,13 +9,14 @@
 <h1 align="center">
   ViriaRevive
   <br>
-  <sub><sup>Turn long gameplay recordings into short-form clips.</sup></sub>
+  <sub><sup>A video-game focused clipping studio for creators.</sup></sub>
 </h1>
 
 <p align="center">
-  ViriaRevive finds promising moments in long gameplay videos, renders vertical clips,
-  adds optional subtitles, helps write titles and descriptions, and can schedule posts
-  to YouTube.
+  ViriaRevive is a Windows-first fork built for gameplay creators. It turns long
+  recordings, streams, and YouTube gameplay videos into Shorts-ready clips and
+  montages with local analysis, optional local AI, subtitles, metadata, and
+  upload preparation.
 </p>
 
 <p align="center">
@@ -28,26 +29,50 @@
 
 ---
 
-## Why Use It
+## What This Fork Is
 
-Gameplay recordings are long. Good Shorts are usually buried in the middle.
+ViriaRevive is a **video-game focused clipping app**. It is designed around the
+messy reality of gaming footage: long sessions, separate microphone and game
+audio, NPC dialogue, quiet story beats, sudden chaos, deaths, tutorials,
+cutscenes, and creator reactions that are easy to miss in a normal editor.
 
-ViriaRevive is built for creators who want a local desktop workflow for finding
-those moments without dragging a three-hour recording through a timeline by hand.
-It looks for speech, reactions, gameplay intensity, scene changes, failures,
-explainer moments, atmosphere, and creator feedback over time.
+This fork keeps the original open-source foundation and pushes it toward a
+creator workflow for gameplay Shorts, TikToks, YouTube clips, and stitched
+montage highlights.
 
-It is especially useful for:
+Use it when you want to:
 
-- Streamers turning long sessions into Shorts.
-- YouTubers reviewing local OBS recordings.
-- Creators with separate mic/game audio tracks.
-- Anyone who wants clips, subtitles, titles, descriptions, and upload scheduling
-  in one place.
+- Find good moments in long gameplay recordings without scrubbing for hours.
+- Keep creator commentary separate from game/NPC audio when possible.
+- Generate vertical clips, subtitles, titles, descriptions, hashtags, and tags.
+- Build multi-beat gameplay montages from related moments.
+- Let local feedback, game context, voice profile data, and optional Ollama AI
+  improve future ranking over time.
+- Prepare clips for manual posting or optional YouTube scheduling.
 
 ---
 
-## What It Does
+## Highlights
+
+- **Gameplay-first detection:** ranks moments using speech, audio intensity,
+  scene changes, visual motion, game context, category labels, and creator
+  feedback.
+- **Short Clips and Montage modes:** create single highlight clips or 1-5
+  stitched gameplay montages from the same analysis pass.
+- **Multi-track audio aware:** final clips keep the full game/mic mix while
+  subtitles and metadata can focus on the commentary track.
+- **Local AI optional:** Ollama can improve titles, descriptions, labels, and
+  Deep Analysis vision-frame context without sending videos to a cloud service.
+- **Game-aware metadata:** optional game hints, filename/YouTube metadata, and
+  compact Wikidata facts help titles and descriptions stay grounded.
+- **Learning loop:** likes, dislikes, favorites, reasons, deleted clips, montage
+  outcomes, and timing history stay local and can nudge future results.
+- **Creator-friendly output:** vertical video, subtitle placement, sidecar
+  `.txt` metadata, thumbnails, preview cards, and optional YouTube upload prep.
+
+---
+
+## Feature Tour
 
 ### Find Better Moments
 
@@ -56,8 +81,10 @@ It is especially useful for:
   - **Fast** keeps heavier AI/vision passes off so quick batches finish sooner.
   - **Balanced** uses stronger transcript, scene, and label ranking without the
     full vision-model pass.
-  - **Deep Analysis** inspects more candidates and can use local vision context
-    when Ollama's vision model is ready.
+  - **Deep Analysis** inspects more candidates, can use local vision context
+    when Ollama's vision model is ready, and gives quieter funny, sarcastic,
+    chaotic, story, or explainer commentary room to rank without needing loud
+    panic keywords.
 - Uses audio peaks, scene signals, transcript quality, category labels, and
   local feedback to rank clips.
 - In **Deep Analysis**, can use an installed local Ollama vision model to inspect
@@ -77,13 +104,31 @@ It is especially useful for:
   instructional moments can win close calls, but the cap keeps game knowledge
   from overpowering actual clip quality.
 - Can prefer fewer stronger clips instead of padding a batch with weak moments.
+- When creator captions are requested, final render validation rejects clips
+  where the selected commentary track has no usable creator speech instead of
+  burning stale or game-dialogue subtitles.
 - Learns from local like, dislike, favorite, and reason feedback.
-- The Generate page now has a staged **Short Clips / Montage** mode switch.
-  Montage settings are wired through the wizard and run debug as planning
-  intent; stitched montage rendering is being built from the staged plan in
-  [docs/montage-plan.md](docs/montage-plan.md).
+- The Generate page has a **Short Clips / Montage** mode switch. Montage mode
+  looks for multiple related gameplay beats, then builds 1-5 stitched vertical
+  montages when enough distinct material exists.
+- Montage generation plans around a simple creator-friendly arc: hook, setup,
+  escalation, payoff, reaction, or callback.
+- Montage renders reuse the same vertical crop, commentary-track transcription,
+  subtitle styling, title, description, tag, and upload-prep paths as normal
+  clips.
+- If the source does not have enough usable beats, ViriaRevive returns fewer
+  montages instead of duplicating weak or unrelated moments.
+- Montage titles and descriptions are generated from the actual storyboard
+  beats, roles, game context, and compact quality notes so multiple montages
+  from the same source do not all collapse into the same generic title.
+- Montage planning penalizes repeated low-context chatter loops while still
+  allowing real running jokes or payoff lines to survive when the surrounding
+  beat context supports them.
+- Montage feedback can be saved as compact local learning data for the whole
+  montage or individual beats, without copying source video, audio, thumbnails,
+  or full transcripts into the learning file.
 
-### Handle Gameplay Audio
+### Understand Gameplay Audio
 
 - Keeps the final clip audio mix intact.
 - Can choose a separate mic/commentary track for subtitles and title context.
@@ -92,27 +137,45 @@ It is especially useful for:
 - Works with normal single-track videos too, including YouTube downloads where
   voice and game audio are already mixed together.
 
-### Render Shorts
+### Render Game Clips
 
 - Creates vertical clips for short-form platforms.
+- Lets you choose a default output folder in Settings so generated videos,
+  sidecar metadata files, Results, All Videos, and Upload all use the same
+  creator-selected location.
 - Keeps already-vertical footage from being forced through an unnecessary crop.
 - Offers subtitle styles, subtitle placement controls, and a **None** option for
   clips with no words on screen.
 - Supports optional visual effects and local background music.
 
-### Review, Rate, And Improve
+### Review, Rate, And Improve Clips
 
 - Results and All Videos show playable clip cards, thumbnails, labels, and local
   feedback controls.
 - Likes, dislikes, favorites, reason chips, and optional notes stay on your
   machine and can nudge future detection.
+- Run outcomes are also stored locally in compact form so future ranking and
+  montage storyboards can learn from what was selected, liked, disliked,
+  deleted, rerolled, or produced no clips without storing raw media.
+- Montage audits stay local under `analysis_cache/montages` and store compact
+  beat metadata, counts, category variety, and feature usage rather than raw
+  media or full transcripts.
+- Montage feedback also stays local in `run_learning.json`. It records the
+  storyboard id, beat id, role, category, feedback type, reason, and compact
+  learning terms so later montage planning can learn from approved or rejected
+  sequences.
+- Local Ollama prompts use the same compact learning context when generating
+  titles, descriptions, and moment labels. This is retrieval-style local memory,
+  not silent model retraining.
+- When a source has both approved and rejected examples, local learning can use
+  the difference between them as a small capped nudge for future close calls.
 - Optional creator voice profile stores numeric local features only, not raw
   audio. It needs enough usable creator-speech samples before the ranking nudge
   becomes active.
 - Deep Analysis can combine several capped nudges: feedback, creator voice,
   transcript labels, scene/audio evidence, and local vision-frame context.
 
-### Titles, Descriptions, And Uploads
+### Create Titles, Descriptions, And Upload Metadata
 
 - Generates titles, descriptions, tags, and sidecar `.txt` files for manual
   posting.
@@ -125,10 +188,9 @@ It is especially useful for:
 - The optional Generate wizard **Game** field is run-only: "Leave blank for
   auto-detect. Add the game name if you want stronger titles, labels, and clip
   ranking."
-- Result cards, All Videos cards, preview windows, and run debug JSON include a
-  compact truth summary: detected game, confidence, source of the match
-  (user hint, YouTube metadata, filename, Wikidata, or auto), whether game
-  context moved ranking, the score delta, and whether visual analysis was used.
+- Result cards, All Videos cards, preview windows, and local debug reports can
+  show the detected game, key context, and whether local visual/game analysis
+  helped the clip.
 - Reuses analysis-generated titles, descriptions, tags, vision keywords, and
   creator notes when clips are added to the upload scheduler.
 - Supports creator-provided AI notes per clip so title and description rerolls
@@ -148,10 +210,17 @@ It is especially useful for:
 
 ViriaRevive is designed to keep creator data local.
 
-- Clips, debug reports, feedback, source/game memory, voice profile data,
-  settings, and YouTube tokens are stored on your PC.
+- Clips, debug reports, feedback, compact run-learning memory, source/game
+  memory, voice profile data, settings, and YouTube tokens are stored on your
+  PC.
 - Clip detection, transcript ranking, local labels, and feedback learning do not
   upload your raw media to a cloud service.
+- `run_learning.json` stores compact counts, IDs, categories, and outcome
+  signals for future learning and montage planning. It does not store raw video,
+  thumbnails, raw audio, or full transcripts.
+- `processing_history.json` stores local timing history so ETA estimates can
+  learn how long each phase usually takes on your machine. It stores run
+  durations, settings fingerprints, and stage timing numbers, not media.
 - Ollama is optional and runs locally when installed.
 - Optional game knowledge resolves the likely game title through Wikidata using
   local filenames, YouTube titles/descriptions/tags when available, and user
@@ -379,10 +448,13 @@ ViriaRevive/
 ├── detector.py                # Candidate detection
 ├── transcriber.py             # Faster-Whisper integration
 ├── clipper.py                 # FFmpeg clip rendering
+├── montage_storyboard.py      # Montage beat planning and audit data
+├── montage_renderer.py        # Montage segment rendering and concatenation
 ├── multimodal_analysis.py     # Optional local Ollama vision-frame context
 ├── game_context.py            # Compact Wikidata-backed game facts/cache
 ├── game_identity.py           # Game title/source identity resolver
 ├── speech_source_classifier.py # Creator/game speech-source classifier
+├── run_learning.py            # Compact local run/outcome learning memory
 ├── title_generator.py         # Titles, descriptions, tags, AI labels
 ├── uploader.py                # YouTube OAuth and uploads
 ├── version.py                 # Central app version metadata
@@ -400,12 +472,14 @@ ignored by Git.
 
 ## Fork And Attribution
 
-This repository is a heavily modified fork of the original
+This repository is a gameplay-focused fork of the original
 [ViriaRevive project by VladPolus](https://github.com/VladPolus/ViriaRevive).
 
-This fork keeps the original open-source foundation and adds a creator-focused
-workflow around multi-track gameplay audio, transcript-aware ranking, local
-learning, upload preparation, packaging, and public-release safety.
+The fork keeps the original open-source foundation and turns it into a
+video-game clipping workflow: multi-track gameplay audio, creator-commentary
+subtitles, game-aware ranking, montage generation, local learning, optional
+Ollama AI, metadata generation, upload preparation, packaging, and
+public-release safety.
 
 If you contribute changes that are useful to the original project, open a pull
 request upstream. If your work is specific to this fork's creator workflow, open

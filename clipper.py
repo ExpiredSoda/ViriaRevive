@@ -653,6 +653,7 @@ def _cleanup(path):
 
 
 def _fmt(seconds: int) -> str:
+    seconds = int(round(float(seconds or 0)))
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"

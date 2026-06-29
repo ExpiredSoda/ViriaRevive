@@ -16,6 +16,7 @@ from api_bridge import (  # noqa: E402
     ApiBridge,
     _allowed_media_origin,
     _candidate_model_for_depth,
+    _selected_audio_stream_profile,
     _candidate_transcription_chunks,
     _transcribe_candidate_wav_chunks,
     _normalize_audio_source_settings,
@@ -23,6 +24,7 @@ from api_bridge import (  # noqa: E402
     _normalize_montage_settings,
     _normalize_processing_depth,
     _processing_depth_profile,
+    _clip_speech_policy_summary,
     _subtitle_words_for_render_start,
 )
 from config import CLIPS_DIR  # noqa: E402
@@ -31,6 +33,18 @@ from voice_profile import VOICE_PROFILE_FEATURE_COUNT, empty_voice_profile  # no
 
 
 class ApiBridgePathSafetyTests(unittest.TestCase):
+    def test_custom_output_dir_controls_generated_clip_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._user_settings = {"output_dir": temp_dir}
+
+            clips_dir = bridge._clips_dir()
+            output = bridge._unique_clip_output_path("sample source", 1)
+
+            self.assertEqual(clips_dir, Path(temp_dir).resolve())
+            self.assertEqual(output.parent, Path(temp_dir).resolve())
+            self.assertTrue(output.name.endswith("_viral1.mp4"))
+
     def test_youtube_download_metadata_feeds_game_identity_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             clip_path = Path(temp_dir) / "Alan_Wake_Part_4.mp4"
@@ -436,6 +450,9 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         ]
 
         with patch("api_bridge.ollama_vision_status", return_value={"model_ready": True, "model": "test-vision"}), patch(
+            "api_bridge.preflight_ollama_vision_model",
+            return_value={"ok": True, "status": "ok", "model": "test-vision"},
+        ), patch(
             "api_bridge.analyze_candidate_frames_with_ollama",
             return_value={
                 "status": "ok",
@@ -985,6 +1002,80 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertEqual(seen["identity_kwargs"]["creator_context"], "blind Alan Wake run")
             self.assertEqual(bridge._moments[0]["game_identity"]["qid"], "Q575505")
 
+    def test_creator_policy_blocks_rendered_audio_backfill_when_selected_track_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_bytes(b"fake video")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "word_count": 0,
+                "subtitle_word_count": 0,
+                "analysis_word_count": 62,
+                "audio_source": {
+                    "subtitle_policy": "creator",
+                    "stream_count": 2,
+                    "selected_stream": 1,
+                    "selected_reason": "manual_stream",
+                    "render_audio": "all_source_streams_mixed",
+                },
+                "stream_selection": {
+                    "status": "manual",
+                    "selected_stream": 1,
+                    "selected_title": "Microphone",
+                    "confidence": 0.82,
+                },
+            }]
+
+            with patch("api_bridge.extract_audio_clip") as extract_audio, \
+                    patch("api_bridge.transcribe_clip") as transcribe:
+                bridge._backfill_transcript_single(0)
+
+            extract_audio.assert_not_called()
+            transcribe.assert_not_called()
+            policy = bridge._moments[0]["speech_policy"]
+            self.assertEqual(policy["status"], "no_selected_commentary_speech")
+            self.assertTrue(policy["metadata_backfill_blocked"])
+            self.assertTrue(policy["mixed_speech_without_selected_track"])
+            self.assertTrue(bridge._moments[0]["metadata_needs_context"])
+
+    def test_generate_title_for_clip_reports_missing_creator_transcript_without_backfill(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_bytes(b"fake video")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "word_count": 0,
+                "subtitle_word_count": 0,
+                "analysis_word_count": 20,
+                "audio_source": {
+                    "subtitle_policy": "creator",
+                    "stream_count": 2,
+                    "selected_stream": 1,
+                    "render_audio": "all_source_streams_mixed",
+                },
+            }]
+            bridge._save_state = lambda: None
+
+            with patch("api_bridge.extract_audio_clip") as extract_audio:
+                result = bridge.generate_title_for_clip(0, save=True)
+
+            extract_audio.assert_not_called()
+            self.assertEqual(result["error"], "No commentary transcript for this clip")
+            self.assertEqual(result["speech_policy"]["status"], "no_selected_commentary_speech")
+            self.assertTrue(result["metadata_needs_context"])
+
+    def test_clip_speech_policy_allows_legacy_rendered_backfill_when_not_track_aware(self):
+        policy = _clip_speech_policy_summary({
+            "word_count": 0,
+            "subtitle_word_count": 0,
+            "analysis_word_count": 0,
+        })
+
+        self.assertEqual(policy["status"], "ok")
+        self.assertFalse(policy["metadata_backfill_blocked"])
+
     def test_clip_title_context_updates_one_clip_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1161,6 +1252,88 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertTrue(classification["fallback_used"])
         self.assertEqual(classification["selection_impact"], "none")
 
+    def test_selected_moments_retry_cached_ollama_error(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        bridge._infer_game_title_from_path = lambda path: "Test Game"
+        bridge._game_context_for_source = lambda *args, **kwargs: {"label": "Test Game"}
+        bridge._feedback_learning_prompt_context = lambda: {"enabled": False}
+        selected = [{
+            "moment": {
+                "start": 0,
+                "end": 30,
+                "transcript": "Oh no he is right behind me run",
+                "moment_categories": {"primary": "high_energy"},
+                "primary_category": "high_energy",
+                "ranker": {},
+            },
+            "candidate": {"candidate_rank": 1},
+        }]
+        cache_key = bridge._ai_moment_cache_key(selected[0])
+        cache = {cache_key: {"status": "ollama_error", "fallback_used": True, "primary_category": "low_value"}}
+        fresh = {
+            "status": "ok",
+            "provider": "ollama",
+            "fallback_used": False,
+            "primary_category": "high_energy",
+            "fine_labels": ["chase_panic"],
+            "confidence": 0.8,
+            "ai_viral_score": 72,
+            "ai_confidence": 0.8,
+            "ai_dimensions": {"hook": 0.7, "flow": 0.6, "value": 0.6, "platform_fit": 0.7, "game_context": 0.6},
+            "selection_impact": "none",
+            "output_changed": False,
+        }
+
+        with patch("api_bridge.is_ollama_model_ready", return_value=True), \
+                patch("api_bridge.classify_moment_ai", return_value=fresh) as classify_mock:
+            report = bridge._classify_selected_moments(
+                selected,
+                Path("A:/Videos/Test Game/source.mp4"),
+                enabled=True,
+                max_ollama=1,
+                classification_cache=cache,
+            )
+
+        self.assertEqual(report["reused_shadow_count"], 0)
+        self.assertEqual(report["ollama_attempted_count"], 1)
+        classify_mock.assert_called_once()
+        self.assertEqual(selected[0]["moment"]["ai_moment_classification"]["status"], "ok")
+
+    def test_manual_audio_profile_does_not_fabricate_creator_confidence_from_title(self):
+        profile = _selected_audio_stream_profile(
+            {
+                "mode": "stream",
+                "streams": [{"ordinal": 0, "title": "Microphone_vertical", "likely_role": "commentary"}],
+                "stream_selection": {
+                    "status": "forced",
+                    "mode": "manual_stream",
+                    "selected_stream": 0,
+                    "selected_title": "Microphone_vertical",
+                    "selected_reason": "user_selected_stream",
+                    "confidence": 1.0,
+                    "stream_profiles": [],
+                },
+            },
+            selected_stream=0,
+        )
+
+        self.assertEqual(profile["selected_reason"], "user_selected_stream")
+        self.assertLessEqual(profile["creator_likeness_score"], 0.2)
+        self.assertEqual(profile["natural_dialogue_score"], 0.0)
+
+    def test_manual_audio_selection_is_locked_against_auto_override(self):
+        source = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
+
+        self.assertIn("manual_stream_locked = forced_speech_stream is not None", source)
+        self.assertIn(
+            'final_stream = speech_stream if manual_stream_locked else m.get("speech_stream", speech_stream)',
+            source,
+        )
+        self.assertIn("User-selected transcription stream locked", source)
+        self.assertNotIn("manual_audio_stream_overridden_by_creator_detection", source)
+        self.assertNotIn("creator_detection_overrode_manual_stream", source)
+        self.assertNotIn("manual_overridden", source)
+
     def test_local_video_server_sends_thumbnail_safe_headers(self):
         source = (ROOT / "api_bridge.py").read_text(encoding="utf-8")
 
@@ -1277,6 +1450,78 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             sidecar_text = new_sidecar.read_text(encoding="utf-8")
             self.assertIn("Title: Better Clip Title #shorts", sidecar_text)
             self.assertIn(new_clip.name, sidecar_text)
+
+    def test_generated_metadata_records_stable_clip_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{
+                "clip_id": "clip-identity",
+                "source_id": "source-identity",
+                "transcript": "this is a useful moment",
+            }]
+            bridge._user_settings = {}
+
+            bridge._store_generated_metadata(
+                0,
+                "Useful Moment",
+                "Description",
+                "tags",
+                "Test Game",
+                str(clip_path.with_suffix(".txt")),
+                {"transcript": "this is a useful moment"},
+            )
+
+            meta = bridge._moments[0]["generated_metadata"]
+            self.assertEqual(meta["clip_id"], "clip-identity")
+            self.assertEqual(meta["source_id"], "source-identity")
+            self.assertEqual(meta["clip_filename"], "clip.mp4")
+
+    def test_montage_metadata_uses_storyboard_context_for_title_and_description(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "montage.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{"clip_id": "clip-montage", "source_id": "src-montage"}]
+            bridge._user_settings = {"description_profile": {"auto_hashtags": False, "custom_text": ""}}
+            bridge._game_context_for_title = lambda *_args, **_kwargs: {
+                "status": "ok",
+                "label": "Star Wars Outlaws",
+                "facts": {"genres": ["action-adventure game"]},
+            }
+            bridge._feedback_learning_prompt_context = lambda: {"enabled": False}
+            seen = {}
+
+            def fake_generate_title(transcript, game_title="", clip_context=None):
+                seen["transcript"] = transcript
+                seen["clip_context"] = clip_context
+                return "That Bribe Was Not Worth It #shorts"
+
+            bridge._generated_description_for_clip = lambda title, transcript, game_title, clip_context: (
+                "The club bribe somehow gets worse."
+            )
+            storyboard = {
+                "source": {"game_title": "Star Wars Outlaws"},
+                "summary": {"beat_count": 3, "planned_duration_seconds": 58},
+                "beats": [
+                    {"role": "setup", "category": "commentary_or_review", "hook_text": "we need to sneak into the club"},
+                    {"role": "escalation", "category": "high_energy", "hook_text": "we have to bribe this guy for fifty credits"},
+                    {"role": "punchline", "category": "commentary_or_review", "hook_text": "that was not worth it"},
+                ],
+            }
+
+            with patch("api_bridge.generate_title", side_effect=fake_generate_title):
+                metadata = bridge._write_montage_metadata(0, storyboard)
+
+            self.assertEqual(metadata["title"], "That Bribe Was Not Worth It #shorts")
+            self.assertIn("setup:", seen["transcript"])
+            self.assertIn("bribe this guy", seen["transcript"])
+            self.assertIn("montage_storyboard", seen["clip_context"])
+            self.assertIn("montage_quality_explanation", bridge._moments[0])
+            self.assertIn("Montage Quality:", clip_path.with_suffix(".txt").read_text(encoding="utf-8"))
 
     def test_manual_ai_metadata_reroll_renames_clip_and_removes_stale_sidecar(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1426,10 +1671,12 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(_normalize_montage_settings({
             "template": "death / failure",
             "target_duration": 999,
+            "count": 99,
             "prompt": "make it scary\n" * 80,
         }), {
             "template": "panic",
             "target_duration": 60,
+            "count": 5,
             "prompt": ("make it scary " * 80).strip()[:500],
         })
 
@@ -1438,6 +1685,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             "montage": {
                 "template": "story",
                 "target_duration": 90,
+                "count": 3,
                 "prompt": "story recap with a clean payoff",
             },
         })
@@ -1445,6 +1693,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(settings["generation_mode"], "montage")
         self.assertEqual(settings["montage"]["template"], "story")
         self.assertEqual(settings["montage"]["target_duration"], 90)
+        self.assertEqual(settings["montage"]["count"], 3)
         self.assertEqual(settings["montage"]["prompt"], "story recap with a clean payoff")
 
     def test_processing_depth_profile_maps_runtime_cost(self):

@@ -57,6 +57,8 @@ const state = {
     wizardProcessingDepth: 'balanced',
     wizardMontageTemplate: 'panic',
     progressStartedAt: 0,
+    progressStage: null,
+    progressStagePercent: 0,
     dependencies: { ffmpeg: null, ffprobe: null, checked: false, error: '' },
 };
 
@@ -80,6 +82,14 @@ const DETECTION_PREFERENCES = new Set(['auto', 'quality', 'quantity']);
 const PROCESSING_DEPTHS = new Set(['fast', 'balanced', 'deep']);
 const GENERATION_MODES = new Set(['clips', 'montage']);
 const MONTAGE_TEMPLATES = new Set(['panic', 'funny', 'failure', 'combat', 'story', 'tutorial', 'atmosphere', 'custom']);
+const PIPELINE_STAGE_ORDER = ['download', 'detect', 'candidates', 'clips'];
+const DEFAULT_PROGRESS_RANGES = {
+    download: [0, 12],
+    detect: [12, 24],
+    candidates: [24, 68],
+    clips: [68, 98],
+    upload: [0, 100],
+};
 const FEEDBACK_REASON_PRESETS = {
     like: ['Strong hook', 'Funny moment', 'Good pacing', 'Useful explanation', 'Good subtitles'],
     dislike: ['Weak moment', 'Wrong audio', 'Bad timing', 'Too slow', 'Bad subtitles'],
@@ -95,6 +105,7 @@ function persistSettingsAsync(settings, { quiet = false } = {}) {
     if (!window.pywebview || !pywebview.api || !pywebview.api.save_settings) return;
     clearTimeout(_settingsPersistTimer);
     const payload = { ...(settings || {}) };
+    delete payload.game_title_hint;
     _settingsPersistTimer = setTimeout(async () => {
         try {
             const result = await pywebview.api.save_settings(payload);
@@ -149,10 +160,16 @@ function normalizeMontageDuration(value) {
     return [30, 45, 60, 90].includes(seconds) ? seconds : 60;
 }
 
+function normalizeMontageCount(value) {
+    const count = parseInt(value, 10);
+    return Number.isFinite(count) ? Math.max(1, Math.min(5, count)) : 1;
+}
+
 function montageSettingsFromWizard() {
     return {
         template: normalizeMontageTemplate(state.wizardMontageTemplate),
         target_duration: normalizeMontageDuration(getVal('wizard-montage-duration')),
+        count: normalizeMontageCount(getVal('wizard-montage-count')),
         prompt: normalizeMontagePrompt(getVal('wizard-montage-prompt')),
     };
 }
@@ -742,8 +759,39 @@ function updateScheduledDescriptionPreview(item) {
     return item;
 }
 
+function scheduleClipFilename(item) {
+    if (!item) return '';
+    const direct = String(item.clip_filename || item.filename || '').trim();
+    if (direct) return direct;
+    const idx = Number(item.clipIdx);
+    const clip = Number.isInteger(idx) && idx >= 0 ? state.results[idx] : null;
+    return String(clip?.filename || '').trim();
+}
+
+function metadataMatchesScheduleItem(item, meta) {
+    if (!item || !meta) return false;
+    const metaClipId = String(meta.clip_id || '').trim();
+    const itemClipId = String(item.clip_id || '').trim();
+    if (metaClipId || itemClipId) return Boolean(metaClipId && itemClipId && metaClipId === itemClipId);
+    const metaFilename = String(meta.clip_filename || meta.filename || '').trim();
+    const itemFilename = scheduleClipFilename(item);
+    if (metaFilename || itemFilename) return Boolean(metaFilename && itemFilename && metaFilename === itemFilename);
+    const metaIndex = Number(meta.index ?? meta.clip_index);
+    const itemIndex = Number(item.clipIdx);
+    if (Number.isInteger(metaIndex) || Number.isInteger(itemIndex)) {
+        return Number.isInteger(metaIndex) && Number.isInteger(itemIndex) && metaIndex === itemIndex;
+    }
+    return true;
+}
+
 function applyGeneratedMetadataToSchedule(item, meta) {
     if (!item || !meta) return item;
+    if (!metadataMatchesScheduleItem(item, meta)) {
+        item.metadata_stale = true;
+        item.metadata_identity_mismatch = true;
+        return item;
+    }
+    delete item.metadata_identity_mismatch;
     if (!String(item.title || '').trim() && meta.title) item.title = meta.title;
     const generated = meta.generated_description || meta.description_generated || meta.description || '';
     if (generated) {
@@ -781,14 +829,6 @@ function descriptionFieldsForClip(clip, idx, title = '') {
         final_description: final,
         recommended_hashtags: recommendedDescriptionHashtags(gameTitle),
     };
-}
-
-function defaultUploadDescription(title = '') {
-    return composeDescriptionPreview({
-        generated: title,
-        custom: descriptionProfile().custom_text,
-        autoHashtags: descriptionProfile().auto_hashtags,
-    });
 }
 
 function clipIndexById(clipId) {
@@ -1096,22 +1136,28 @@ function momentLabelMarkup(clip = {}, moment = {}) {
         </div>`;
 }
 
-function truthSummaryForClip(clip = {}, moment = {}) {
-    const truth = clip.truth_summary || moment.truth_summary || {};
-    return truth && typeof truth === 'object' ? truth : {};
-}
-
 function clipTruthMarkup(clip = {}, moment = {}, options = {}) {
     const gameTitle = gameTitleForEntity(clip, moment);
     const gameText = `Game: ${gameTitle || 'Unknown'}`;
+    const truth = moment.truth_summary || clip.truth_summary || {};
+    const speechPolicy = moment.speech_policy || clip.speech_policy || {};
+    const speechStatus = String(speechPolicy.status || truth.speech_policy_status || '').trim();
+    const speechWarning = String(speechPolicy.warning || truth.speech_policy_warning || '').trim();
+    const needsCommentary = speechStatus === 'no_selected_commentary_speech'
+        || moment.metadata_needs_context === true
+        || clip.metadata_needs_context === true;
     const editable = options.editable === true;
     const editText = gameTitle ? 'Edit game' : 'Set game';
     const editButton = editable
         ? `<button type="button" class="truth-chip truth-chip-btn is-edit-game">${editText}</button>`
         : '';
+    const speechChip = needsCommentary
+        ? `<span class="truth-chip is-warning" title="${escHtml(speechWarning || 'No commentary transcript was found on the selected track.')}">No commentary transcript</span>`
+        : '';
     return `
         <div class="truth-summary-row" title="${escHtml(gameText)}">
             <span class="truth-chip is-game">${escHtml(gameText)}</span>
+            ${speechChip}
             ${editButton}
         </div>`;
 }
@@ -1508,6 +1554,44 @@ async function openDataFolder() {
         if (r && r.error) toast(r.error, 'error');
     } catch (_) {
         toast('Could not open data folder', 'error');
+    }
+}
+
+function setOutputFolderDisplay(path) {
+    const input = document.getElementById('set-output-dir');
+    if (!input) return;
+    const value = String(path || '').trim();
+    input.value = value || 'Default clips folder';
+    input.title = value || 'Uses the app default clips folder';
+}
+
+async function selectOutputFolder() {
+    try {
+        const r = await pywebview.api.select_output_folder();
+        if (!r || r.cancelled) return;
+        if (r.error) return toast(r.error, 'error');
+        state.settings = { ...(state.settings || {}), output_dir: r.path || '' };
+        setOutputFolderDisplay(r.path || '');
+        saveLocal('settings', state.settings);
+        toast('Output folder updated', 'success');
+        refreshUploadClips?.();
+    } catch (_) {
+        toast('Could not choose output folder', 'error');
+    }
+}
+
+async function resetOutputFolder() {
+    try {
+        const r = await pywebview.api.reset_output_folder();
+        if (r && r.error) return toast(r.error, 'error');
+        state.settings = { ...(state.settings || {}) };
+        delete state.settings.output_dir;
+        setOutputFolderDisplay('');
+        saveLocal('settings', state.settings);
+        toast('Output folder reset', 'success');
+        refreshUploadClips?.();
+    } catch (_) {
+        toast('Could not reset output folder', 'error');
     }
 }
 
@@ -2395,6 +2479,7 @@ function openStylePicker() {
     const savedMontage = saved.montage || state.settings.montage || {};
     selectMontageTemplate(savedMontage.template || state.wizardMontageTemplate || 'panic');
     setSelect('wizard-montage-duration', normalizeMontageDuration(savedMontage.target_duration || 60));
+    setSelect('wizard-montage-count', normalizeMontageCount(savedMontage.count || 1));
     setVal('wizard-montage-prompt', savedMontage.prompt || '');
     const clipDurationLabel = document.getElementById('val-wizard-clip-duration');
     const minGapLabel = document.getElementById('val-wizard-min-gap');
@@ -2490,8 +2575,9 @@ function syncWizardEstimate() {
         const montageEl = document.getElementById('wizard-montage-estimate');
         if (!montageEl) return;
         const target = normalizeMontageDuration(getVal('wizard-montage-duration'));
+        const count = normalizeMontageCount(getVal('wizard-montage-count'));
         const template = normalizeMontageTemplate(state.wizardMontageTemplate).replace(/-/g, ' ');
-        montageEl.textContent = `Montage target: about ${target}s. ViriaRevive will gather multiple ${template} beats before the final stitch pass.`;
+        montageEl.textContent = `Montage target: ${count} ${count === 1 ? 'montage' : 'montages'} at about ${target}s each. ViriaRevive will gather distinct ${template} beats and may return fewer if the source does not have enough strong story threads.`;
         return;
     }
     const el = document.getElementById('wizard-estimate');
@@ -3114,10 +3200,6 @@ function confirmStyleAndGenerate() {
     });
 
     closeModal('style-picker-modal');
-    if (pickedGenerationMode === 'montage') {
-        safeToast('Montage mode is wired for planning; this build still renders normal clips until the montage renderer lands.', 'info');
-    }
-
     // Snapshot settings for the entire batch
     const settings = gatherSettings();
     settings.generation_mode = pickedGenerationMode;
@@ -3149,7 +3231,10 @@ function confirmStyleAndGenerate() {
             subtitle_policy: audioSource.subtitle_policy || 'creator',
     };
     state.batchQueue.forEach(item => {
-        item.audioSource = { ...(item.audioSource || perItemAudioSource) };
+        const hasAudioOverride = item.audioSourceOverride === true || item.audio_source_override === true;
+        item.audioSource = hasAudioOverride && item.audioSource
+            ? { ...item.audioSource }
+            : { ...(perItemAudioSource || {}) };
         item.subtitleStyle = settings.subtitle_style || 'tiktok';
         item.generationMode = settings.generation_mode || 'clips';
         item.montage = { ...(settings.montage || {}) };
@@ -3599,15 +3684,11 @@ window.onPipelineProgress = function (stage, percent, message, detail, context =
     }
     if (!state.processing) return;
     applyPipelineProgressContext(context);
-    const ranges = {
-        download: [0, 12],
-        detect: [12, 24],
-        candidates: [24, 68],
-        clips: [68, 98],
-        upload: [0, 100],
-    };
-    const r = ranges[stage] || [0, 100];
-    setProgress(r[0] + (percent / 100) * (r[1] - r[0]), message);
+    const stagePercent = Math.min(100, Math.max(0, Number(percent) || 0));
+    state.progressStage = stage;
+    state.progressStagePercent = stagePercent;
+    const r = progressRangeForStage(stage);
+    setProgress(r[0] + (stagePercent / 100) * (r[1] - r[0]), message);
     if (detail) {
         setProgressDetail(detail);
     } else {
@@ -3623,8 +3704,12 @@ window.onClipProgress = function (clipNum, totalClips, substep, percent, message
     if (!state.processing) return;
     const sw = { audio: [0, 0.10], transcribe: [0.10, 0.40], subtitle: [0.40, 0.60], render: [0.60, 1.0] }[substep] || [0, 1];
     const clipFrac = sw[0] + (percent / 100) * (sw[1] - sw[0]);
-    const perClip = 30 / Math.max(1, totalClips || 1);
-    setProgress(68 + (clipNum - 1) * perClip + clipFrac * perClip, message);
+    const total = Math.max(1, totalClips || 1);
+    const clipStagePercent = Math.min(100, Math.max(0, ((clipNum - 1) + clipFrac) / total * 100));
+    state.progressStage = 'clips';
+    state.progressStagePercent = clipStagePercent;
+    const r = progressRangeForStage('clips');
+    setProgress(r[0] + (clipStagePercent / 100) * (r[1] - r[0]), message);
     completeStage('candidates');
     activateStage('clips');
     updateClipCard(clipNum, totalClips, substep, percent, message);
@@ -3686,14 +3771,18 @@ window.onPipelineComplete = async function (success, doneCount, totalCount, erro
     let hasMore = false;
     const completionDetails = details && typeof details === 'object' ? details : {};
     const noQualityClips = success && completionDetails.completion_state === 'no_quality_clips';
+    const montageCreated = success && completionDetails.completion_state === 'montage_created';
+    const noMontageBeats = success && completionDetails.completion_state === 'no_montage_beats';
     try {
         // Mark current batch item
         if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
             state.batchQueue[state.batchIndex].status = success
-                ? (noQualityClips ? 'empty' : 'done')
+                ? ((noQualityClips || noMontageBeats) ? 'empty' : 'done')
                 : 'error';
             if (noQualityClips) {
                 state.batchQueue[state.batchIndex].message = completionDetails.message || 'No clips met the quality bar.';
+            } else if (noMontageBeats) {
+                state.batchQueue[state.batchIndex].message = completionDetails.message || 'No montage could be assembled.';
             }
             renderBatchQueue();
             renderBatchProgress();
@@ -3702,12 +3791,33 @@ window.onPipelineComplete = async function (success, doneCount, totalCount, erro
         hasMore = state.batchQueue.some((q, i) => i > state.batchIndex && q.status === 'pending');
 
         if (success) {
-            setProgress(100, noQualityClips ? (completionDetails.message || 'No clips met the quality bar') : `${doneCount} clips created`);
+            setProgress(
+                100,
+                noQualityClips || noMontageBeats
+                    ? (completionDetails.message || 'No clips met the quality bar')
+                    : (montageCreated ? 'Montage created' : `${doneCount} clips created`)
+            );
             completeStageThrough('done');
-            if (noQualityClips) {
-                const guidance = completionDetails.guidance || 'Try Auto or Quantity, a longer source, a shorter minimum gap, or Deep Analysis.';
-                safeToast(completionDetails.message || 'No clips met the quality bar', 'warning');
-                safeAddNotification('No Clips Created', guidance, 'info');
+            if (noQualityClips || noMontageBeats) {
+                const fallbackGuidance = noMontageBeats
+                    ? 'Try a longer source, a broader montage template, or Deep Analysis.'
+                    : 'Try Auto or Quantity, a longer source, a shorter minimum gap, or Deep Analysis.';
+                const guidance = completionDetails.guidance || fallbackGuidance;
+                safeToast(completionDetails.message || (noMontageBeats ? 'No montage could be assembled' : 'No clips met the quality bar'), 'warning');
+                safeAddNotification(noMontageBeats ? 'No Montage Created' : 'No Clips Created', guidance, 'info');
+            } else if (montageCreated) {
+                const beatCount = Number(completionDetails.beat_count || 0);
+                const createdCount = Number(completionDetails.created_count || doneCount || 1);
+                const requestedCount = Number(completionDetails.requested_count || createdCount);
+                safeToast(
+                    createdCount === 1 ? 'Montage created successfully' : `${createdCount} montages created successfully`,
+                    'success'
+                );
+                safeAddNotification(
+                    createdCount === 1 ? 'Montage Ready' : 'Montages Ready',
+                    `${createdCount} of ${requestedCount} requested montage${requestedCount !== 1 ? 's' : ''}${beatCount ? ` from ${beatCount} total beat${beatCount !== 1 ? 's' : ''}` : ''} ready to review`,
+                    'success'
+                );
             } else {
                 safeToast(`${doneCount} clips created successfully`, 'success');
                 safeAddNotification(
@@ -3721,7 +3831,7 @@ window.onPipelineComplete = async function (success, doneCount, totalCount, erro
             pywebview.api.get_results().then(r => {
                 state.results = visibleClipList(r.clips);
                 state.moments = r.moments || state.moments;
-                if (!noQualityClips) refreshSubtitlePreviewSnapshot(true);
+                if (!noQualityClips && !noMontageBeats) refreshSubtitlePreviewSnapshot(true);
             }).catch(() => {});
         } else {
             safeToast(errorMsg || 'Processing failed', 'error');
@@ -3861,6 +3971,47 @@ window.onScheduleUpdated = function () {
 
 /* ── Progress Helpers ──────────────────────────────────────────────────── */
 
+function learnedEtaStagePlan() {
+    const context = state.batchProgressContext || {};
+    const rawPlan = context.etaStagePlan || context.eta_stage_plan || {};
+    if (!rawPlan || typeof rawPlan !== 'object') return null;
+    const stages = {};
+    let total = 0;
+    PIPELINE_STAGE_ORDER.forEach(stage => {
+        const seconds = Number(rawPlan[stage]);
+        stages[stage] = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+        total += stages[stage];
+    });
+    if (total <= 0) return null;
+    return {
+        stages,
+        total,
+        confidence: String(context.etaStageConfidence || context.eta_stage_confidence || '').trim(),
+        sampleCount: Number(context.etaStageSampleCount ?? context.eta_stage_sample_count ?? 0),
+    };
+}
+
+function learnedProgressRanges() {
+    const plan = learnedEtaStagePlan();
+    if (!plan) return null;
+    const ranges = {};
+    let cursor = 0;
+    PIPELINE_STAGE_ORDER.forEach((stage, index) => {
+        const width = (plan.stages[stage] / plan.total) * 100;
+        const end = index === PIPELINE_STAGE_ORDER.length - 1 ? 100 : cursor + width;
+        ranges[stage] = [cursor, end];
+        cursor = end;
+    });
+    ranges.upload = DEFAULT_PROGRESS_RANGES.upload;
+    return ranges;
+}
+
+function progressRangeForStage(stage) {
+    const learned = learnedProgressRanges();
+    if (learned && learned[stage]) return learned[stage];
+    return DEFAULT_PROGRESS_RANGES[stage] || [0, 100];
+}
+
 function setProgress(pct, msg, allowDecrease = false) {
     pct = Math.min(100, Math.max(0, pct));
     if (!allowDecrease) pct = Math.max(pct, state.overallPercent || 0);
@@ -3874,7 +4025,7 @@ function setProgress(pct, msg, allowDecrease = false) {
         if (pct >= 100) {
             etaEl.textContent = 'Complete.';
         } else {
-            const backendEta = backendHistoryEtaRemaining();
+            const backendEta = learnedStageEtaRemaining() || backendHistoryEtaRemaining();
             if (backendEta) {
                 etaEl.textContent = `Rough ETA: ${fmtEta(backendEta.remaining)} remaining (${backendEta.source})`;
             } else if (pct >= 3 && state.progressStartedAt) {
@@ -3910,6 +4061,8 @@ function resetStages() {
     document.querySelectorAll('.stage-line').forEach(l => l.classList.remove('active', 'completed'));
     const etaEl = document.getElementById('progress-eta');
     if (etaEl) etaEl.textContent = 'ETA will appear after progress starts.';
+    state.progressStage = null;
+    state.progressStagePercent = 0;
     setProgressDetail('');
 }
 function activateStage(name) {
@@ -3946,6 +4099,23 @@ function fmtEta(seconds) {
     return rem ? `${hours}h ${rem}m` : `${hours}h`;
 }
 
+function learnedStageEtaRemaining() {
+    const plan = learnedEtaStagePlan();
+    if (!plan || !state.progressStage) return null;
+    const stage = String(state.progressStage || '').trim();
+    const currentIndex = PIPELINE_STAGE_ORDER.indexOf(stage);
+    if (currentIndex < 0) return null;
+    const percent = Math.min(100, Math.max(0, Number(state.progressStagePercent) || 0)) / 100;
+    let remaining = plan.stages[stage] * (1 - percent);
+    for (let index = currentIndex + 1; index < PIPELINE_STAGE_ORDER.length; index += 1) {
+        remaining += plan.stages[PIPELINE_STAGE_ORDER[index]] || 0;
+    }
+    if (!Number.isFinite(remaining) || remaining <= 0) return null;
+    const suffix = plan.confidence === 'low' ? 'learning' : 'learned stages';
+    const sampleText = plan.sampleCount > 0 ? `, ${plan.sampleCount} run${plan.sampleCount === 1 ? '' : 's'}` : '';
+    return { remaining, source: `${suffix}${sampleText}` };
+}
+
 function backendHistoryEtaRemaining() {
     const context = state.batchProgressContext || {};
     const total = Number(context.estimatedTotalSeconds ?? context.estimated_total_seconds);
@@ -3969,6 +4139,8 @@ function clipSelectionTier(moment = {}) {
     if (rawTier === 'extra_pick' || rawTier === 'near_quality_pick') return 'Extra pick';
     const fallback = moment && moment.near_quality_fallback;
     if (fallback && fallback.applied) return 'Extra pick';
+    const depth = normalizeProcessingDepth(moment?.processing_depth || state.batchSettings?.processing_depth || state.settings?.processing_depth || 'balanced');
+    if (depth === 'fast') return 'Quick pick';
     return 'Recommended';
 }
 
@@ -5565,27 +5737,6 @@ function _availableScheduleSlotsForDate(dateStr, count, now = new Date()) {
         .filter(t => _isFutureScheduleSlot(dateStr, t, now));
 }
 
-function _nextPeakTimeForDate(dateStr) {
-    // Find the next available peak time for a given date (not already taken)
-    const available = _availableScheduleSlotsForDate(dateStr, PEAK_TIMES.length);
-    if (available.length) return available[0];
-    if (_isTodayDateStr(dateStr)) {
-        const future = new Date(Date.now() + SCHEDULE_BUFFER_MINUTES * 60 * 1000);
-        return `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
-    }
-    // All peak slots taken — use next hour after last used
-    const usedTimes = state.scheduled
-        .filter(s => s.date === dateStr && !s.uploaded)
-        .map(s => s.time);
-    if (usedTimes.length) {
-        const last = usedTimes.sort().pop();
-        const [h, m] = last.split(':').map(Number);
-        const nextH = Math.min(h + 1, 23);
-        return `${String(nextH).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    }
-    return '12:00';
-}
-
 function _resolveSchedulableDateTime(dateStr, requestedTime = null) {
     let cursor = new Date(`${dateStr}T12:00:00`);
     if (Number.isNaN(cursor.getTime())) cursor = new Date();
@@ -6145,43 +6296,6 @@ function _scheduleClipIndices(clipIndices, opts = {}) {
     // AI metadata is generated manually via the upload page button.
 }
 
-async function generateAITitles() {
-    try {
-        toast('Generating AI metadata...', 'info');
-        const r = await pywebview.api.generate_titles();
-        if (r.error || !r.titles || !r.titles.length) {
-            if (r.error) toast(r.error, 'warning');
-            return;
-        }
-        let updated = 0;
-        const metaByIndex = {};
-        (r.metadata || []).forEach(m => { metaByIndex[m.index] = m; });
-        state.scheduled.forEach(s => {
-            if (s.uploaded) return;
-            const idx = s.clipIdx;
-            if (idx >= 0 && idx < r.titles.length && r.titles[idx]) {
-                s.title = r.titles[idx];
-                if (metaByIndex[idx]) {
-                    applyGeneratedMetadataToSchedule(s, metaByIndex[idx]);
-                }
-                updated++;
-            }
-        });
-        if (updated) {
-            persistSchedule();
-            renderTimeline();
-            renderCalendar();
-            if (r.llm) {
-                toast(`AI generated metadata for ${updated} clip${updated > 1 ? 's' : ''}`, 'success');
-            } else {
-                toast(`Generated metadata for ${updated} clip${updated > 1 ? 's' : ''} (install Ollama for better AI metadata)`, 'warning');
-            }
-        }
-    } catch (e) {
-        console.error('AI metadata generation error:', e);
-    }
-}
-
 // Title generation progress callback from backend (runs in background thread)
 window.onTitleProgress = function (done, total, title) {
     const btn = document.getElementById('btn-gen-ai-titles');
@@ -6205,6 +6319,11 @@ window.onTitlesDone = function (r) {
             if (!t.title) return;
             state.scheduled.forEach(s => {
                 if (s.clipIdx === t.index && !s.uploaded) {
+                    if (!metadataMatchesScheduleItem(s, t)) {
+                        s.metadata_stale = true;
+                        s.metadata_identity_mismatch = true;
+                        return;
+                    }
                     s.title = t.title;
                     applyGeneratedMetadataToSchedule(s, t);
                     schedUpdated++;
@@ -6359,10 +6478,6 @@ async function regenerateTitle(schedIdx) {
 
 function _toDateStr(d) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-function _fmtDateShort(d) {
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
 function _fmtDateFull(dateStr, timeStr) {
@@ -6933,6 +7048,7 @@ function populateSettings(s) {
     setVal('set-language', s.whisper_language || '');
     const crop = document.getElementById('set-crop-vertical');
     if (crop) crop.checked = s.crop_vertical !== false;
+    setOutputFolderDisplay(s.output_dir || '');
     const subtitlePlacement = s.subtitle_placement || {};
     setSlider('set-subtitle-x', subtitlePlacement.x_pct ?? 50);
     setSlider('set-subtitle-y', subtitlePlacement.y_pct ?? 82);
@@ -6952,7 +7068,6 @@ function gatherSettings() {
         num_clips: autoClips ? 'auto' : parseInt(getVal('set-num-clips')),
         processing_depth: normalizeProcessingDepth(state.wizardProcessingDepth || state.settings?.processing_depth),
         detection_preference: normalizeDetectionPreference(getVal('set-detection-preference')),
-        game_title_hint: normalizeGameTitleHint(getVal('wizard-game-title-hint')),
         montage: montageSettingsFromWizard(),
         clip_duration: clampClipDuration(getVal('set-clip-duration')),
         min_gap: parseInt(getVal('set-min-gap')),
@@ -6967,6 +7082,7 @@ function gatherSettings() {
         ffmpeg_preset: getVal('set-preset'),
         video_crf: getVal('set-crf'),
         crop_vertical: document.getElementById('set-crop-vertical')?.checked ?? true,
+        output_dir: state.settings?.output_dir || '',
         description_profile: descriptionProfile(),
         visual_diagnostics: document.getElementById('set-visual-diagnostics')?.checked ?? true,
         ai_moment_classification: document.getElementById('set-ai-moment-classification')?.checked ?? false,
@@ -7210,16 +7326,6 @@ function addNotification(title, desc, type = 'info', { progress = -1, id = null 
     _updateNotifBadge();
     _renderNotifList();
     return notif.id;
-}
-
-function updateNotification(id, updates) {
-    const notif = _notifications.find(n => n.id === id);
-    if (!notif) return;
-    if (updates.title !== undefined) notif.title = updates.title;
-    if (updates.desc !== undefined) notif.desc = updates.desc;
-    if (updates.type !== undefined) notif.type = updates.type;
-    if (updates.progress !== undefined) notif.progress = updates.progress;
-    _renderNotifList();
 }
 
 function removeNotificationsByType(type) {

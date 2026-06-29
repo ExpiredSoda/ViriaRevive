@@ -829,6 +829,16 @@
                             </div>
                         </div>
                         <div class="setting-row">
+                            <label for="set-output-dir">Default output folder</label>
+                            <input type="text" id="set-output-dir" class="form-input output-folder-input" readonly placeholder="Default clips folder">
+                            <div class="data-privacy-actions output-folder-actions">
+                                <button class="btn-secondary btn-sm" onclick="selectOutputFolder()">Choose</button>
+                                <button class="btn-secondary btn-sm" onclick="openFolder()">Open</button>
+                                <button class="btn-secondary btn-sm" onclick="resetOutputFolder()">Reset</button>
+                            </div>
+                            <span class="setting-hint">Generated videos, metadata text files, Results, All Videos, and Upload use this folder.</span>
+                        </div>
+                        <div class="setting-row">
                             <label for="set-preset">FFmpeg preset</label>
                             <select id="set-preset" class="form-select">
                                 <option value="ultrafast" selected>Ultra Fast</option>
@@ -1743,6 +1753,16 @@
                                 <option value="45">45 seconds</option>
                                 <option value="60" selected>60 seconds</option>
                                 <option value="90">90 seconds</option>
+                            </select>
+                        </div>
+                        <div class="wizard-detection-row">
+                            <label for="wizard-montage-count">Montages to create</label>
+                            <select id="wizard-montage-count" class="form-select" onchange="syncWizardEstimate()">
+                                <option value="1" selected>1 montage</option>
+                                <option value="2">2 montages</option>
+                                <option value="3">3 montages</option>
+                                <option value="4">4 montages</option>
+                                <option value="5">5 montages</option>
                             </select>
                         </div>
                         <div class="wizard-detection-row wizard-detection-row-wide wizard-textarea-row">

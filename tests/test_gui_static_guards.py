@@ -308,7 +308,6 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("settings.detection_preference = pickedDetectionPreference;", self.app_js)
         self.assertIn("settings.game_title_hint = pickedGameTitleHint;", self.app_js)
         self.assertIn("function normalizeGameTitleHint", self.app_js)
-        self.assertIn("function truthSummaryForClip", self.app_js)
         self.assertIn("function clipTruthMarkup", self.app_js)
         self.assertIn("truth_summary", api)
         self.assertIn("_clip_truth_summary", api)
@@ -317,6 +316,8 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn(".truth-summary-row", css)
         self.assertIn("Edit game", self.app_js)
         self.assertIn("Game: ${gameTitle || 'Unknown'}", self.app_js)
+        self.assertIn("No commentary transcript", self.app_js)
+        self.assertIn(".truth-chip.is-warning", css)
         self.assertNotIn("Game nudge", self.app_js)
         self.assertNotIn("formatTruthConfidence", self.app_js)
         self.assertNotIn("formatTruthDelta", self.app_js)
@@ -333,6 +334,7 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("openSubtitlePreviewModal", self.app_js)
         self.assertIn("refreshSubtitlePreviewSnapshot", self.app_js)
         self.assertIn("get_subtitle_preview_url", (ROOT / "api_bridge.py").read_text(encoding="utf-8"))
+        self.assertIn("Quick pick", self.app_js)
 
     def test_all_videos_feedback_controls_share_result_feedback_pipeline(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")
@@ -546,10 +548,12 @@ class GuiStaticGuardTests(unittest.TestCase):
 
         self.assertIn("window.onPipelineComplete = async function (success, doneCount, totalCount, errorMsg, details = null)", self.app_js)
         self.assertIn("completionDetails.completion_state === 'no_quality_clips'", self.app_js)
-        self.assertIn("? (noQualityClips ? 'empty' : 'done')", self.app_js)
+        self.assertIn("completionDetails.completion_state === 'no_montage_beats'", self.app_js)
+        self.assertIn("((noQualityClips || noMontageBeats) ? 'empty' : 'done')", self.app_js)
         self.assertIn("No Clips Created", self.app_js)
         self.assertIn("No clips met the quality bar", self.app_js)
-        self.assertIn("if (!noQualityClips) refreshSubtitlePreviewSnapshot(true);", self.app_js)
+        self.assertIn("No Montage Created", self.app_js)
+        self.assertIn("if (!noQualityClips && !noMontageBeats) refreshSubtitlePreviewSnapshot(true);", self.app_js)
         self.assertIn(".batch-queue-item.empty", css)
         self.assertIn(".batch-queue-item-status.empty", css)
 
@@ -563,6 +567,11 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("candidates: [24, 68]", self.app_js)
         self.assertIn("completeStage('candidates')", self.app_js)
         self.assertIn("Rough ETA:", self.app_js)
+        self.assertIn("const PIPELINE_STAGE_ORDER = ['download', 'detect', 'candidates', 'clips'];", self.app_js)
+        self.assertIn("function learnedEtaStagePlan()", self.app_js)
+        self.assertIn("function progressRangeForStage(stage)", self.app_js)
+        self.assertIn("function learnedStageEtaRemaining()", self.app_js)
+        self.assertIn("learnedStageEtaRemaining() || backendHistoryEtaRemaining()", self.app_js)
         self.assertIn("backendHistoryEtaRemaining()", self.app_js)
 
     def test_final_debug_preserves_active_ai_and_category_ranking_fields(self):
@@ -602,6 +611,9 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn('id="progress-eta"', html)
         self.assertIn('id="progress-detail"', html)
         self.assertIn('id="batch-progress-card"', html)
+        self.assertIn("ETA_PROGRESS_STAGES", api)
+        self.assertIn("etaStagePlan", api)
+        self.assertIn("_estimate_processing_stage_plan_from_history", api)
 
     def test_data_privacy_modal_uses_wrapped_tabs_instead_of_horizontal_scroll(self):
         css = (ROOT / "gui" / "style.css").read_text(encoding="utf-8")
@@ -638,6 +650,9 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn("item.audioSource", self.app_js)
         self.assertIn("state.batchQueue.forEach(item => {", self.app_js)
         self.assertIn("item.audioSource =", self.app_js)
+        self.assertIn("const hasAudioOverride = item.audioSourceOverride === true || item.audio_source_override === true;", self.app_js)
+        self.assertIn("? { ...item.audioSource }", self.app_js)
+        self.assertIn(": { ...(perItemAudioSource || {}) };", self.app_js)
         self.assertIn("audio_source: item.audioSource || state.batchSettings?.audio_source", self.app_js)
         self.assertIn("if (currentBatchSourceCount() > 1)", self.app_js)
         self.assertIn("subtitle_policy: audioSource.subtitle_policy || 'creator'", self.app_js)
@@ -648,6 +663,13 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertNotIn("updateBatchSubtitleOverride", self.app_js)
         self.assertNotIn("batch-queue-caption-select", (ROOT / "gui" / "style.css").read_text(encoding="utf-8"))
         self.assertNotIn("batch-queue-caption", self.app_js)
+
+    def test_generated_metadata_requires_clip_identity_before_clearing_stale_state(self):
+        self.assertIn("function metadataMatchesScheduleItem(item, meta)", self.app_js)
+        self.assertIn("meta.clip_id", self.app_js)
+        self.assertIn("meta.clip_filename || meta.filename", self.app_js)
+        self.assertIn("item.metadata_identity_mismatch = true;", self.app_js)
+        self.assertIn("if (!metadataMatchesScheduleItem(s, t))", self.app_js)
 
     def test_completed_batch_history_is_pruned_before_new_processing(self):
         self.assertIn("function pruneCompletedBatchItemsForNewRun", self.app_js)
@@ -741,15 +763,22 @@ class GuiStaticGuardTests(unittest.TestCase):
         self.assertIn('data-mode="montage"', html)
         self.assertIn('id="wizard-montage-plan-panel"', html)
         self.assertIn('id="wizard-montage-duration"', html)
+        self.assertIn('id="wizard-montage-count"', html)
         self.assertIn('id="wizard-montage-prompt"', html)
         self.assertIn("function selectGenerationMode", self.app_js)
+        self.assertIn("function normalizeMontageCount", self.app_js)
         self.assertIn("settings.generation_mode = pickedGenerationMode;", self.app_js)
         self.assertIn("settings.montage = pickedMontage;", self.app_js)
         self.assertIn("generation_mode: item.generationMode", self.app_js)
+        self.assertNotIn("still renders normal clips until the montage renderer lands", self.app_js)
+        self.assertIn('completion_state === \'montage_created\'', self.app_js)
         self.assertIn(".generation-mode-card.active", css)
         self.assertIn(".montage-template-card.active", css)
         self.assertIn('"generation_mode": "clips"', bridge)
-        self.assertIn('"montage_renderer_ready": False', bridge)
+        self.assertIn('"montage_renderer_ready": generation_mode == "montage"', bridge)
+        self.assertIn('if generation_mode == "montage":', bridge)
+        self.assertIn('"completion_state": "montage_created"', bridge)
+        self.assertIn("_render_montage_storyboard_payload(", bridge)
 
     def test_clip_duration_controls_are_shorts_bounded(self):
         html = (ROOT / "gui" / "index.html").read_text(encoding="utf-8")

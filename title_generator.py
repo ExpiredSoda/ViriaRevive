@@ -30,6 +30,7 @@ AI_MOMENT_CATEGORIES = (
     "tutorial_or_explainer",
     "commentary_or_review",
     "lore_or_story",
+    "cinematic_dialogue",
     "atmosphere_or_visual",
     "low_value",
 )
@@ -42,6 +43,8 @@ AI_FINE_LABELS = (
     "possible_failure",
     "tutorial_tip",
     "lore_story",
+    "cinematic_dialogue",
+    "npc_dialogue",
     "scenic_atmosphere",
     "creator_reaction",
     "game_narration",
@@ -88,6 +91,14 @@ MOMENT_SIGNAL_RULES = (
             "restart",
         ),
         "tags": ("lets play", "gameplay moment", "playthrough"),
+    },
+    {
+        "type": "cinematic/dialogue",
+        "phrases": (
+            "cutscene", "dialogue", "conversation", "objective updated",
+            "checkpoint reached", "mission", "chapter", "quest",
+        ),
+        "tags": ("cinematic gameplay", "story moment", "game dialogue"),
     },
 )
 
@@ -244,10 +255,9 @@ def generated_description_body(
     """Generated description without custom text or hashtag footer."""
     base_title = _clean_base_title(title)
     context_line = _description_context_line(title, game_title, clip_context)
-    parts = [base_title]
-    if context_line:
-        parts.append(context_line)
-    return "\n\n".join(part for part in parts if part)
+    if context_line and not _text_echoes_title(context_line, base_title):
+        return context_line
+    return base_title
 
 
 def generate_ai_description_body(
@@ -274,7 +284,7 @@ def generate_ai_description_body(
         return ""
     if not isinstance(parsed, dict):
         return ""
-    return _clean_generated_description(parsed.get("description"))
+    return _clean_generated_description(parsed.get("description"), title=title)
 
 
 def compose_description(
@@ -287,7 +297,11 @@ def compose_description(
 ) -> str:
     """Compose final upload text from generated description plus user text."""
     parts = []
-    generated = (generated_text or generated_description_body(title, game_title, clip_context)).strip()
+    if generated_text:
+        generated = _clean_generated_description(generated_text, title=title)
+    else:
+        generated = generated_description_body(title, game_title, clip_context)
+    generated = generated.strip()
     custom = (custom_text or "").strip()
     if generated:
         parts.append(generated)
@@ -308,6 +322,38 @@ def generate_tags(
     game = (game_title or "").strip()
     transcript_text = (transcript or "").lower()
     context = summarize_clip_context(transcript, game_title, clip_context)
+    game_knowledge = context.get("game_knowledge") if isinstance(context.get("game_knowledge"), dict) else {}
+    knowledge_text = " ".join(
+        str(value or "")
+        for key in ("label", "description", "genres", "series", "fictional_universes")
+        for value in (
+            game_knowledge.get(key)
+            if isinstance(game_knowledge.get(key), list)
+            else [game_knowledge.get(key)]
+        )
+        if value
+    ).lower()
+    primary_category = str(context.get("ai_primary_category") or context.get("primary_category") or "").strip()
+    fine_labels = {
+        str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
+        for label in (context.get("ai_fine_labels") or [])
+    }
+    moment_type = str(context.get("moment_type") or "")
+    speech_source = context.get("speech_source") if isinstance(context.get("speech_source"), dict) else {}
+    game_speech_like = (
+        "game_narration" in fine_labels
+        or "npc_dialogue" in fine_labels
+        or str(speech_source.get("primary_source") or "").lower() in {"game", "game_or_npc", "npc"}
+    )
+    is_cinematic_dialogue = (
+        primary_category == "cinematic_dialogue"
+        or moment_type == "cinematic/dialogue"
+        or game_speech_like
+    )
+    horror_context = any(
+        term in " ".join([game.lower(), knowledge_text, transcript_text])
+        for term in ("horror", "scary", "creepy", "survival horror", "jump scare", "jumpscare")
+    )
     tags = []
     if game:
         tags.extend([game, f"{game} gameplay", f"{game} shorts", f"{game} clips"])
@@ -335,29 +381,32 @@ def generate_tags(
         "youtube shorts",
         "viral shorts",
         "stream highlights",
-        "streamer moments",
-        "live stream clips",
-        "funny gaming moments",
-        "scary gaming moments",
-        "horror gaming",
-        "scary game",
-        "creepy game",
-        "survival horror",
-        "horror shorts",
-        "jump scare",
-        "chase scene",
-        "panic moment",
-        "gaming reaction",
         "lets play",
         "playthrough",
         "vertical gaming",
         "game clips",
     ])
+    if is_cinematic_dialogue:
+        tags.extend(["cinematic gameplay", "story moment", "game dialogue", "cutscene moment"])
+    else:
+        tags.extend(["streamer moments", "live stream clips", "gaming reaction", "funny gaming moments"])
+    if horror_context:
+        tags.extend([
+            "scary gaming moments",
+            "horror gaming",
+            "scary game",
+            "creepy game",
+            "survival horror",
+            "horror shorts",
+            "jump scare",
+            "chase scene",
+            "panic moment",
+        ])
     if any(word in transcript_text for word in ("run", "behind", "hide", "chase")):
         tags.extend(["chase gameplay", "running scared", "close call"])
-    if any(word in transcript_text for word in ("boss", "fight", "kill", "hit")):
+    if not is_cinematic_dialogue and any(word in transcript_text for word in ("boss", "fight", "kill", "hit")):
         tags.extend(["boss fight", "combat gameplay", "intense fight"])
-    if any(word in transcript_text for word in ("scary", "oh my god", "what", "please")):
+    if horror_context and any(word in transcript_text for word in ("scary", "oh my god", "what", "please")):
         tags.extend(["scary reaction", "panic reaction", "creepy moments"])
 
     unique = []
@@ -429,6 +478,21 @@ def summarize_clip_context(
         if isinstance(clip_context.get("multi_signal_ai_scoring"), dict)
         else {}
     )
+    speech_source = (
+        clip_context.get("speech_source")
+        if isinstance(clip_context.get("speech_source"), dict)
+        else {}
+    )
+    commentary_guard = (
+        clip_context.get("commentary_guard")
+        if isinstance(clip_context.get("commentary_guard"), dict)
+        else {}
+    )
+    commentary_summary = (
+        commentary_guard.get("summary")
+        if isinstance(commentary_guard.get("summary"), dict)
+        else {}
+    )
     game_knowledge = compact_game_context_for_prompt(clip_context.get("game_context"))
     text = transcript or clip_context.get("transcript") or ""
     normal = _normal_text(text)
@@ -447,6 +511,8 @@ def summarize_clip_context(
         "positive_feedback_count": int(raw_learning.get("positive_feedback_count") or 0),
         "negative_feedback_count": int(raw_learning.get("negative_feedback_count") or 0),
         "favorite_count": int(raw_learning.get("favorite_count") or 0),
+        "run_learning_signal_count": int(raw_learning.get("run_learning_signal_count") or 0),
+        "montage_learning_signal_count": int(raw_learning.get("montage_learning_signal_count") or 0),
         "positive_terms": [
             _prompt_safe_text(term, limit=48)
             for term in (raw_learning.get("positive_terms") or [])[:8]
@@ -457,7 +523,27 @@ def summarize_clip_context(
             for term in (raw_learning.get("negative_terms") or [])[:8]
             if str(term or "").strip()
         ],
-        "guidance": "",
+        "guidance": _prompt_safe_text(raw_learning.get("guidance"), limit=240),
+    }
+    raw_speech_policy = (
+        clip_context.get("speech_policy")
+        if isinstance(clip_context.get("speech_policy"), dict)
+        else {}
+    )
+    speech_policy = {
+        "subtitle_policy": _prompt_safe_text(raw_speech_policy.get("subtitle_policy"), limit=24),
+        "status": _prompt_safe_text(raw_speech_policy.get("status"), limit=48),
+        "warning": _prompt_safe_text(raw_speech_policy.get("warning"), limit=180),
+        "metadata_transcript_source": _prompt_safe_text(raw_speech_policy.get("metadata_transcript_source"), limit=48),
+        "selected_track_has_speech": bool(raw_speech_policy.get("selected_track_has_speech")),
+        "selected_track_word_count": _int_or_zero(raw_speech_policy.get("selected_track_word_count")),
+        "analysis_word_count": _int_or_zero(raw_speech_policy.get("analysis_word_count")),
+        "selected_stream": raw_speech_policy.get("selected_stream"),
+        "selected_title": _prompt_safe_text(raw_speech_policy.get("selected_title"), limit=80),
+        "selected_reason": _prompt_safe_text(raw_speech_policy.get("selected_reason"), limit=80),
+        "render_audio": _prompt_safe_text(raw_speech_policy.get("render_audio"), limit=80),
+        "mixed_speech_without_selected_track": bool(raw_speech_policy.get("mixed_speech_without_selected_track")),
+        "metadata_backfill_blocked": bool(raw_speech_policy.get("metadata_backfill_blocked")),
     }
     summary = {
         "schema_version": TITLE_CONTEXT_SCHEMA_VERSION,
@@ -465,6 +551,15 @@ def summarize_clip_context(
         "game_knowledge": game_knowledge,
         "creator_title_context": creator_context,
         "feedback_learning_context": learning_context,
+        "speech_policy": speech_policy,
+        "metadata_warning": _prompt_safe_text(
+            clip_context.get("metadata_warning") or speech_policy.get("warning"),
+            limit=180,
+        ),
+        "metadata_needs_context": bool(
+            clip_context.get("metadata_needs_context")
+            or speech_policy.get("metadata_backfill_blocked")
+        ),
         "moment_type": moment_type,
         "primary_category": clip_context.get("primary_category") or moment_categories.get("primary"),
         "ai_primary_category": ai_classification.get("primary_category"),
@@ -506,6 +601,14 @@ def summarize_clip_context(
             if isinstance(ai_classification.get("fine_labels"), list) else [],
             "confidence": _round_or_none(ai_classification.get("confidence")),
             "fallback_used": bool(ai_classification.get("fallback_used")),
+        },
+        "speech_source": {
+            "primary_source": speech_source.get("primary_source"),
+            "creator_probability": _round_or_none(speech_source.get("creator_probability")),
+            "game_or_npc_probability": _round_or_none(speech_source.get("game_or_npc_probability")),
+            "music_or_lyrics_probability": _round_or_none(speech_source.get("music_or_lyrics_probability")),
+            "creator_safe": bool(speech_source.get("creator_safe")),
+            "commentary_guard_label": commentary_summary.get("primary_label"),
         },
         "multimodal_analysis": {
             "status": multimodal.get("status"),
@@ -578,6 +681,9 @@ def _build_ollama_prompt(
         "- No quotes, no hashtags, no emojis\n"
         "- Make it specific to the game moment, enemy, objective, or reaction\n"
         "- Do not invent enemy names, locations, weapons, or mechanics not present in the transcript or analysis\n"
+        "- Treat the transcript as the selected creator-commentary transcript, not as proof of game/NPC dialogue\n"
+        "- If the speech policy says there is no selected creator speech, do not invent a creator reaction\n"
+        "- Do not claim something is a fan favorite, guide, tutorial, review, or secret unless the transcript or creator context supports it\n"
         "- Avoid generic titles like 'This Changes Everything' unless the transcript truly supports it\n"
         "- Use curiosity, danger, panic, funny failure, or a clear payoff\n"
         "- Good examples: 'Alan Wake Had Me Running For My Life', "
@@ -753,11 +859,26 @@ def _build_moment_classification_prompt(
         "variance": context.get("variance_score"),
         "scene": context.get("scene_score"),
     }
+    learning = context.get("feedback_learning_context") if isinstance(context.get("feedback_learning_context"), dict) else {}
+    classification_learning = {
+        key: learning.get(key)
+        for key in (
+            "enabled",
+            "positive_feedback_count",
+            "negative_feedback_count",
+            "favorite_count",
+            "run_learning_signal_count",
+            "montage_learning_signal_count",
+            "positive_terms",
+            "negative_terms",
+        )
+        if key in learning
+    }
     payload = {
         "game_title": context.get("game_title") or "",
         "game_knowledge": context.get("game_knowledge"),
         "heuristic_primary": context.get("primary_category") or categories.get("primary") or "general_gameplay",
-        "creator_learning": context.get("feedback_learning_context"),
+        "creator_learning": classification_learning,
         "heuristic_scores": {
             key: _round_or_none(category_scores.get(key))
             for key in AI_MOMENT_CATEGORIES
@@ -840,9 +961,10 @@ def _viral_dimensions_from_context(
     )
     value = _clamp01(
         0.35
-        + (0.22 if primary in {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "atmosphere_or_visual"} else 0.0)
+        + (0.22 if primary in {"high_energy", "death_or_failure", "tutorial_or_explainer", "lore_or_story", "cinematic_dialogue", "atmosphere_or_visual"} else 0.0)
         + (0.12 if primary == "tutorial_or_explainer" else 0.0)
         + (0.08 if primary == "lore_or_story" else 0.0)
+        + (0.06 if primary == "cinematic_dialogue" else 0.0)
         + 0.12 * _float_or_zero(scores.get(primary))
         - (0.25 if primary == "low_value" else 0.0)
     )
@@ -860,7 +982,7 @@ def _viral_dimensions_from_context(
         + 0.14 * _float_or_zero(visual.get("visual_energy"))
         + 0.16 * _float_or_zero(visual.get("possible_failure_score"))
         + 0.12 * _float_or_zero(visual.get("scenic_score"))
-        + (0.08 if primary in {"high_energy", "death_or_failure", "atmosphere_or_visual"} else 0.0)
+        + (0.08 if primary in {"high_energy", "death_or_failure", "cinematic_dialogue", "atmosphere_or_visual"} else 0.0)
     )
     game_knowledge = context.get("game_knowledge") if isinstance(context.get("game_knowledge"), dict) else {}
     if game_knowledge.get("available"):
@@ -883,7 +1005,7 @@ def _viral_dimensions_from_context(
             + 0.08 * richness
             + (
                 0.04 * richness
-                if primary in {"lore_or_story", "tutorial_or_explainer", "atmosphere_or_visual"}
+                if primary in {"lore_or_story", "cinematic_dialogue", "tutorial_or_explainer", "atmosphere_or_visual"}
                 else 0.0
             )
         )
@@ -994,6 +1116,8 @@ def _heuristic_moment_classification(
             primary = "high_energy"
         elif moment_type == "funny failure":
             primary = "death_or_failure"
+        elif moment_type == "cinematic/dialogue":
+            primary = "cinematic_dialogue"
         elif moment_type == "exploration/setup":
             primary = "low_value"
         else:
@@ -1008,6 +1132,11 @@ def _heuristic_moment_classification(
         fine_labels.append("tutorial_tip")
     elif primary == "lore_or_story":
         fine_labels.append("lore_story")
+    elif primary == "cinematic_dialogue":
+        fine_labels.append("cinematic_dialogue")
+        speech_source = context.get("speech_source") if isinstance(context.get("speech_source"), dict) else {}
+        if str(speech_source.get("primary_source") or "").lower() in {"game", "game_or_npc", "npc"}:
+            fine_labels.append("npc_dialogue")
     elif primary == "commentary_or_review":
         fine_labels.append("creator_reaction")
     fine_labels = _sanitize_fine_labels(fine_labels)
@@ -1057,6 +1186,10 @@ def _sanitize_ai_classification(response, fallback: dict, model: str) -> dict | 
         "commentary_review": "commentary_or_review",
         "lore_story": "lore_or_story",
         "atmosphere_scenic": "atmosphere_or_visual",
+        "cinematic": "cinematic_dialogue",
+        "cinematic_scene": "cinematic_dialogue",
+        "dialogue_scene": "cinematic_dialogue",
+        "npc_dialogue": "cinematic_dialogue",
         "death_failure": "death_or_failure",
         "funny_failure": "death_or_failure",
         "general_gameplay": fallback.get("primary_category", "low_value"),
@@ -1149,6 +1282,8 @@ def _classification_reason(primary: str, fine_labels: list[str], visual: dict) -
         return "Instructional or explanation-style language."
     if primary == "lore_or_story":
         return "Story, lore, or narrative-context language."
+    if primary == "cinematic_dialogue":
+        return "In-game dialogue or cinematic story context carries the moment."
     if primary == "atmosphere_or_visual":
         return "Atmospheric or scenic visual/context cues."
     if primary == "commentary_or_review":
@@ -1204,6 +1339,12 @@ def _heuristic_title(
             f"This {game} Moment Went Sideways",
             f"{game} Went Completely Wrong",
             f"This Was A Bad Idea In {game}",
+        ])
+    if moment_type == "cinematic/dialogue":
+        return random.choice([
+            f"{game} Drops A Story Moment",
+            f"This {game} Scene Got Interesting",
+            f"{game} Paused For A Story Beat",
         ])
 
     words = transcript.lower().split()
@@ -1426,6 +1567,24 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         lines.append(f"- Scene detection status: {context['scene_detection_status']}")
     if context.get("creator_title_context"):
         lines.append(f"- Creator-provided context: {context['creator_title_context']}")
+    speech_policy = context.get("speech_policy") if isinstance(context.get("speech_policy"), dict) else {}
+    if speech_policy:
+        speech_parts = []
+        if speech_policy.get("subtitle_policy"):
+            speech_parts.append(f"subtitle_policy={speech_policy.get('subtitle_policy')}")
+        if speech_policy.get("metadata_transcript_source"):
+            speech_parts.append(f"metadata_transcript_source={speech_policy.get('metadata_transcript_source')}")
+        speech_parts.append(f"selected_track_has_speech={bool(speech_policy.get('selected_track_has_speech'))}")
+        speech_parts.append(f"selected_track_words={speech_policy.get('selected_track_word_count', 0)}")
+        if speech_policy.get("analysis_word_count"):
+            speech_parts.append(f"analysis_words={speech_policy.get('analysis_word_count')}")
+        if speech_policy.get("selected_title"):
+            speech_parts.append(f"selected_track={speech_policy.get('selected_title')}")
+        if speech_policy.get("warning"):
+            speech_parts.append(f"warning={speech_policy.get('warning')}")
+        lines.append(f"- Speech policy: {'; '.join(speech_parts)}")
+    if context.get("metadata_warning"):
+        lines.append(f"- Metadata warning: {context.get('metadata_warning')}")
     learning = context.get("feedback_learning_context") if isinstance(context.get("feedback_learning_context"), dict) else {}
     if learning.get("enabled"):
         parts = []
@@ -1436,9 +1595,13 @@ def _analysis_prompt_lines(context: dict) -> list[str]:
         counts = (
             f"positive={learning.get('positive_feedback_count', 0)}, "
             f"negative={learning.get('negative_feedback_count', 0)}, "
-            f"favorites={learning.get('favorite_count', 0)}"
+            f"favorites={learning.get('favorite_count', 0)}, "
+            f"run_memory={learning.get('run_learning_signal_count', 0)}, "
+            f"montage_memory={learning.get('montage_learning_signal_count', 0)}"
         )
         parts.append(counts)
+        if learning.get("guidance"):
+            parts.append(f"guidance={learning.get('guidance')}")
         lines.append(f"- Creator feedback learning: {'; '.join(parts)}")
     ranker_parts = []
     for key in ("hook_points", "weak_points", "aftermath_points", "first_word_start"):
@@ -1530,6 +1693,8 @@ def _build_description_prompt(
         f"{game_line}\n"
         f"Title: {_prompt_safe_text(_clean_base_title(title), limit=120)}\n\n"
         "Use the transcript, detector/ranker summary, game knowledge, creator feedback hints, and vision summary if present.\n"
+        "Treat the transcript as the selected creator-commentary transcript. Do not describe game/NPC dialogue as creator commentary.\n"
+        "If speech policy says no selected creator speech, write only from verified game/visual/context facts and keep it neutral.\n"
         "Do not mention AI, analysis, detector, ranker, scores, metadata, captions, subtitles, or that the clip was selected.\n"
         "Do not include hashtags, links, calls to action, channel branding, or the custom footer.\n"
         "Do not quote the prompt or explain your reasoning.\n"
@@ -1541,12 +1706,25 @@ def _build_description_prompt(
     )
 
 
-def _clean_generated_description(value) -> str:
+def _clean_generated_description(value, *, title: str | None = None) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" \"'\n\t")
     text = re.sub(r"^(description|caption)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"#\w+", "", text).strip()
     if not text:
         return ""
+    base_title = _clean_base_title(title or "")
+    if base_title and _text_echoes_title(text, base_title):
+        title_pattern = re.escape(base_title)
+        remainder = re.sub(
+            rf"^{title_pattern}\s*[\-:–—.]?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        if remainder and not _text_echoes_title(remainder, base_title):
+            text = remainder
+        else:
+            return ""
     lower = text.lower()
     blocked = (
         "detector",
@@ -1564,6 +1742,9 @@ def _clean_generated_description(value) -> str:
         "action, panic, or reaction cues",
         "grounded by",
         "this moment is",
+        "speech policy",
+        "selected creator speech",
+        "selected creator-commentary",
         "return only",
         "valid json",
         "youtube shorts description",
@@ -1584,6 +1765,21 @@ def _clean_generated_description(value) -> str:
                     break
                 text = candidate
     return text.strip()
+
+
+def _text_echoes_title(text: str | None, title: str | None) -> bool:
+    clean_text = _normal_text(_clean_base_title(str(text or "")))
+    clean_title = _normal_text(_clean_base_title(str(title or "")))
+    if not clean_text or not clean_title or clean_title == "gaming moment":
+        return False
+    if clean_text == clean_title or clean_text.startswith(clean_title + " "):
+        return True
+    text_words = set(clean_text.split())
+    title_words = [word for word in clean_title.split() if len(word) > 2]
+    if len(title_words) < 4:
+        return False
+    overlap = sum(1 for word in title_words if word in text_words)
+    return overlap / max(1, len(title_words)) >= 0.88 and len(clean_text.split()) <= len(title_words) + 4
 
 
 def _description_context_line(
@@ -1615,7 +1811,9 @@ def _context_sentence(context: dict, game_title: str | None) -> str:
         return f"{game} gets tense here: {summary[:180].rstrip('.') }."
     if moment_type == "chase/panic":
         if hook:
-            return f"The panic ramps up around \"{hook}\" as {game} closes in."
+            if len(hook.split()) >= 2:
+                return f"{game} turns into a close-call chase once \"{hook}\" hits."
+            return f"{game} turns tense fast as the escape starts going wrong."
         return f"{game} turns tense fast as the chase pressure takes over."
     if moment_type == "combat/fight":
         return f"{game} drops straight into a fight with the pressure turned up."
@@ -1633,6 +1831,8 @@ def _context_sentence(context: dict, game_title: str | None) -> str:
         return f"{game} gets a little creator commentary here, with the reaction doing the heavy lifting."
     if moment_type == "lore/story":
         return f"{game}'s story takes a strange turn here, right in the middle of the darkness."
+    if moment_type == "cinematic/dialogue":
+        return f"{game} pauses on an in-game dialogue beat, with the story carrying the moment."
     if moment_type == "atmosphere/visual":
         return f"{game} leans into the mood here, letting the atmosphere do the work."
     return ""
@@ -1689,6 +1889,7 @@ def _moment_type_from_category(category: str) -> str:
         "tutorial_or_explainer": "tutorial/explainer",
         "commentary_or_review": "commentary/review",
         "lore_or_story": "lore/story",
+        "cinematic_dialogue": "cinematic/dialogue",
         "atmosphere_or_visual": "atmosphere/visual",
         "low_value": "exploration/setup",
     }.get(str(category or "").strip(), "general gameplay")
@@ -1720,6 +1921,13 @@ def _round_or_none(value):
         return round(float(value), 4)
     except (TypeError, ValueError):
         return None
+
+
+def _int_or_zero(value) -> int:
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _float_or_zero(value) -> float:

@@ -27,6 +27,7 @@ from candidate_ranker import (  # noqa: E402
     apply_moment_category_scoring,
     apply_multi_signal_ai_scoring,
     apply_voice_profile_scoring,
+    build_learning_prompt_context,
     build_learning_status,
     build_ai_moment_ranking_report,
     build_moment_category_ranking_report,
@@ -178,8 +179,28 @@ class FeedbackReconciliationTests(unittest.TestCase):
         )
 
         self.assertNotEqual(categories["primary"], "high_energy")
+        self.assertEqual(categories["primary"], "cinematic_dialogue")
         self.assertEqual(categories["signals"]["speech_source"], "game_narration")
         self.assertGreater(categories["signals"]["game_speech"], categories["signals"]["creator_speech"])
+        self.assertGreater(categories["scores"]["cinematic_dialogue"], categories["scores"]["high_energy"])
+
+    def test_category_scoring_uses_visual_dialogue_scene_for_cinematic_label(self):
+        categories = score_moment_categories(
+            "I need you to listen carefully before the next chapter begins.",
+            {
+                "detector_scores": {"audio": 0.62, "variance": 0.44, "scene": 0.28},
+                "visual_diagnostics": {
+                    "primary_visual_label": "lore_or_story",
+                    "labels": ["dialogue_scene"],
+                },
+            },
+            word_count=12,
+            duration=20,
+        )
+
+        self.assertEqual(categories["primary"], "cinematic_dialogue")
+        self.assertIn("visual_dialogue_scene", categories["signals"])
+        self.assertGreaterEqual(categories["signals"]["visual_dialogue_scene"], 0.7)
 
     def test_category_scoring_keeps_lore_over_actionish_narration(self):
         categories = score_moment_categories(
@@ -712,6 +733,51 @@ class FeedbackReconciliationTests(unittest.TestCase):
 
         self.assertEqual(selected, [])
 
+    def test_near_quality_fallback_does_not_promote_missing_creator_transcript(self):
+        missing_creator = {
+            "accepted": False,
+            "reject_reason": "low_transcript_quality",
+            "quality_score": 0.57,
+            "learned_quality_score": 0.57,
+            "quality_floor": 0.60,
+            "candidate": {"candidate_rank": 1, "candidate_kind": "primary"},
+            "moment": {
+                "start": 0,
+                "end": 35,
+                "duration": 35,
+                "transcript": "",
+                "metadata_needs_context": True,
+                "speech_policy": {
+                    "status": "no_selected_commentary_speech",
+                    "metadata_backfill_blocked": True,
+                    "selected_track_has_speech": False,
+                    "selected_track_word_count": 0,
+                    "track_aware": True,
+                },
+                "ranker": {"reject_reason": "low_transcript_quality"},
+            },
+            "word_count": 16,
+            "subtitle_word_count": 16,
+            "music_lyrics_guard": {"reject_candidate": False},
+            "speech_source": {
+                "primary_source": "creator",
+                "creator_safe": True,
+                "game_or_npc_probability": 0.02,
+                "music_or_lyrics_probability": 0.01,
+            },
+            "commentary_guard": {"summary": {"primary_label": "creator_commentary"}},
+        }
+
+        selected = select_near_quality_fallback_candidates(
+            [missing_creator],
+            3,
+            min_gap=8,
+            score_key="learned_quality_score",
+            subtitle_policy="creator",
+        )
+
+        self.assertEqual(selected, [])
+
     def test_partial_near_quality_fallback_fills_deep_auto_shortfall(self):
         existing = _evaluation(1, 0.58, "oh my god this is a strong creator moment", start=0)
 
@@ -806,6 +872,43 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertGreater(quiet_eval["laid_back_commentary_boost"], 0)
         self.assertGreater(quiet_eval["quality_score"], plain_eval["quality_score"])
         self.assertIn("laid_back_commentary", quiet_eval["moment"]["ranker"])
+
+    def test_rich_context_commentary_gets_capped_quality_boost(self):
+        rich_words = _words_from_tokens(
+            "I love how this is chaos because of course the game ran me over and that was hilarious".split(),
+            start=0.1,
+        )
+        plain_words = _words_from_tokens(
+            "walking around through this hallway with nothing much happening right now".split(),
+            start=0.1,
+        )
+
+        rich_eval = evaluate_candidate(
+            _ranker_candidate(),
+            rich_words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=90,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            detection_preference="auto",
+        )
+        plain_eval = evaluate_candidate(
+            _ranker_candidate(),
+            plain_words,
+            extraction_start=0,
+            extraction_end=35,
+            video_duration=90,
+            target_duration=30,
+            selected_stream=1,
+            quality_floor=0.0,
+            detection_preference="auto",
+        )
+
+        self.assertGreater(rich_eval["rich_context_boost"], 0)
+        self.assertGreater(rich_eval["quality_score"], plain_eval["quality_score"])
+        self.assertIn("rich_context", rich_eval["moment"]["ranker"])
 
     def test_commentary_guard_shadow_classifies_creator_and_game_segments(self):
         creator = classify_commentary_guard([
@@ -1614,6 +1717,156 @@ class FeedbackReconciliationTests(unittest.TestCase):
         self.assertLess(shadow["learned_adjustment"], 0.0)
         self.assertLess(evaluation["learned_quality_score"], 0.5)
         self.assertGreater(shadow["signals"]["negative_points"], 0)
+
+    def test_pairwise_terms_nudge_close_calls_with_same_source_feedback(self):
+        evaluation = _evaluation(1, 0.5, "quiet tutorial explanation puzzle route")
+        personalization = {
+            "schema_version": 1,
+            "events": [],
+            "clips": {
+                "clip_positive": {
+                    "clip_id": "clip_positive",
+                    "source_id": "src_same",
+                    "latest": {"like": True, "dislike": False, "favorite": False, "reason": ""},
+                    "clip_snapshot": {},
+                    "learning_terms": ["quiet tutorial", "puzzle route"],
+                },
+                "clip_negative": {
+                    "clip_id": "clip_negative",
+                    "source_id": "src_same",
+                    "latest": {"like": False, "dislike": True, "favorite": False, "reason": ""},
+                    "clip_snapshot": {},
+                    "learning_terms": ["npc dialogue", "cutscene chatter"],
+                },
+            },
+        }
+
+        apply_learned_scoring([evaluation], personalization)
+
+        shadow = evaluation["shadow_scoring"]
+        self.assertGreater(shadow["signals"]["pairwise_adjustment"], 0.0)
+        self.assertGreater(shadow["signals"]["pairwise_positive_points"], 0.0)
+        self.assertEqual(shadow["signals"]["pairwise_negative_points"], 0.0)
+        self.assertLessEqual(abs(shadow["learned_adjustment"]), LEARNED_SELECTION_MAX_ADJUSTMENT)
+        report = build_shadow_scoring_report([evaluation], [evaluation], personalization, max_count=1, min_gap=8)
+        self.assertEqual(report["profile"]["pairwise_source_count"], 1)
+        self.assertGreater(len(report["profile"]["pairwise_positive_terms"]), 0)
+
+    def test_pairwise_terms_require_positive_and_negative_source_examples(self):
+        evaluation = _evaluation(1, 0.5, "quiet tutorial explanation puzzle route")
+        personalization = {
+            "schema_version": 1,
+            "events": [],
+            "clips": {
+                "clip_positive": {
+                    "clip_id": "clip_positive",
+                    "source_id": "src_same",
+                    "latest": {"like": True, "dislike": False, "favorite": False, "reason": ""},
+                    "clip_snapshot": {},
+                    "learning_terms": ["quiet tutorial", "puzzle route"],
+                },
+            },
+        }
+
+        apply_learned_scoring([evaluation], personalization)
+
+        shadow = evaluation["shadow_scoring"]
+        self.assertEqual(shadow["signals"]["pairwise_adjustment"], 0.0)
+        self.assertEqual(shadow["signals"]["pairwise_positive_points"], 0)
+
+    def test_run_learning_outcomes_feed_learning_when_personalization_missing(self):
+        evaluation = _evaluation(1, 0.5, "quiet tutorial puzzle route")
+        run_learning = {
+            "schema_version": 1,
+            "events": [],
+            "clip_outcomes": {
+                "clip_positive": {
+                    "clip_id": "clip_positive",
+                    "source_id": "src_same",
+                    "like": True,
+                    "learning_terms": ["quiet tutorial", "puzzle route"],
+                },
+                "clip_negative": {
+                    "clip_id": "clip_negative",
+                    "source_id": "src_same",
+                    "dislike": True,
+                    "learning_terms": ["npc dialogue"],
+                },
+            },
+        }
+
+        apply_learned_scoring(
+            [evaluation],
+            {"schema_version": 1, "events": [], "clips": {}},
+            run_learning=run_learning,
+        )
+
+        shadow = evaluation["shadow_scoring"]
+        self.assertTrue(shadow["learned_selection_enabled"])
+        self.assertGreater(shadow["learned_adjustment"], 0.0)
+        report = build_shadow_scoring_report(
+            [evaluation],
+            [evaluation],
+            {"schema_version": 1, "events": [], "clips": {}},
+            run_learning=run_learning,
+            max_count=1,
+            min_gap=8,
+        )
+        self.assertEqual(report["profile"]["run_learning_signal_count"], 2)
+        self.assertEqual(report["profile"]["pairwise_source_count"], 1)
+
+    def test_montage_outcomes_feed_learning_and_prompt_context(self):
+        evaluation = _evaluation(1, 0.5, "panic chase hook")
+        run_learning = {
+            "schema_version": 1,
+            "events": [],
+            "clip_outcomes": {},
+            "montage_outcomes": {
+                "montage_1": {
+                    "storyboard_id": "montage_1",
+                    "source_id": "src_same",
+                    "like": True,
+                    "learning_terms": ["panic chase", "strong hook"],
+                    "beat_outcomes": {
+                        "beat_1": {
+                            "beat_id": "beat_1",
+                            "clip_id": "clip_beat_1",
+                            "source_id": "src_same",
+                            "role": "hook",
+                            "category": "high_energy",
+                            "like": True,
+                            "learning_terms": ["panic chase"],
+                        },
+                        "beat_2": {
+                            "beat_id": "beat_2",
+                            "clip_id": "clip_beat_2",
+                            "source_id": "src_same",
+                            "role": "payoff",
+                            "category": "cinematic_dialogue",
+                            "dislike": True,
+                            "learning_terms": ["npc dialogue"],
+                        },
+                    },
+                }
+            },
+        }
+
+        apply_learned_scoring(
+            [evaluation],
+            {"schema_version": 1, "events": [], "clips": {}},
+            run_learning=run_learning,
+        )
+
+        shadow = evaluation["shadow_scoring"]
+        prompt_context = build_learning_prompt_context(
+            {"schema_version": 1, "events": [], "clips": {}},
+            run_learning=run_learning,
+        )
+        self.assertTrue(shadow["learned_selection_enabled"])
+        self.assertGreater(shadow["learned_adjustment"], 0.0)
+        self.assertEqual(prompt_context["montage_learning_signal_count"], 3)
+        self.assertIn("panic chase", prompt_context["positive_terms"])
+        self.assertIn("npc dialogue", prompt_context["negative_terms"])
 
     def test_feedback_learning_can_match_ai_and_vision_terms(self):
         evaluation = _evaluation(1, 0.5, "")

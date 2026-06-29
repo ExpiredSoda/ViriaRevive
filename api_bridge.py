@@ -27,7 +27,6 @@ from urllib.parse import quote, urlparse
 import yt_dlp
 
 from config import (
-    BASE_DIR,
     APP_DATA_DIR,
     BIN_DIR,
     CLIPS_DIR,
@@ -37,12 +36,15 @@ from config import (
     DOWNLOADS_DIR,
     FFMPEG_PRESET,
     MIN_GAP,
+    MONTAGES_DIR,
     MUSIC_DIR,
     NUM_CLIPS,
     PERSONALIZATION_FILE,
     PERSONALIZATION_SCHEMA_VERSION,
     PROCESSING_HISTORY_FILE,
     PROCESSING_HISTORY_SCHEMA_VERSION,
+    RUN_LEARNING_FILE,
+    RUN_LEARNING_SCHEMA_VERSION,
     STATE_FILE,
     STATE_SCHEMA_VERSION,
     SUBTITLE_PLACEMENT,
@@ -61,8 +63,15 @@ MAX_MIN_GAP_SECONDS = 60
 CANDIDATE_TRANSCRIPT_PROBE_MAX_SECONDS = 90
 CANDIDATE_TRANSCRIPT_CHUNK_MAX_SECONDS = 180
 CANDIDATE_TRANSCRIPT_CHUNK_MAX_FILES = 8
+ETA_PROGRESS_STAGES = ("download", "detect", "candidates", "clips")
+ETA_STAGE_TIMING_KEYS = {
+    "download": ("download", "game_context"),
+    "detect": ("detect", "visual_analysis"),
+    "candidates": ("candidate_analysis", "multimodal_analysis"),
+    "clips": ("final_render", "auto_metadata"),
+}
 from detector import find_viral_moments, get_last_scene_detection_diagnostics
-from transcriber import transcribe_clip, transcribe_clips, find_sentence_boundary
+from transcriber import transcribe_clip, transcribe_clips
 from subtitler import (
     generate_subtitles,
     get_available_styles,
@@ -71,10 +80,10 @@ from subtitler import (
     subtitles_are_enabled,
 )
 from clipper import (
-    extract_clip, extract_audio_clip, ClipResult,
+    extract_clip, extract_audio_clip,
     add_background_music, apply_video_effect, get_effects_list,
 )
-from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions
+from cropper import get_crop_params_dynamic, get_dimensions
 from audio_streams import (
     get_audio_streams,
     get_last_audio_stream_diagnostics,
@@ -123,7 +132,6 @@ from speech_stream_selector import (
 from downloader import resolve_downloaded_path
 from title_generator import (
     DEFAULT_MODEL,
-    DEFAULT_VIDEO_CATEGORY_ID,
     classify_moment_ai,
     compose_description,
     generate_ai_description_body,
@@ -131,6 +139,7 @@ from title_generator import (
     generate_title,
     generate_tags,
     generate_titles_batch,
+    format_short_title,
     list_ollama_models,
     ensure_model,
     is_ollama_model_ready,
@@ -148,6 +157,25 @@ from uploader import (
     add_account,
     list_accounts,
 )
+from run_learning import (
+    append_event as append_run_learning_event,
+    append_run_summary,
+    build_clip_deleted_event,
+    build_feedback_event,
+    build_metadata_event,
+    build_montage_feedback_event,
+    compact_clip_snapshot,
+    empty_run_learning,
+    redacted_summary as run_learning_redacted_summary,
+    sanitize_run_learning,
+)
+from montage_storyboard import (
+    build_candidate_audit,
+    build_storyboard_from_audit,
+    write_candidate_audit,
+    write_storyboard,
+)
+from montage_renderer import render_draft_montage
 from version import APP_DESCRIPTION, APP_NAME, APP_VERSION, APP_VERSION_DISPLAY
 from voice_profile import (
     MIN_VOICE_PROFILE_SAMPLES,
@@ -171,6 +199,7 @@ from multimodal_analysis import (
     apply_multimodal_scoring,
     build_multimodal_ranking_report,
     ollama_vision_status,
+    preflight_ollama_vision_model,
 )
 from game_context import get_game_context, compact_game_context_for_prompt, normalize_game_title
 from game_identity import resolve_game_identity
@@ -320,13 +349,36 @@ def _normalize_montage_duration(value) -> int:
     return seconds if seconds in {30, 45, 60, 90} else 60
 
 
+def _normalize_montage_count(value) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, min(5, count))
+
+
 def _normalize_montage_settings(value) -> dict:
     raw = value if isinstance(value, dict) else {}
     return {
         "template": _normalize_montage_template(raw.get("template")),
         "target_duration": _normalize_montage_duration(raw.get("target_duration")),
+        "count": _normalize_montage_count(raw.get("count")),
         "prompt": _sanitize_montage_prompt(raw.get("prompt")),
     }
+
+
+def _montage_story_shape_for_template(template: str) -> str:
+    template = _normalize_montage_template(template)
+    return {
+        "tutorial": "tutorial_story",
+        "story": "story_reveal",
+        "atmosphere": "atmosphere_build",
+        "failure": "failure_recovery_payoff",
+        "combat": "combat_escalation",
+        "funny": "setup_escalate_punchline",
+        "panic": "hook_escalate_payoff",
+        "custom": "hook_escalate_payoff",
+    }.get(template, "hook_escalate_payoff")
 
 
 def _category_snapshot_from_selection(item: dict, moment: dict) -> tuple[str | None, dict | None]:
@@ -815,7 +867,14 @@ def _selected_audio_stream_profile(
             )
         except (TypeError, ValueError):
             selected_confidence = 0.0
-        creator_selected = "creator" in selected_reason.lower() and selected_confidence >= 0.55
+        selection_status = str(selection.get("status") or audio_source_debug.get("status") or "").lower()
+        selection_mode = str(selection.get("mode") or audio_source_debug.get("mode") or "").lower()
+        creator_selected = (
+            "creator" in selected_reason.lower()
+            and selected_confidence >= 0.55
+            and selection_status not in {"forced", "manual", "manual_stream"}
+            and selection_mode != "manual_stream"
+        )
         return {
             "ordinal": selected_ordinal,
             "title": title,
@@ -857,7 +916,8 @@ def _selected_audio_stream_profile(
                 "words": 0,
                 "voice_title_hints": voice_hints,
                 "game_title_hints": game_hints,
-                "creator_likeness_score": 0.66 if likely_role == "commentary" or voice_hints else 0.0,
+                "metadata_hint_only": True,
+                "creator_likeness_score": 0.18 if likely_role == "commentary" or voice_hints else 0.0,
                 "natural_dialogue_score": 0.0,
                 "scripted_game_score": 0.0,
                 "acoustic_game_bed_score": 0.0,
@@ -902,6 +962,125 @@ def _audio_stream_selection_summary(
     return {key: value for key, value in summary.items() if value is not None}
 
 
+def _clip_speech_policy_summary(moment: dict | None) -> dict:
+    """Summarize which speech source is safe for subtitles and metadata."""
+    moment = moment if isinstance(moment, dict) else {}
+    audio = moment.get("audio_source") if isinstance(moment.get("audio_source"), dict) else {}
+    selection = moment.get("stream_selection") if isinstance(moment.get("stream_selection"), dict) else {}
+    if not selection and isinstance(audio.get("stream_selection"), dict):
+        selection = audio.get("stream_selection")
+
+    policy = normalize_commentary_subtitle_policy(
+        audio.get("subtitle_policy")
+        or moment.get("subtitle_policy")
+        or "creator"
+    )
+    selected_words = _safe_int_value(
+        moment.get("subtitle_word_count")
+        if moment.get("subtitle_word_count") is not None
+        else moment.get("word_count"),
+        0,
+    )
+    final_words = _safe_int_value(moment.get("word_count"), 0)
+    analysis_words = _safe_int_value(moment.get("analysis_word_count"), 0)
+    transcript = str(moment.get("transcript") or "").strip()
+    has_selected_track_speech = bool(selected_words > 0 or final_words > 0 or transcript)
+
+    stream_count = _safe_int_value(audio.get("stream_count"), 0)
+    selected_stream = audio.get("selected_stream")
+    if selected_stream is None:
+        selected_stream = selection.get("selected_stream")
+    if selected_stream is None:
+        selected_stream = moment.get("speech_stream")
+    track_aware = bool(audio or selection or stream_count > 1 or selected_stream is not None)
+
+    selected_confidence = _safe_float_value(
+        audio.get("selected_confidence")
+        if audio.get("selected_confidence") is not None
+        else selection.get("confidence"),
+        None,
+    )
+    selected_title = (
+        str(audio.get("selected_title") or "").strip()
+        or str(selection.get("selected_title") or "").strip()
+    )
+    selected_reason = (
+        str(audio.get("selected_reason") or "").strip()
+        or str(selection.get("selected_reason") or "").strip()
+    )
+    selected_status = str(selection.get("status") or audio.get("status") or "").strip()
+    render_audio = str(audio.get("render_audio") or "").strip()
+    if not render_audio:
+        render_audio = "mixed_all_streams" if stream_count > 1 else "source_audio"
+
+    mixed_speech_without_selected = bool(
+        policy == "creator"
+        and track_aware
+        and not has_selected_track_speech
+        and analysis_words > max(selected_words, final_words, 0)
+    )
+    no_creator_speech = bool(
+        policy == "creator"
+        and track_aware
+        and not has_selected_track_speech
+    )
+    status = "ok"
+    warning = ""
+    if no_creator_speech:
+        status = "no_selected_commentary_speech"
+        warning = "No commentary transcript was found on the selected track."
+    if mixed_speech_without_selected:
+        warning = "Selected commentary track had no speech, but another analysis path saw speech."
+
+    metadata_backfill_blocked = bool(no_creator_speech)
+    metadata_transcript_source = "selected_commentary_track"
+    if policy == "all":
+        metadata_transcript_source = "all_speech_policy"
+    elif policy == "game":
+        metadata_transcript_source = "game_audio_policy"
+    elif no_creator_speech:
+        metadata_transcript_source = "none_selected_track"
+
+    return {
+        "schema_version": 1,
+        "subtitle_policy": policy,
+        "status": status,
+        "warning": warning,
+        "metadata_transcript_source": metadata_transcript_source,
+        "metadata_backfill_blocked": metadata_backfill_blocked,
+        "selected_track_has_speech": has_selected_track_speech,
+        "selected_track_word_count": max(selected_words, final_words),
+        "analysis_word_count": analysis_words,
+        "selected_stream": selected_stream,
+        "selected_title": selected_title,
+        "selected_reason": selected_reason,
+        "selected_status": selected_status,
+        "selected_confidence": selected_confidence,
+        "stream_count": stream_count,
+        "render_audio": render_audio,
+        "mixed_speech_without_selected_track": mixed_speech_without_selected,
+        "track_aware": track_aware,
+    }
+
+
+def _creator_caption_speech_missing(moment: dict | None, *, subtitle_enabled: bool, subtitle_policy: str | None) -> bool:
+    """Return true when a creator-caption render has no selected creator speech."""
+    if not subtitle_enabled:
+        return False
+    if normalize_commentary_subtitle_policy(subtitle_policy) != "creator":
+        return False
+    policy = _clip_speech_policy_summary(moment)
+    return bool(
+        policy.get("metadata_backfill_blocked")
+        or policy.get("status") == "no_selected_commentary_speech"
+        or (
+            policy.get("track_aware")
+            and not policy.get("selected_track_has_speech")
+            and int(policy.get("selected_track_word_count") or 0) <= 0
+        )
+    )
+
+
 def _subtitle_words_for_render_start(words: list[dict], trim_start: float, render_start: float) -> list[dict]:
     """Move trim-relative subtitle words onto the actual rendered clip timeline."""
     try:
@@ -929,9 +1108,6 @@ def _subtitle_words_for_render_start(words: list[dict], trim_start: float, rende
 # ── Log interceptor — captures print() and forwards to the GUI console ───────
 
 import sys as _sys
-import io as _io
-
-
 class _LogTee:
     """Wraps stdout/stderr: writes to both the original stream and a callback."""
 
@@ -1081,6 +1257,7 @@ class ApiBridge:
         self._moments: list[dict] = []
         self._scheduled: list[dict] = []
         self._upload_history: list[dict] = []
+        self._video_root = CLIPS_DIR.resolve()
         self._video_port = _start_video_server(CLIPS_DIR)
         self._music_port = _start_video_server(MUSIC_DIR)
         self._scheduler_running = False
@@ -1097,6 +1274,8 @@ class ApiBridge:
         self._voice_profile: dict = empty_voice_profile()
         self._processing_history_lock = threading.RLock()
         self._processing_history: dict = self._empty_processing_history()
+        self._run_learning_lock = threading.RLock()
+        self._run_learning: dict = empty_run_learning()
 
         # Install log interceptor so print() output goes to the GUI console
         global _log_bridge
@@ -1108,9 +1287,56 @@ class ApiBridge:
         self._load_personalization()
         self._load_voice_profile()
         self._load_processing_history()
+        self._load_run_learning()
+        self._sync_video_server_root()
         self._cleanup_voice_profile_temp_wavs()
 
     # ── Exposed: config / deps ───────────────────────────────────────────
+
+    def _clips_dir(self) -> Path:
+        """Return the active generated-video folder, falling back to LocalAppData."""
+        raw = ""
+        try:
+            raw = str((self._user_settings or {}).get("output_dir") or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+            return CLIPS_DIR
+        try:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                return CLIPS_DIR
+            path.mkdir(parents=True, exist_ok=True)
+            resolved = path.resolve()
+            if not resolved.exists() or not resolved.is_dir():
+                return CLIPS_DIR
+            return resolved
+        except Exception as exc:
+            print(f"[settings] Custom output folder unavailable; using default clips folder: {exc}")
+            CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+            return CLIPS_DIR
+
+    def _sync_video_server_root(self):
+        """Ensure the local preview server serves the active clips folder."""
+        try:
+            root = self._clips_dir().resolve()
+        except Exception:
+            root = CLIPS_DIR.resolve()
+        if getattr(self, "_video_root", None) == root:
+            return
+        self._video_root = root
+        self._video_port = _start_video_server(root)
+        print(f"[settings] Video output folder active: {root}")
+
+    def _clip_url_for_path(self, path: Path) -> str | None:
+        try:
+            root = self._clips_dir().resolve()
+            rel = path.resolve().relative_to(root).as_posix()
+            self._sync_video_server_root()
+            return f"http://127.0.0.1:{self._video_port}/{quote(rel)}"
+        except Exception:
+            return None
 
     def _cleanup_voice_profile_temp_wavs(self):
         """Remove stale voice-profile temp WAVs left by an interrupted enrollment."""
@@ -1153,6 +1379,7 @@ class ApiBridge:
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
             "crop_vertical": CROP_VERTICAL,
+            "output_dir": "",
             "description_profile": {
                 "auto_hashtags": True,
                 "custom_text": "",
@@ -1171,10 +1398,15 @@ class ApiBridge:
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
             defaults.update(self._user_settings)
+        # Game is a per-run/source hint, not a global preference. Older builds
+        # persisted it in user settings, so hide stale values from the wizard.
+        defaults["game_title_hint"] = ""
         defaults["generation_mode"] = _normalize_generation_mode(defaults.get("generation_mode"))
         defaults["montage"] = _normalize_montage_settings(defaults.get("montage"))
         defaults["clip_duration"] = _normalize_clip_duration(defaults.get("clip_duration"))
         defaults["min_gap"] = _normalize_min_gap(defaults.get("min_gap"))
+        if defaults.get("output_dir"):
+            defaults["output_dir"] = str(defaults.get("output_dir") or "")
         return defaults
 
     def get_app_metadata(self):
@@ -1192,7 +1424,8 @@ class ApiBridge:
             "app_data_dir": str(APP_DATA_DIR),
             "client_secrets_file": str(CLIENT_SECRETS_FILE),
             "bin_dir": str(BIN_DIR),
-            "clips_dir": str(CLIPS_DIR),
+            "clips_dir": str(self._clips_dir()),
+            "default_clips_dir": str(CLIPS_DIR),
             "music_dir": str(MUSIC_DIR),
         }
 
@@ -1215,14 +1448,21 @@ class ApiBridge:
             cleaned["processing_depth"] = _normalize_processing_depth(
                 cleaned.get("processing_depth")
             )
-        if "game_title_hint" in cleaned:
-            cleaned["game_title_hint"] = self._sanitize_game_title_hint(
-                cleaned.get("game_title_hint")
-            )
+        cleaned.pop("game_title_hint", None)
         if "clip_duration" in cleaned:
             cleaned["clip_duration"] = _normalize_clip_duration(
                 cleaned.get("clip_duration")
             )
+        if "output_dir" in cleaned:
+            raw_output_dir = str(cleaned.get("output_dir") or "").strip()
+            if raw_output_dir:
+                try:
+                    path = Path(raw_output_dir).expanduser()
+                    cleaned["output_dir"] = str(path.resolve()) if path.is_absolute() else ""
+                except Exception:
+                    cleaned["output_dir"] = ""
+            else:
+                cleaned["output_dir"] = ""
         if "min_gap" in cleaned:
             cleaned["min_gap"] = _normalize_min_gap(
                 cleaned.get("min_gap")
@@ -1269,6 +1509,7 @@ class ApiBridge:
             cleaned.pop("mixed_audio_subtitle_policy", None)
             cleaned.pop("commentary_subtitle_policy", None)
         self._user_settings = cleaned
+        self._sync_video_server_root()
         self._save_state()
         return {"ok": True}
 
@@ -1906,7 +2147,16 @@ class ApiBridge:
             personalization = self._empty_personalization()
         with lock:
             personalization_snapshot = json.loads(json.dumps(personalization))
-        return build_learning_prompt_context(personalization_snapshot)
+        run_lock = getattr(self, "_run_learning_lock", threading.RLock())
+        run_learning = getattr(self, "_run_learning", empty_run_learning())
+        if not isinstance(run_learning, dict):
+            run_learning = empty_run_learning()
+        with run_lock:
+            run_learning_snapshot = json.loads(json.dumps(run_learning))
+        return build_learning_prompt_context(
+            personalization_snapshot,
+            run_learning=run_learning_snapshot,
+        )
 
     def _title_context_for_clip(self, clip_index: int) -> dict:
         if clip_index < 0 or clip_index >= len(self._moments):
@@ -2002,6 +2252,15 @@ class ApiBridge:
         }
         if not context["game_context"] and context.get("game_title"):
             context["game_context"] = self._game_context_for_title(context["game_title"], allow_network=False)
+        speech_policy = _clip_speech_policy_summary(moment)
+        context["speech_policy"] = speech_policy
+        context["metadata_warning"] = str(
+            moment.get("metadata_warning") or speech_policy.get("warning") or ""
+        )
+        context["metadata_needs_context"] = bool(
+            moment.get("metadata_needs_context")
+            or speech_policy.get("metadata_backfill_blocked")
+        )
         context["feedback_learning_context"] = self._feedback_learning_prompt_context()
         if 0 <= clip_index < len(self._results):
             context["clip_filename"] = self._results[clip_index].name
@@ -2166,8 +2425,23 @@ class ApiBridge:
             f"Quality Score: {context_summary.get('quality_score')}",
             f"Selection Quality Score: {context_summary.get('selection_quality_score')}",
         ]
+        speech_policy = context_summary.get("speech_policy") if isinstance(context_summary.get("speech_policy"), dict) else {}
+        if speech_policy.get("status") and speech_policy.get("status") != "ok":
+            lines.append(f"Speech Policy: {speech_policy.get('status')}")
+        if context_summary.get("metadata_warning"):
+            lines.append(f"Metadata Warning: {context_summary.get('metadata_warning')}")
         if context_summary.get("creator_title_context"):
             lines.append(f"Creator Context: {context_summary['creator_title_context']}")
+        montage_quality = (clip_context or {}).get("montage_quality_explanation") if isinstance(clip_context, dict) else {}
+        if isinstance(montage_quality, dict) and montage_quality:
+            lines.append("")
+            lines.append("Montage Quality:")
+            if montage_quality.get("roles"):
+                lines.append(f"Roles: {', '.join(str(role) for role in montage_quality.get('roles', [])[:8])}")
+            if montage_quality.get("strengths"):
+                lines.append(f"Strengths: {'; '.join(str(item) for item in montage_quality.get('strengths', [])[:4])}")
+            if montage_quality.get("warnings"):
+                lines.append(f"Warnings: {'; '.join(str(item) for item in montage_quality.get('warnings', [])[:4])}")
         game_knowledge = context_summary.get("game_knowledge") if isinstance(context_summary.get("game_knowledge"), dict) else {}
         if game_knowledge.get("available"):
             game_bits = [str(game_knowledge.get("label") or game_title or "Unknown")]
@@ -2204,10 +2478,11 @@ class ApiBridge:
         reason: str = "",
     ) -> bool:
         """Delete a generated metadata .txt file after validating it is local app data."""
-        sidecar = self._safe_path_under(CLIPS_DIR, sidecar_path)
+        clips_dir = self._clips_dir()
+        sidecar = self._safe_path_under(clips_dir, sidecar_path)
         if not sidecar or sidecar.suffix.lower() != ".txt" or not sidecar.exists() or not sidecar.is_file():
             return False
-        keep = self._safe_path_under(CLIPS_DIR, keep_path) if keep_path else None
+        keep = self._safe_path_under(clips_dir, keep_path) if keep_path else None
         if keep and sidecar.resolve() == keep.resolve():
             return False
         try:
@@ -2228,8 +2503,9 @@ class ApiBridge:
     ) -> int:
         deleted = 0
         seen: set[str] = set()
+        clips_dir = self._clips_dir()
         for sidecar_path in sidecar_paths or []:
-            sidecar = self._safe_path_under(CLIPS_DIR, sidecar_path)
+            sidecar = self._safe_path_under(clips_dir, sidecar_path)
             if not sidecar:
                 continue
             key = str(sidecar)
@@ -2259,7 +2535,15 @@ class ApiBridge:
         if not isinstance(moment, dict):
             moment = {}
             self._moments[clip_index] = moment
+        clip_filename = ""
+        try:
+            clip_filename = Path(self._results[clip_index]).name if 0 <= clip_index < len(self._results) else ""
+        except Exception:
+            clip_filename = ""
         moment["generated_metadata"] = {
+            "clip_id": moment.get("clip_id") or "",
+            "source_id": moment.get("source_id") or "",
+            "clip_filename": clip_filename,
             "title": title,
             "description": description,
             "final_description": description,
@@ -2272,6 +2556,11 @@ class ApiBridge:
             "tags": tags,
             "game_title": game_title,
             "metadata_file": metadata_file,
+            "speech_policy": (clip_context or {}).get("speech_policy")
+            if isinstance((clip_context or {}).get("speech_policy"), dict)
+            else _clip_speech_policy_summary(moment),
+            "metadata_warning": (clip_context or {}).get("metadata_warning") or moment.get("metadata_warning", ""),
+            "metadata_needs_context": bool((clip_context or {}).get("metadata_needs_context") or moment.get("metadata_needs_context")),
             "title_context": summarize_clip_context(
                 (clip_context or {}).get("transcript", ""),
                 game_title,
@@ -2282,6 +2571,44 @@ class ApiBridge:
         if creator_context:
             moment["creator_title_context"] = creator_context
             moment["generated_metadata"]["creator_title_context"] = creator_context
+
+    def _record_metadata_learning_event(
+        self,
+        clip_index: int,
+        title: str,
+        game_title: str = "",
+        *,
+        reason: str = "metadata_generated",
+    ):
+        if clip_index < 0 or clip_index >= len(self._moments):
+            return
+        try:
+            path = self._results[clip_index] if clip_index < len(self._results) else None
+            moment = self._ensure_moment_identity(self._moments[clip_index], path)
+            self._moments[clip_index] = moment
+            timestamp = self._utc_now_label()
+            self._record_run_learning_event(
+                build_metadata_event(
+                    event_id=self._hash_id(
+                        "learn",
+                        timestamp,
+                        moment.get("clip_id"),
+                        title,
+                        reason,
+                        length=18,
+                    ),
+                    timestamp=timestamp,
+                    clip_id=moment.get("clip_id", ""),
+                    source_id=moment.get("source_id", ""),
+                    source_stem=moment.get("source_stem", ""),
+                    clip_filename=Path(path).name if path else "",
+                    title=title,
+                    game_title=game_title,
+                    reason=reason,
+                )
+            )
+        except Exception as exc:
+            print(f"[learning] Failed to record metadata outcome: {exc}")
 
     def generate_titles(self):
         """Generate titles for all clips using LLM (or heuristic fallback).
@@ -2346,6 +2673,12 @@ class ApiBridge:
                 clip_context=clip_context,
             )
             metadata_file = self._write_metadata_sidecar(i, title, game_title, description, tags, clip_context)
+            moment = self._moments[i] if i < len(self._moments) and isinstance(self._moments[i], dict) else {}
+            clip_filename = ""
+            try:
+                clip_filename = Path(self._results[i]).name if i < len(self._results) else ""
+            except Exception:
+                clip_filename = ""
             self._store_generated_metadata(
                 i,
                 title,
@@ -2360,6 +2693,9 @@ class ApiBridge:
             )
             metadata.append({
                 "index": i,
+                "clip_id": moment.get("clip_id") or "",
+                "source_id": moment.get("source_id") or "",
+                "clip_filename": clip_filename,
                 "title": title,
                 "game_title": game_title,
                 "description": description,
@@ -2373,6 +2709,12 @@ class ApiBridge:
                 "title_context": summarize_clip_context(transcripts[i], game_title, clip_context),
                 "metadata_file": metadata_file,
             })
+            self._record_metadata_learning_event(
+                i,
+                title,
+                game_title,
+                reason="batch_metadata_generated",
+            )
         self._save_state()
         return {"titles": titles, "metadata": metadata, "llm": llm_available}
 
@@ -2402,7 +2744,21 @@ class ApiBridge:
             transcript = self._moments[clip_index].get("transcript", "")
 
         if not transcript:
-            return {"title": "", "error": "No transcript for this clip"}
+            policy = _clip_speech_policy_summary(self._moments[clip_index])
+            self._moments[clip_index]["speech_policy"] = policy
+            if policy.get("warning"):
+                self._moments[clip_index]["metadata_warning"] = policy["warning"]
+            self._moments[clip_index]["metadata_needs_context"] = bool(policy.get("metadata_backfill_blocked"))
+            error = "No commentary transcript for this clip" if policy.get("metadata_backfill_blocked") else "No transcript for this clip"
+            if save:
+                self._save_state()
+            return {
+                "title": "",
+                "error": error,
+                "speech_policy": policy,
+                "metadata_warning": self._moments[clip_index].get("metadata_warning", ""),
+                "metadata_needs_context": self._moments[clip_index].get("metadata_needs_context", False),
+            }
         self._refresh_clip_game_identity_for_metadata(
             clip_index,
             allow_network=True,
@@ -2443,7 +2799,21 @@ class ApiBridge:
         )
         if save:
             self._save_state()
+            self._record_metadata_learning_event(
+                clip_index,
+                title,
+                game_title,
+                reason="clip_metadata_rerolled",
+            )
+        moment = self._moments[clip_index] if isinstance(self._moments[clip_index], dict) else {}
+        try:
+            clip_filename = Path(self._results[clip_index]).name if clip_index < len(self._results) else ""
+        except Exception:
+            clip_filename = ""
         return {
+            "clip_id": moment.get("clip_id") or "",
+            "source_id": moment.get("source_id") or "",
+            "clip_filename": clip_filename,
             "title": title,
             "description": description,
             "final_description": description,
@@ -2525,6 +2895,7 @@ class ApiBridge:
                         "filename",
                         self._results[clip_index].name if 0 <= clip_index < len(self._results) else "",
                     )
+                    metadata["clip_filename"] = metadata["filename"]
                     metadata["path"] = rename_result.get(
                         "path",
                         str(self._results[clip_index]) if 0 <= clip_index < len(self._results) else "",
@@ -2535,6 +2906,9 @@ class ApiBridge:
                             final_clip_debug[offset]["path"] = metadata.get("path")
                             final_clip_debug[offset]["filename"] = metadata.get("filename")
                         final_clip_debug[offset]["generated_metadata"] = {
+                            "clip_id": metadata.get("clip_id"),
+                            "source_id": metadata.get("source_id"),
+                            "clip_filename": metadata.get("clip_filename"),
                             "title": metadata.get("title"),
                             "description": metadata.get("description"),
                             "final_description": metadata.get("final_description"),
@@ -2545,6 +2919,23 @@ class ApiBridge:
                             "metadata_file": metadata.get("metadata_file"),
                             "renamed": metadata.get("renamed"),
                             "filename": metadata.get("filename"),
+                        }
+                else:
+                    error_text = str((metadata or {}).get("error") or "metadata_not_generated")
+                    if run_warnings is not None:
+                        warning_code = "no_selected_commentary_transcript" if "commentary" in error_text.lower() else "metadata_not_generated"
+                        run_warnings.append(f"clip_{offset + 1}_{warning_code}")
+                    if final_clip_debug is not None and offset < len(final_clip_debug):
+                        moment = self._moments[clip_index] if 0 <= clip_index < len(self._moments) and isinstance(self._moments[clip_index], dict) else {}
+                        policy = (metadata or {}).get("speech_policy")
+                        if not isinstance(policy, dict):
+                            policy = _clip_speech_policy_summary(moment)
+                        final_clip_debug[offset]["generated_metadata"] = {
+                            "error": error_text,
+                            "title": "",
+                            "speech_policy": policy,
+                            "metadata_warning": (metadata or {}).get("metadata_warning") or moment.get("metadata_warning", ""),
+                            "metadata_needs_context": bool((metadata or {}).get("metadata_needs_context") or moment.get("metadata_needs_context")),
                         }
             except CancelledError:
                 raise
@@ -2577,7 +2968,8 @@ class ApiBridge:
         ext = old_path.suffix
         new_name = f"{safe}{ext}"
         new_path = old_path.parent / new_name
-        safe_new_path = self._safe_path_under(CLIPS_DIR, new_path)
+        clips_dir = self._clips_dir()
+        safe_new_path = self._safe_path_under(clips_dir, new_path)
         if not safe_new_path:
             return {"error": "Unsafe output path"}
         new_path = safe_new_path
@@ -2587,7 +2979,7 @@ class ApiBridge:
             counter = 2
             while new_path.exists():
                 new_name = f"{safe} ({counter}){ext}"
-                safe_new_path = self._safe_path_under(CLIPS_DIR, old_path.parent / new_name)
+                safe_new_path = self._safe_path_under(clips_dir, old_path.parent / new_name)
                 if not safe_new_path:
                     return {"error": "Unsafe output path"}
                 new_path = safe_new_path
@@ -2783,15 +3175,6 @@ class ApiBridge:
             print(f"[title-gen] Error: {e}")
             self._js(f"window.onTitlesDone && window.onTitlesDone({{error: `{self._esc(str(e))}`}})")
 
-    def _backfill_transcripts(self):
-        """Transcribe clips that are missing transcripts (e.g. from previous sessions)."""
-        print("[title-gen] Backfilling missing transcripts from clip audio...")
-        for i, p in enumerate(self._results):
-            if i < len(self._moments) and self._moments[i].get("transcript"):
-                continue  # already has transcript
-            self._backfill_transcript_single(i)
-        self._save_state()  # persist backfilled transcripts
-
     def _backfill_transcript_single(self, clip_index):
         """Transcribe a single clip to fill in its transcript."""
         import tempfile
@@ -2804,6 +3187,19 @@ class ApiBridge:
         # Ensure moments slot exists
         while len(self._moments) <= clip_index:
             self._moments.append({})
+
+        moment = self._moments[clip_index] if isinstance(self._moments[clip_index], dict) else {}
+        policy = _clip_speech_policy_summary(moment)
+        if policy.get("metadata_backfill_blocked"):
+            moment["speech_policy"] = policy
+            moment["metadata_warning"] = policy.get("warning", "")
+            moment["metadata_needs_context"] = True
+            self._moments[clip_index] = moment
+            print(
+                f"  [title-gen] Clip {clip_index + 1}: skipped rendered-audio backfill "
+                "because the selected commentary track had no transcript"
+            )
+            return
 
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
@@ -3027,8 +3423,8 @@ class ApiBridge:
             return None
 
     def _safe_clip_path(self, path) -> Path | None:
-        """Return an existing clip path only when it is inside CLIPS_DIR."""
-        resolved = self._safe_path_under(CLIPS_DIR, path)
+        """Return an existing clip path only when it is inside the active clips folder."""
+        resolved = self._safe_path_under(self._clips_dir(), path)
         if (
             resolved
             and resolved.exists()
@@ -3065,7 +3461,7 @@ class ApiBridge:
 
     def _delete_clip_sidecar(self, clip_path, *, reason: str = "") -> bool:
         """Delete the generated .txt metadata sidecar that belongs to a clip."""
-        video_path = self._safe_path_under(CLIPS_DIR, clip_path)
+        video_path = self._safe_path_under(self._clips_dir(), clip_path)
         if not video_path or video_path.suffix.lower() not in VIDEO_FILE_EXTS:
             return False
         return self._delete_metadata_sidecar_path(video_path.with_suffix(".txt"), reason=reason)
@@ -3084,11 +3480,12 @@ class ApiBridge:
 
     def _prune_orphan_metadata_sidecars(self) -> int:
         """Remove app-generated .txt metadata files whose matching video is gone."""
-        if not CLIPS_DIR.exists():
+        clips_dir = self._clips_dir()
+        if not clips_dir.exists():
             return 0
         deleted = 0
-        for path in CLIPS_DIR.glob("*.txt"):
-            sidecar = self._safe_path_under(CLIPS_DIR, path)
+        for path in clips_dir.glob("*.txt"):
+            sidecar = self._safe_path_under(clips_dir, path)
             if not sidecar or not sidecar.is_file():
                 continue
             has_matching_video = any(
@@ -3105,14 +3502,28 @@ class ApiBridge:
         """Return a clip output path without deleting an existing rendered clip."""
         clean_stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(stem or "clip")).strip(" ._") or "clip"
         safe_num = max(1, int(clip_num or 1))
-        base = CLIPS_DIR / f"{clean_stem}_viral{safe_num}.mp4"
+        clips_dir = self._clips_dir()
+        base = clips_dir / f"{clean_stem}_viral{safe_num}.mp4"
         if not base.exists():
             return base
         for suffix in range(2, 1000):
-            candidate = CLIPS_DIR / f"{clean_stem}_viral{safe_num}_{suffix}.mp4"
+            candidate = clips_dir / f"{clean_stem}_viral{safe_num}_{suffix}.mp4"
             if not candidate.exists():
                 return candidate
-        return CLIPS_DIR / f"{clean_stem}_viral{safe_num}_{uuid.uuid4().hex[:8]}.mp4"
+        return clips_dir / f"{clean_stem}_viral{safe_num}_{uuid.uuid4().hex[:8]}.mp4"
+
+    def _unique_montage_output_path(self, stem: str) -> Path:
+        """Return a montage output path without deleting existing files."""
+        clean_stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(stem or "montage")).strip(" ._") or "montage"
+        clips_dir = self._clips_dir()
+        base = clips_dir / f"{clean_stem}_montage1.mp4"
+        if not base.exists():
+            return base
+        for suffix in range(2, 1000):
+            candidate = clips_dir / f"{clean_stem}_montage{suffix}.mp4"
+            if not candidate.exists():
+                return candidate
+        return clips_dir / f"{clean_stem}_montage_{uuid.uuid4().hex[:8]}.mp4"
 
     def get_music_url(self, filename):
         """Return a local HTTP URL for a music file so the browser can play it."""
@@ -3314,7 +3725,12 @@ class ApiBridge:
             transcript = moment.get("transcript") or item.get("transcript") or ""
             cache_key = self._ai_moment_cache_key(item)
             cached = classification_cache.get(cache_key) if cache_key else None
-            if isinstance(cached, dict):
+            cached_status = str((cached or {}).get("status") or "").lower() if isinstance(cached, dict) else ""
+            cache_is_reusable = (
+                isinstance(cached, dict)
+                and cached_status not in {"ollama_error", "ollama_timeout", "error", "invalid_response"}
+            )
+            if cache_is_reusable:
                 classification = dict(cached)
                 report["reused_shadow_count"] += 1
             else:
@@ -3759,22 +4175,39 @@ class ApiBridge:
             report["status"] = "vision_model_missing"
             report["elapsed_seconds"] = round(time.monotonic() - started, 3)
             return report
+        preflight = preflight_ollama_vision_model(str(report["model"] or ""))
+        report["preflight"] = preflight
+        if not preflight.get("ok"):
+            report["status"] = f"vision_preflight_{preflight.get('status') or 'failed'}"
+            report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            return report
 
-        near_miss_reserve = min(3, max(1, math.ceil(max_count * 0.25))) if max_count >= 2 else 0
-        accepted_cap = max(0, max_count - near_miss_reserve)
-        accepted_shortlist = self._ai_shadow_shortlist(
+        selected_shortlist: list[dict] = []
+        seen_ids: set[int] = set()
+        for item in selected:
+            if len(selected_shortlist) >= max_count:
+                break
+            selected_shortlist.append(item)
+            seen_ids.add(id(item))
+        near_miss_reserve = min(3, max(1, math.ceil(max_count * 0.18))) if max_count >= 2 else 0
+        accepted_cap = max(0, max_count - len(selected_shortlist) - near_miss_reserve)
+        accepted_shortlist = [
+            item for item in self._ai_shadow_shortlist(
             evaluations,
             max_count=accepted_cap,
             score_key=score_key,
-        )
+            )
+            if id(item) not in seen_ids
+        ]
+        seen_ids.update(id(item) for item in accepted_shortlist)
         near_miss_shortlist = self._multimodal_near_miss_shortlist(
             evaluations,
-            max_count=max(0, max_count - len(accepted_shortlist)),
-            exclude_ids={id(item) for item in accepted_shortlist},
+            max_count=max(0, max_count - len(selected_shortlist) - len(accepted_shortlist)),
+            exclude_ids=seen_ids,
             score_key=score_key,
         )
-        if len(accepted_shortlist) + len(near_miss_shortlist) < max_count:
-            used_ids = {id(item) for item in accepted_shortlist + near_miss_shortlist}
+        if len(selected_shortlist) + len(accepted_shortlist) + len(near_miss_shortlist) < max_count:
+            used_ids = {id(item) for item in selected_shortlist + accepted_shortlist + near_miss_shortlist}
             accepted_backfill = [
                 item
                 for item in self._ai_shadow_shortlist(
@@ -3784,11 +4217,12 @@ class ApiBridge:
                 )
                 if id(item) not in used_ids
             ]
-            remaining_slots = max_count - len(accepted_shortlist) - len(near_miss_shortlist)
+            remaining_slots = max_count - len(selected_shortlist) - len(accepted_shortlist) - len(near_miss_shortlist)
             accepted_shortlist.extend(accepted_backfill[:remaining_slots])
-        shortlist = accepted_shortlist + near_miss_shortlist
+        shortlist = selected_shortlist + accepted_shortlist + near_miss_shortlist
         report["shortlist_count"] = len(shortlist)
-        report["accepted_shortlist_count"] = len(accepted_shortlist)
+        report["selected_shortlist_count"] = len(selected_shortlist)
+        report["accepted_shortlist_count"] = len(selected_shortlist) + len(accepted_shortlist)
         report["near_miss_shortlist_count"] = len(near_miss_shortlist)
         if not shortlist:
             report["status"] = "no_shortlist_candidates"
@@ -3832,7 +4266,7 @@ class ApiBridge:
                 video_duration=video_duration,
                 enabled=True,
                 model=report["model"],
-                max_frames=3,
+                max_frames=6,
             )
             item["multimodal_analysis"] = analysis
             candidate["multimodal_analysis"] = analysis
@@ -3868,6 +4302,8 @@ class ApiBridge:
                     "confidence": analysis.get("confidence"),
                     "ranking_adjustment": analysis.get("ranking_adjustment"),
                     "reject_flags": analysis.get("reject_flags"),
+                    "fallback_used": analysis.get("fallback_used"),
+                    "initial_status": analysis.get("initial_status"),
                 }
             )
 
@@ -4375,6 +4811,7 @@ class ApiBridge:
         )
         affected_ranking = bool(abs(adjustment) > 0.0001)
         visual_truth = self._visual_truth_payload(moment)
+        speech_policy = _clip_speech_policy_summary(moment)
         return {
             "schema_version": 1,
             "game_title": title[:140],
@@ -4405,6 +4842,11 @@ class ApiBridge:
             "visual_analysis_source": visual_truth.get("source"),
             "vision_model": visual_truth.get("model"),
             "visual_frame_count": visual_truth.get("frame_count"),
+            "speech_policy_status": speech_policy.get("status"),
+            "speech_policy_warning": speech_policy.get("warning"),
+            "selected_track_has_speech": speech_policy.get("selected_track_has_speech"),
+            "selected_track_word_count": speech_policy.get("selected_track_word_count"),
+            "metadata_transcript_source": speech_policy.get("metadata_transcript_source"),
         }
 
     def _clip_payload(self, idx: int, path: Path, include_url: bool = True) -> dict:
@@ -4434,10 +4876,13 @@ class ApiBridge:
             "subtitle_generated": moment.get("subtitle_generated"),
             "subtitles_burned": moment.get("subtitles_burned"),
             "subtitle_placement": moment.get("subtitle_placement"),
+            "speech_policy": moment.get("speech_policy") if isinstance(moment.get("speech_policy"), dict) else _clip_speech_policy_summary(moment),
+            "metadata_warning": moment.get("metadata_warning"),
+            "metadata_needs_context": bool(moment.get("metadata_needs_context")),
             "truth_summary": self._clip_truth_summary(moment, path),
         }
         if include_url:
-            clip["url"] = f"http://127.0.0.1:{self._video_port}/{quote(path.name)}"
+            clip["url"] = self._clip_url_for_path(path) or f"http://127.0.0.1:{self._video_port}/{quote(path.name)}"
         return clip
 
     @staticmethod
@@ -4544,7 +4989,230 @@ class ApiBridge:
             "last_run": clean_runs[-1] if clean_runs else None,
         }
 
-    def _estimate_processing_seconds_from_history(self, depth: str, video_duration: float | None) -> tuple[float | None, str]:
+    @staticmethod
+    def _history_fingerprint_similarity(target: dict | None, actual: dict | None) -> float:
+        target = target if isinstance(target, dict) else {}
+        actual = actual if isinstance(actual, dict) else {}
+        if not target or not actual:
+            return 0.0
+        target_mode = str(target.get("generation_mode") or "").strip()
+        actual_mode = str(actual.get("generation_mode") or "").strip()
+        if target_mode and actual_mode and target_mode != actual_mode:
+            return 0.0
+        score = 0.0
+        total = 0.0
+        for key in (
+            "generation_mode",
+            "candidate_whisper_model",
+            "scene_mode",
+            "subtitle_style",
+        ):
+            if target.get(key) is None:
+                continue
+            total += 1.0
+            if str(target.get(key)) == str(actual.get(key)):
+                score += 1.0
+        for key in (
+            "visual_analysis",
+            "multimodal_analysis",
+            "ai_moment_labels",
+            "ai_moment_ranking",
+            "multimodal_ranking",
+            "multi_signal_ai_ranking",
+            "moment_label_ranking",
+            "voice_profile_ranking",
+            "game_context",
+        ):
+            if key not in target:
+                continue
+            total += 0.8
+            if bool(target.get(key)) == bool(actual.get(key)):
+                score += 0.8
+        for key in ("candidate_pool_cap", "candidate_multiplier"):
+            if target.get(key) is None or actual.get(key) is None:
+                continue
+            try:
+                left = float(target.get(key) or 0.0)
+                right = float(actual.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            total += 0.8
+            score += 0.8 * max(0.0, 1.0 - abs(left - right) / max(1.0, left, right))
+        return round(score / total, 4) if total > 0 else 0.0
+
+    @staticmethod
+    def _history_generation_mode(row: dict | None) -> str:
+        row = row if isinstance(row, dict) else {}
+        fingerprint = row.get("settings_fingerprint") if isinstance(row.get("settings_fingerprint"), dict) else {}
+        return _normalize_generation_mode(row.get("generation_mode") or fingerprint.get("generation_mode"))
+
+    @classmethod
+    def _history_runs_matching_fingerprint(cls, runs: list[dict], fingerprint: dict | None) -> list[dict]:
+        target = fingerprint if isinstance(fingerprint, dict) else {}
+        target_mode = (
+            _normalize_generation_mode(target.get("generation_mode"))
+            if target.get("generation_mode")
+            else ""
+        )
+        if not target_mode:
+            return [row for row in runs if isinstance(row, dict)]
+        filtered = []
+        for row in runs:
+            if not isinstance(row, dict):
+                continue
+            actual_fingerprint = row.get("settings_fingerprint") if isinstance(row.get("settings_fingerprint"), dict) else {}
+            actual_mode_raw = row.get("generation_mode") or actual_fingerprint.get("generation_mode")
+            if not actual_mode_raw:
+                continue
+            if cls._history_generation_mode(row) == target_mode:
+                filtered.append(row)
+        return filtered
+
+    @staticmethod
+    def _median_float(values: list[float]) -> float | None:
+        clean = sorted(float(value) for value in values if isinstance(value, (int, float)) and math.isfinite(float(value)))
+        if not clean:
+            return None
+        mid = len(clean) // 2
+        if len(clean) % 2:
+            return clean[mid]
+        return (clean[mid - 1] + clean[mid]) / 2.0
+
+    @staticmethod
+    def _stage_seconds_from_timing(stage_timings: dict | None) -> dict[str, float]:
+        timings = stage_timings if isinstance(stage_timings, dict) else {}
+        stage_seconds: dict[str, float] = {}
+        for stage in ETA_PROGRESS_STAGES:
+            total = 0.0
+            for key in ETA_STAGE_TIMING_KEYS.get(stage, ()):
+                total += max(0.0, _safe_float_value(timings.get(key), 0.0))
+            stage_seconds[stage] = round(total, 3)
+
+        # Older debug backfills may only have scene_detection, while live runs
+        # record detect as the parent operation. Use scene_detection only as a
+        # fallback so scene time is not double-counted.
+        if stage_seconds.get("detect", 0.0) <= 0:
+            stage_seconds["detect"] = round(
+                max(0.0, _safe_float_value(timings.get("scene_detection"), 0.0)),
+                3,
+            )
+
+        tracked = sum(stage_seconds.values())
+        other = max(0.0, _safe_float_value(timings.get("other_untracked"), 0.0))
+        if other > 0 and tracked > 0:
+            # Spread untracked time across known stages so learned weights add up
+            # closer to real wall time without inventing a new UI stage.
+            for stage in ETA_PROGRESS_STAGES:
+                share = stage_seconds[stage] / tracked if tracked else 0.0
+                stage_seconds[stage] = round(stage_seconds[stage] + other * share, 3)
+        elif other > 0:
+            stage_seconds["candidates"] = round(stage_seconds.get("candidates", 0.0) + other, 3)
+        return stage_seconds
+
+    def _estimate_processing_stage_plan_from_history(
+        self,
+        depth: str,
+        video_duration: float | None,
+        *,
+        settings_fingerprint: dict | None = None,
+    ) -> dict | None:
+        """Return learned per-stage ETA seconds for the current workload."""
+        try:
+            video_minutes = max(0.0, float(video_duration or 0.0) / 60.0)
+        except (TypeError, ValueError):
+            video_minutes = 0.0
+        if video_minutes <= 0:
+            return None
+
+        lock = getattr(self, "_processing_history_lock", threading.RLock())
+        history = getattr(self, "_processing_history", self._empty_processing_history())
+        with lock:
+            runs = list(history.get("runs", []))
+
+        normalized_depth = _normalize_processing_depth(depth)
+        eligible = []
+        recent_runs = self._history_runs_matching_fingerprint(runs[-80:], settings_fingerprint)
+        for idx, row in enumerate(recent_runs):
+            if not isinstance(row, dict):
+                continue
+            if _normalize_processing_depth(row.get("processing_depth")) != normalized_depth:
+                continue
+            elapsed = _safe_float_value(row.get("elapsed_seconds"), 0.0)
+            duration = _safe_float_value(row.get("video_duration_seconds"), 0.0)
+            stage_seconds = self._stage_seconds_from_timing(row.get("stage_timings"))
+            if elapsed <= 0 or duration <= 0 or sum(stage_seconds.values()) <= 0:
+                continue
+            similarity = self._history_fingerprint_similarity(
+                settings_fingerprint,
+                row.get("settings_fingerprint") if isinstance(row.get("settings_fingerprint"), dict) else {},
+            )
+            eligible.append(
+                {
+                    "stage_seconds_per_minute": {
+                        stage: seconds / max(0.1, duration / 60.0)
+                        for stage, seconds in stage_seconds.items()
+                    },
+                    "similarity": similarity,
+                    "recency_weight": 0.65 + (idx / max(1, len(recent_runs))) * 0.35,
+                }
+            )
+
+        similar = [row for row in eligible if row["similarity"] >= 0.68]
+        source_rows = similar[-12:] if similar else eligible[-12:]
+        if not source_rows:
+            return None
+
+        stage_plan = {}
+        stage_rates = {}
+        for stage in ETA_PROGRESS_STAGES:
+            values = []
+            weighted_total = 0.0
+            weight_sum = 0.0
+            for item in source_rows:
+                rate = float(item["stage_seconds_per_minute"].get(stage, 0.0) or 0.0)
+                if rate <= 0:
+                    continue
+                weight = (
+                    max(0.1, float(item.get("similarity") or 0.0))
+                    * float(item.get("recency_weight") or 1.0)
+                )
+                values.append(rate)
+                weighted_total += rate * weight
+                weight_sum += weight
+            if weight_sum > 0:
+                rate = weighted_total / weight_sum
+            else:
+                median_rate = self._median_float(values)
+                rate = float(median_rate or 0.0)
+            stage_rates[stage] = round(rate, 4)
+            stage_plan[stage] = round(max(0.0, rate * video_minutes), 3)
+
+        total = round(sum(stage_plan.values()), 3)
+        if total <= 0:
+            return None
+
+        source = "stage_history_similar" if similar else "stage_history"
+        if len(source_rows) == 1:
+            source = "stage_history_nearest"
+        confidence = "medium" if len(source_rows) >= 3 and similar else "low"
+        if len(source_rows) >= 6 and similar:
+            confidence = "high"
+        return {
+            "stages": stage_plan,
+            "stageRates": stage_rates,
+            "estimatedTotalSeconds": total,
+            "source": source,
+            "sampleCount": len(source_rows),
+            "confidence": confidence,
+        }
+
+    def _estimate_processing_seconds_from_history(
+        self,
+        depth: str,
+        video_duration: float | None,
+        *,
+        settings_fingerprint: dict | None = None,
+    ) -> tuple[float | None, str]:
         try:
             video_minutes = max(0.0, float(video_duration or 0.0) / 60.0)
         except (TypeError, ValueError):
@@ -4555,8 +5223,43 @@ class ApiBridge:
         history = getattr(self, "_processing_history", self._empty_processing_history())
         with lock:
             runs = list(history.get("runs", []))
-        stats = self._processing_history_stats(runs)
-        depth_stats = stats.get("by_depth", {}).get(_normalize_processing_depth(depth), {})
+        normalized_depth = _normalize_processing_depth(depth)
+        eligible_runs = []
+        history_runs = self._history_runs_matching_fingerprint(runs[-80:], settings_fingerprint)
+        for idx, row in enumerate(history_runs):
+            if not isinstance(row, dict):
+                continue
+            if _normalize_processing_depth(row.get("processing_depth")) != normalized_depth:
+                continue
+            elapsed = _safe_float_value(row.get("elapsed_seconds"), 0.0)
+            duration = _safe_float_value(row.get("video_duration_seconds"), 0.0)
+            if elapsed <= 0 or duration <= 0:
+                continue
+            similarity = self._history_fingerprint_similarity(
+                settings_fingerprint,
+                row.get("settings_fingerprint") if isinstance(row.get("settings_fingerprint"), dict) else {},
+            )
+            eligible_runs.append(
+                {
+                    "row": row,
+                    "similarity": similarity,
+                    "recency_weight": 0.65 + (idx / max(1, len(history_runs))) * 0.35,
+                    "seconds_per_minute": elapsed / max(0.1, duration / 60.0),
+                }
+            )
+        similar_runs = [row for row in eligible_runs if row["similarity"] >= 0.68]
+        if similar_runs:
+            weighted_total = 0.0
+            weight_sum = 0.0
+            for item in similar_runs[-12:]:
+                weight = max(0.1, item["similarity"]) * float(item["recency_weight"])
+                weighted_total += float(item["seconds_per_minute"]) * weight
+                weight_sum += weight
+            if weight_sum > 0:
+                source = "local_history_similar" if len(similar_runs) >= 2 else "local_history_nearest"
+                return round((weighted_total / weight_sum) * video_minutes, 2), source
+        stats = self._processing_history_stats(history_runs)
+        depth_stats = stats.get("by_depth", {}).get(normalized_depth, {})
         seconds_per_minute = depth_stats.get("seconds_per_video_minute")
         run_count = int(depth_stats.get("run_count") or 0)
         if not seconds_per_minute or run_count < 1:
@@ -4593,6 +5296,22 @@ class ApiBridge:
             if estimated_raw is not None
             else None
         )
+        raw_stage_timings = row.get("stage_timings") if isinstance(row.get("stage_timings"), dict) else {}
+        clean_stage_timings = {}
+        for key, value in raw_stage_timings.items():
+            try:
+                clean_stage_timings[str(key)] = round(float(value), 3)
+            except (TypeError, ValueError):
+                continue
+        tracked_elapsed = sum(
+            max(0.0, float(value))
+            for value in clean_stage_timings.values()
+            if isinstance(value, (int, float))
+        )
+        if elapsed_seconds > 0:
+            untracked = max(0.0, elapsed_seconds - tracked_elapsed)
+            if untracked >= 0.5:
+                clean_stage_timings["other_untracked"] = round(untracked, 3)
         clean = {
             "schema_version": PROCESSING_HISTORY_SCHEMA_VERSION,
             "run_id": str(row.get("run_id") or ""),
@@ -4608,6 +5327,14 @@ class ApiBridge:
             "estimate_source": str(row.get("estimate_source") or "unknown"),
             "estimate_error_seconds": None,
             "video_duration_seconds": round(_safe_float_value(row.get("video_duration_seconds"), 0.0), 3),
+            "generation_mode": _normalize_generation_mode(
+                row.get("generation_mode")
+                or (
+                    row.get("settings_fingerprint", {}).get("generation_mode")
+                    if isinstance(row.get("settings_fingerprint"), dict)
+                    else None
+                )
+            ),
             "processing_depth": _normalize_processing_depth(row.get("processing_depth")),
             "detection_preference": normalize_detection_preference(row.get("detection_preference")),
             "candidate_multiplier": _safe_int_value(row.get("candidate_multiplier"), 0),
@@ -4615,7 +5342,7 @@ class ApiBridge:
             "selected_count": _safe_int_value(row.get("selected_count"), 0),
             "rendered_clip_count": _safe_int_value(row.get("rendered_clip_count"), 0),
             "settings_fingerprint": row.get("settings_fingerprint") if isinstance(row.get("settings_fingerprint"), dict) else {},
-            "stage_timings": row.get("stage_timings") if isinstance(row.get("stage_timings"), dict) else {},
+            "stage_timings": clean_stage_timings,
         }
         if clean["estimated_total_seconds"] is not None and clean["elapsed_seconds"] > 0:
             clean["estimate_error_seconds"] = round(clean["elapsed_seconds"] - clean["estimated_total_seconds"], 3)
@@ -5394,7 +6121,15 @@ class ApiBridge:
                 if entry.get("updated_at"):
                     feedback_times.append(str(entry.get("updated_at")))
             latest_timestamp = max(feedback_times) if feedback_times else ""
-            learning_status = build_learning_status(self._personalization)
+            run_learning = getattr(self, "_run_learning", empty_run_learning())
+            if not isinstance(run_learning, dict):
+                run_learning = empty_run_learning()
+            with getattr(self, "_run_learning_lock", threading.RLock()):
+                run_learning_snapshot = json.loads(json.dumps(run_learning))
+            learning_status = build_learning_status(
+                self._personalization,
+                run_learning=run_learning_snapshot,
+            )
             learning_status["last_feedback_time"] = latest_timestamp
             learning_status["last_feedback_at"] = latest_timestamp
             try:
@@ -5452,6 +6187,7 @@ class ApiBridge:
             },
             "voice_profile": voice_profile_summary,
             "processing_history": self.get_processing_history_summary(),
+            "run_learning": self.get_run_learning_summary(),
             "local_analysis": {
                 "processing_depth": depth,
                 "visual_analysis_enabled": visual_analysis_enabled,
@@ -5669,6 +6405,21 @@ class ApiBridge:
             clips[clip_id] = entry
             self._save_personalization()
 
+        try:
+            self._record_run_learning_event(
+                build_feedback_event(
+                    event_id=event.get("event_id", ""),
+                    event_type=event_type,
+                    active=active,
+                    timestamp=timestamp,
+                    identity=identity,
+                    reason=reason,
+                    clip_snapshot=clip_snapshot,
+                )
+            )
+        except Exception as exc:
+            print(f"[learning] Failed to record feedback outcome: {exc}")
+
         voice_profile_nudge = self._voice_profile_nudge_for_feedback(
             event_type,
             active,
@@ -5722,6 +6473,7 @@ class ApiBridge:
         if not isinstance(personalization, dict):
             return
         lock = getattr(self, "_personalization_lock", threading.RLock())
+        learning_events: list[dict] = []
         with lock:
             clips = personalization.setdefault("clips", {})
             if not isinstance(clips, dict):
@@ -5736,9 +6488,38 @@ class ApiBridge:
                 entry["deleted_at"] = timestamp
                 if filename:
                     entry["deleted_filename"] = filename
+                learning_events.append({
+                    "clip_id": str(entry.get("clip_id") or clip_id or ""),
+                    "source_id": str(entry.get("source_id") or ""),
+                    "source_stem": str(entry.get("source_stem") or ""),
+                    "clip_filename": filename,
+                })
                 changed = True
             if changed:
                 self._save_personalization()
+        if learning_events:
+            for identity in learning_events:
+                try:
+                    self._record_run_learning_event(
+                        build_clip_deleted_event(
+                            event_id=self._hash_id(
+                                "learn",
+                                timestamp,
+                                identity.get("clip_id"),
+                                identity.get("clip_filename"),
+                                "deleted",
+                                length=18,
+                            ),
+                            timestamp=timestamp,
+                            clip_id=identity.get("clip_id", ""),
+                            source_id=identity.get("source_id", ""),
+                            source_stem=identity.get("source_stem", ""),
+                            clip_filename=identity.get("clip_filename", ""),
+                            reason="rendered_file_deleted",
+                        )
+                    )
+                except Exception as exc:
+                    print(f"[learning] Failed to record deleted clip outcome: {exc}")
 
     def _prune_missing_results(self) -> int:
         """Remove deleted clip paths from state while keeping moments/schedule aligned."""
@@ -5816,7 +6597,7 @@ class ApiBridge:
                 except Exception:
                     continue
             try:
-                safe_path = self._safe_clip_path(CLIPS_DIR / target_name)
+                safe_path = self._safe_clip_path(self._clips_dir() / target_name)
             except Exception:
                 safe_path = None
             if safe_path and safe_path.exists():
@@ -5974,10 +6755,42 @@ class ApiBridge:
 
     def open_output_folder(self):
         try:
-            os.startfile(str(CLIPS_DIR))
-        except Exception:
-            pass
+            clips_dir = self._clips_dir()
+            clips_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(clips_dir))
+        except Exception as e:
+            return {"error": str(e)}
         return {"ok": True}
+
+    def select_output_folder(self):
+        """Let the user choose the default generated-video output folder."""
+        import webview
+
+        try:
+            result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
+        except Exception as e:
+            return {"error": str(e)}
+        if not result:
+            return {"cancelled": True}
+        raw = result[0] if isinstance(result, (list, tuple)) else result
+        try:
+            path = Path(raw).expanduser().resolve()
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"error": f"Could not use that folder: {e}"}
+        self._user_settings = dict(getattr(self, "_user_settings", {}) or {})
+        self._user_settings["output_dir"] = str(path)
+        self._sync_video_server_root()
+        self._save_state()
+        return {"ok": True, "path": str(path)}
+
+    def reset_output_folder(self):
+        """Return generated clips to the default LocalAppData clips folder."""
+        self._user_settings = dict(getattr(self, "_user_settings", {}) or {})
+        self._user_settings.pop("output_dir", None)
+        self._sync_video_server_root()
+        self._save_state()
+        return {"ok": True, "path": str(self._clips_dir())}
 
     def select_file(self):
         import webview
@@ -6010,8 +6823,7 @@ class ApiBridge:
         if 0 <= clip_index < len(self._results):
             p = self._safe_clip_path(self._results[clip_index])
             if p:
-                rel = p.resolve().relative_to(CLIPS_DIR.resolve()).as_posix()
-                return {"url": f"http://127.0.0.1:{self._video_port}/{quote(rel)}"}
+                return {"url": self._clip_url_for_path(p)}
         return {"url": None}
 
     def get_subtitle_preview_url(self):
@@ -6021,9 +6833,8 @@ class ApiBridge:
             p = self._safe_clip_path(self._results[idx])
             if not p:
                 continue
-            rel = p.resolve().relative_to(CLIPS_DIR.resolve()).as_posix()
             return {
-                "url": f"http://127.0.0.1:{self._video_port}/{quote(rel)}",
+                "url": self._clip_url_for_path(p),
                 "filename": p.name,
                 "index": idx,
             }
@@ -6083,6 +6894,7 @@ class ApiBridge:
         failed = []
         seen = set()
         missing_names: set[str] = set()
+        clips_dir = self._clips_dir()
 
         for raw in filenames:
             name = str(raw or "").strip()
@@ -6092,7 +6904,7 @@ class ApiBridge:
             if Path(name).name != name:
                 failed.append({"filename": name, "error": "Invalid filename"})
                 continue
-            target = self._safe_child_path(CLIPS_DIR, name)
+            target = self._safe_child_path(clips_dir, name)
             if not target or not target.exists() or not target.is_file():
                 missing_names.add(name)
                 failed.append({"filename": name, "error": "File not found"})
@@ -6183,11 +6995,12 @@ class ApiBridge:
             for i, p in enumerate(self._results)
             if p.exists()
         }
-        if CLIPS_DIR.exists():
+        clips_dir = self._clips_dir()
+        if clips_dir.exists():
             # Single stat() per file — cache the result
             entries = []
-            for p in CLIPS_DIR.iterdir():
-                safe_path = self._safe_path_under(CLIPS_DIR, p)
+            for p in clips_dir.iterdir():
+                safe_path = self._safe_path_under(clips_dir, p)
                 if not safe_path or not safe_path.is_file():
                     continue
                 if safe_path.suffix.lower() in _exts:
@@ -6200,7 +7013,7 @@ class ApiBridge:
                     "filename": p.name,
                     "size_mb": round(st.st_size / (1024 * 1024), 1),
                     "modified": st.st_mtime,
-                    "url": f"http://127.0.0.1:{self._video_port}/{quote(p.name)}",
+                    "url": self._clip_url_for_path(p),
                 }
                 known_idx = known.get(p.resolve())
                 if known_idx is not None:
@@ -6266,10 +7079,11 @@ class ApiBridge:
         existing = {p.resolve() for p in self._results if p.exists()}
         added = 0
 
-        if CLIPS_DIR.exists():
+        clips_dir = self._clips_dir()
+        if clips_dir.exists():
             safe_entries = []
-            for p in CLIPS_DIR.iterdir():
-                safe_path = self._safe_path_under(CLIPS_DIR, p)
+            for p in clips_dir.iterdir():
+                safe_path = self._safe_path_under(clips_dir, p)
                 if safe_path and safe_path.is_file() and safe_path.suffix.lower() in _exts:
                     safe_entries.append(safe_path)
             for p in sorted(safe_entries, key=lambda x: x.stat().st_mtime):
@@ -6566,6 +7380,801 @@ class ApiBridge:
                 return safe_path
         return None
 
+    def _latest_run_debug_path(self) -> Path | None:
+        """Return the newest usable run debug report under SUBTITLES_DIR."""
+        if not SUBTITLES_DIR.exists():
+            return None
+        candidates = sorted(
+            SUBTITLES_DIR.glob("*_run_debug.json"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        for path in candidates:
+            safe_path = self._safe_path_under(SUBTITLES_DIR, path)
+            if not safe_path or not safe_path.is_file():
+                continue
+            try:
+                payload = json.loads(safe_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            rows = payload.get("candidates")
+            if isinstance(rows, list):
+                return safe_path
+        return None
+
+    def get_montage_candidate_audit(
+        self,
+        debug_path=None,
+        target_beats: int = 3,
+        target_duration_seconds=None,
+    ):
+        """Build and persist a compact montage-readiness audit from run debug."""
+        if debug_path:
+            safe_path = self._safe_path_under(SUBTITLES_DIR, debug_path)
+        else:
+            safe_path = self._latest_run_debug_path()
+        if not safe_path or not safe_path.is_file():
+            return {
+                "ok": False,
+                "error": "No run debug report is available for montage audit.",
+                "audit": None,
+            }
+        try:
+            payload = json.loads(safe_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Could not read run debug report: {exc}",
+                "audit": None,
+                "debug_path": str(safe_path),
+            }
+
+        try:
+            audit = build_candidate_audit(
+                payload,
+                target_beats=target_beats,
+                target_duration_seconds=target_duration_seconds,
+            )
+            base_stem = safe_path.stem
+            if base_stem.endswith("_run_debug"):
+                base_stem = base_stem[: -len("_run_debug")]
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", base_stem).strip("._") or "latest"
+            output_path = MONTAGES_DIR / f"{safe_stem}_montage_audit.json"
+            write_candidate_audit(output_path, audit)
+            return {
+                "ok": True,
+                "audit": audit,
+                "path": str(output_path),
+                "debug_path": str(safe_path),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Could not build montage audit: {exc}",
+                "audit": None,
+                "debug_path": str(safe_path),
+            }
+
+    def draft_montage(
+        self,
+        debug_path=None,
+        target_duration_seconds=60,
+        story_shape="hook_escalate_payoff",
+        memory_enabled=True,
+        render_quality="draft",
+    ):
+        """Create a storyboard-only montage draft from the latest run debug."""
+        audit_result = self.get_montage_candidate_audit(
+            debug_path=debug_path,
+            target_beats=3,
+            target_duration_seconds=target_duration_seconds,
+        )
+        if not audit_result.get("ok"):
+            return {
+                "ok": False,
+                "error": audit_result.get("error") or "Could not build montage audit.",
+                "audit": audit_result.get("audit"),
+                "storyboard": None,
+            }
+        audit = audit_result.get("audit") if isinstance(audit_result.get("audit"), dict) else {}
+        try:
+            storyboard = build_storyboard_from_audit(
+                audit,
+                target_duration_seconds=target_duration_seconds,
+                story_shape=story_shape,
+                memory_enabled=bool(memory_enabled),
+                render_quality=render_quality,
+            )
+            if storyboard.get("status") == "no_storyboard":
+                return {
+                    "ok": False,
+                    "error": "No usable beats are available for montage storyboard.",
+                    "audit": audit,
+                    "storyboard": storyboard,
+                    "debug_path": audit_result.get("debug_path"),
+                }
+            source = storyboard.get("source") if isinstance(storyboard.get("source"), dict) else {}
+            base_stem = str(source.get("source_stem") or "latest")
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", base_stem).strip("._") or "latest"
+            output_path = MONTAGES_DIR / f"{safe_stem}_montage_storyboard.json"
+            write_storyboard(output_path, storyboard)
+            return {
+                "ok": True,
+                "audit": audit,
+                "storyboard": storyboard,
+                "path": str(output_path),
+                "audit_path": audit_result.get("path"),
+                "debug_path": audit_result.get("debug_path"),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Could not draft montage storyboard: {exc}",
+                "audit": audit,
+                "storyboard": None,
+                "debug_path": audit_result.get("debug_path"),
+            }
+
+    def _latest_montage_storyboard_path(self) -> Path | None:
+        if not MONTAGES_DIR.exists():
+            return None
+        candidates = sorted(
+            MONTAGES_DIR.glob("*_montage_storyboard.json"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        for path in candidates:
+            safe_path = self._safe_path_under(MONTAGES_DIR, path)
+            if safe_path and safe_path.is_file():
+                return safe_path
+        return None
+
+    def get_montage_storyboard(self, storyboard_path=None):
+        """Return a saved storyboard JSON from the local montage cache."""
+        if storyboard_path:
+            safe_path = self._safe_path_under(MONTAGES_DIR, storyboard_path)
+        else:
+            safe_path = self._latest_montage_storyboard_path()
+        if not safe_path or not safe_path.is_file():
+            return {
+                "ok": False,
+                "error": "No montage storyboard is available.",
+                "storyboard": None,
+            }
+        try:
+            storyboard = json.loads(safe_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Could not read montage storyboard: {exc}",
+                "storyboard": None,
+                "path": str(safe_path),
+            }
+        return {"ok": True, "storyboard": storyboard, "path": str(safe_path)}
+
+    def _storyboard_source_matches_run_debug(self, storyboard: dict) -> bool:
+        """Only render storyboards whose source can be traced to saved run debug."""
+        return self._run_debug_for_storyboard_source(storyboard) is not None
+
+    def _run_debug_for_storyboard_source(self, storyboard: dict) -> dict | None:
+        """Return the saved run debug payload that owns a storyboard source."""
+        if not isinstance(storyboard, dict):
+            return None
+        source = storyboard.get("source") if isinstance(storyboard.get("source"), dict) else {}
+        run_id = str(source.get("run_id") or "").strip()
+        video = str(source.get("video") or "").strip()
+        if not video or not SUBTITLES_DIR.exists():
+            return None
+        for path in SUBTITLES_DIR.glob("*_run_debug.json"):
+            safe_path = self._safe_path_under(SUBTITLES_DIR, path)
+            if not safe_path or not safe_path.is_file():
+                continue
+            try:
+                payload = json.loads(safe_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            payload_run_id = str(payload.get("run_id") or "").strip()
+            payload_video = str(payload.get("video") or "").strip()
+            if run_id and payload_run_id == run_id and payload_video == video:
+                return payload
+            if not run_id and payload_video == video:
+                return payload
+        return None
+
+    def _montage_render_options_from_run_debug(self, payload: dict | None) -> dict:
+        settings = payload.get("settings") if isinstance(payload, dict) and isinstance(payload.get("settings"), dict) else {}
+        audio_source_debug = settings.get("audio_source") if isinstance(settings.get("audio_source"), dict) else {}
+        speech_stream = audio_source_debug.get("selected_stream")
+        try:
+            speech_stream = int(speech_stream) if speech_stream is not None else None
+        except (TypeError, ValueError):
+            speech_stream = None
+        style_value = settings.get("subtitle_style")
+        style = _normalize_subtitle_style(style_value, SUBTITLE_STYLE) if style_value else _normalize_subtitle_style("none", SUBTITLE_STYLE)
+        return {
+            "processing_depth": _normalize_processing_depth(settings.get("processing_depth")),
+            "subtitle_style": style,
+            "subtitle_enabled": subtitles_are_enabled(style),
+            "subtitle_placement": normalize_subtitle_placement(
+                settings.get("subtitle_placement", SUBTITLE_PLACEMENT)
+            ),
+            "crop_vertical": bool(settings.get("crop_vertical")) if "crop_vertical" in settings else False,
+            "whisper_model": settings.get("whisper_model", WHISPER_MODEL),
+            "whisper_language": settings.get("whisper_language") or None,
+            "speech_stream": speech_stream,
+            "allow_stream_retry": bool(audio_source_debug.get("alternate_stream_retry", True)),
+            "commentary_guard_policy": normalize_commentary_subtitle_policy(audio_source_debug.get("subtitle_policy")),
+            "commentary_guard_enabled": bool(audio_source_debug.get("commentary_guard_enabled")),
+            "audio_source_debug": audio_source_debug,
+        }
+
+    def _prepare_montage_storyboard_for_render(
+        self,
+        storyboard: dict,
+        *,
+        source_video: Path,
+        output_stem: str,
+        render_options: dict | None = None,
+    ) -> tuple[dict, dict]:
+        options = render_options if isinstance(render_options, dict) else {}
+        prepared = copy.deepcopy(storyboard)
+        source_video = Path(source_video)
+        processing_depth = _normalize_processing_depth(options.get("processing_depth"))
+        style = _normalize_subtitle_style(options.get("subtitle_style", "none"), "none")
+        subtitle_enabled = bool(options.get("subtitle_enabled") and subtitles_are_enabled(style))
+        subtitle_placement = normalize_subtitle_placement(
+            options.get("subtitle_placement", SUBTITLE_PLACEMENT)
+        )
+        crop_vertical = bool(options.get("crop_vertical"))
+        model = str(options.get("whisper_model") or WHISPER_MODEL)
+        language = options.get("whisper_language") or None
+        speech_stream = options.get("speech_stream")
+        try:
+            speech_stream = int(speech_stream) if speech_stream is not None else None
+        except (TypeError, ValueError):
+            speech_stream = None
+        allow_stream_retry = bool(options.get("allow_stream_retry", False))
+        commentary_guard_policy = normalize_commentary_subtitle_policy(
+            options.get("commentary_guard_policy")
+        )
+        commentary_guard_enabled = bool(options.get("commentary_guard_enabled"))
+        render_plan = prepared.get("render_plan") if isinstance(prepared.get("render_plan"), list) else []
+        beats = prepared.get("beats") if isinstance(prepared.get("beats"), list) else []
+        width, height = get_dimensions(source_video)
+        summary = {
+            "crop_vertical": crop_vertical,
+            "subtitle_enabled": subtitle_enabled,
+            "subtitle_style": style,
+            "subtitle_segments": 0,
+            "subtitle_word_count": 0,
+            "crop_segments": 0,
+            "segments_prepared": 0,
+            "warnings": [],
+        }
+        crop_profile = _crop_tracking_profile(processing_depth)
+        crop_sample_count = min(int(crop_profile["sample_count"]), 28)
+        crop_min_sample_rate = min(float(crop_profile["min_sample_rate"]), 1.5)
+        for index, item in enumerate(render_plan, 1):
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = max(0.0, float(item.get("start") or 0.0))
+                end = max(start, float(item.get("end") or start))
+            except (TypeError, ValueError):
+                continue
+            item["source_video"] = str(source_video)
+            item["start"] = round(start, 3)
+            item["end"] = round(end, 3)
+            crop_params = None
+            crop_w, crop_h = width, height
+            if crop_vertical:
+                try:
+                    crop_params = get_crop_params_dynamic(
+                        source_video,
+                        int(start),
+                        max(int(end), int(start) + 1),
+                        sample_count=crop_sample_count,
+                        min_sample_rate=crop_min_sample_rate,
+                    )
+                except Exception as exc:
+                    summary["warnings"].append(f"beat_{index}_crop_failed:{exc}")
+                    crop_params = None
+                if crop_params:
+                    crop_w, crop_h = crop_params[0], crop_params[1]
+                    item["crop_params"] = crop_params
+                    summary["crop_segments"] += 1
+
+            words = []
+            ass_path = None
+            final_stream = speech_stream
+            if subtitle_enabled:
+                wav = SUBTITLES_DIR / f"{output_stem}_montage_b{index}.wav"
+                ass = SUBTITLES_DIR / f"{output_stem}_montage_b{index}.ass"
+                for stale in (wav, ass):
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if extract_audio_clip(source_video, start, end, wav, audio_stream=final_stream):
+                    words = transcribe_clip(wav, model_size=model, language=language)
+                if allow_stream_retry and needs_stream_retry(
+                    words,
+                    end - start,
+                    subtitle_policy=commentary_guard_policy,
+                    commentary_guard=commentary_guard_enabled,
+                ):
+                    retry_words, retry_stream = self._try_alternate_audio_streams(
+                        source_video,
+                        start,
+                        end,
+                        wav,
+                        model,
+                        language,
+                        index,
+                        max(1, len(render_plan)),
+                        final_stream,
+                        return_stream=True,
+                        progress_stage="silent",
+                        subtitle_policy=commentary_guard_policy,
+                    )
+                    if retry_words:
+                        words = retry_words
+                        final_stream = retry_stream
+                if words:
+                    ass_path = generate_subtitles(
+                        words,
+                        ass,
+                        video_width=crop_w or width or 1080,
+                        video_height=crop_h or height or 1920,
+                        style=style,
+                        subtitle_placement=subtitle_placement,
+                    )
+                if ass_path:
+                    item["subtitle_path"] = str(ass_path)
+                    summary["subtitle_segments"] += 1
+                item["subtitle_word_count"] = len(words)
+                item["speech_stream"] = final_stream
+                summary["subtitle_word_count"] += len(words)
+
+            resolved_placement = resolve_subtitle_placement(
+                crop_w or width or 1080,
+                crop_h or height or 1920,
+                subtitle_placement,
+            )
+            item["subtitle_enabled"] = subtitle_enabled
+            item["subtitle_generated"] = bool(ass_path)
+            item["subtitle_placement"] = resolved_placement
+            item["crop_applied"] = bool(crop_params)
+            if index <= len(beats) and isinstance(beats[index - 1], dict):
+                beat = beats[index - 1]
+                beat["subtitle_enabled"] = subtitle_enabled
+                beat["subtitle_generated"] = bool(ass_path)
+                beat["subtitle_word_count"] = len(words)
+                beat["speech_stream"] = final_stream
+                beat["crop_applied"] = bool(crop_params)
+                beat["subtitle_placement"] = resolved_placement
+            summary["segments_prepared"] += 1
+        return prepared, summary
+
+    def _render_montage_from_storyboard(self, storyboard_path=None, *, final: bool = False):
+        """Render a storyboard montage and add it to Results."""
+        storyboard_result = self.get_montage_storyboard(storyboard_path)
+        if not storyboard_result.get("ok"):
+            return storyboard_result
+        storyboard = storyboard_result.get("storyboard")
+        if not isinstance(storyboard, dict):
+            return {"ok": False, "error": "Storyboard JSON is invalid.", "render": None}
+        run_debug = self._run_debug_for_storyboard_source(storyboard)
+        if not run_debug:
+            return {
+                "ok": False,
+                "error": "Storyboard source does not match a saved run debug report.",
+                "render": None,
+                "storyboard": storyboard,
+            }
+        return self._render_montage_storyboard_payload(
+            storyboard,
+            storyboard_path=storyboard_result.get("path"),
+            final=final,
+            render_options=self._montage_render_options_from_run_debug(run_debug),
+        )
+
+    def _render_montage_storyboard_payload(
+        self,
+        storyboard: dict,
+        *,
+        storyboard_path=None,
+        final: bool = False,
+        render_options: dict | None = None,
+    ):
+        """Render a validated in-memory storyboard and add the montage to Results."""
+        if not isinstance(storyboard, dict):
+            return {"ok": False, "error": "Storyboard JSON is invalid.", "render": None}
+        source = storyboard.get("source") if isinstance(storyboard.get("source"), dict) else {}
+        source_video = Path(str(source.get("video") or ""))
+        if not source_video.exists() or not source_video.is_file():
+            return {
+                "ok": False,
+                "error": "Storyboard source video is missing.",
+                "render": None,
+                "storyboard": storyboard,
+            }
+        render_type = "final_hard_cut" if final else "draft_hard_cut"
+        output_stem = str(source.get("source_stem") or source_video.stem or "montage")
+        if final:
+            output_stem = f"{output_stem}_final"
+        output_path = self._unique_montage_output_path(output_stem)
+        temp_dir = MONTAGES_DIR / ("_final_render_tmp" if final else "_draft_render_tmp")
+        render_storyboard, render_prep = self._prepare_montage_storyboard_for_render(
+            storyboard,
+            source_video=source_video,
+            output_stem=output_path.stem,
+            render_options=render_options,
+        )
+        render = render_draft_montage(
+            render_storyboard,
+            output_path,
+            temp_dir=temp_dir,
+            preset="veryfast" if final else "ultrafast",
+            crf="23" if final else "28",
+            render_type=render_type,
+        )
+        debug_path = MONTAGES_DIR / f"{output_path.stem}_montage_render_debug.json"
+        try:
+            self._write_json_atomic(
+                debug_path,
+                {
+                    "schema_version": 1,
+                    "storyboard_id": storyboard.get("storyboard_id"),
+                    "storyboard_path": str(storyboard_path or ""),
+                    "render_mode": "final" if final else "draft",
+                    "render_prep": render_prep,
+                    "render": render,
+                },
+            )
+        except Exception as exc:
+            print(f"[montage] Failed to write montage render debug: {exc}")
+        if not render.get("ok"):
+            label = "Final" if final else "Draft"
+            return {
+                "ok": False,
+                "error": render.get("error") or f"{label} montage render failed.",
+                "render": render,
+                "storyboard": render_storyboard,
+                "debug_path": str(debug_path),
+            }
+
+        rendered_duration = round(sum(
+            float(item.get("duration") or 0.0)
+            for item in (render.get("segments") or [])
+            if isinstance(item, dict)
+        ), 3)
+        planned_duration = rendered_duration or (render_storyboard.get("summary") or {}).get("planned_duration_seconds")
+        burned_segments = sum(
+            1
+            for item in (render.get("segments") or [])
+            if isinstance(item, dict) and item.get("subtitles_burned")
+        )
+        subtitle_segments = int(render_prep.get("subtitle_segments") or 0)
+        subtitle_enabled = bool(render_prep.get("subtitle_enabled"))
+        subtitle_status = "captions_disabled"
+        if subtitle_enabled and subtitle_segments and burned_segments >= subtitle_segments:
+            subtitle_status = "burned"
+        elif subtitle_enabled and burned_segments:
+            subtitle_status = "partially_burned"
+        elif subtitle_enabled:
+            subtitle_status = "not_burned_no_montage_words"
+        moment = {
+            "montage": True,
+            "montage_storyboard_id": render_storyboard.get("storyboard_id"),
+            "montage_render_type": render_type,
+            "upload_ready": bool(final),
+            "source_path": str(source_video),
+            "source_stem": str(source.get("source_stem") or source_video.stem),
+            "game_title": str(source.get("game_title") or ""),
+            "start": 0,
+            "end": planned_duration or 0,
+            "duration": planned_duration or 0,
+            "primary_category": "montage",
+            "moment_categories": {
+                "primary": "montage",
+                "confidence": 1.0,
+                "signals": {"storyboard_beats": len(render_storyboard.get("beats") or [])},
+            },
+            "subtitle_style": render_prep.get("subtitle_style"),
+            "subtitle_enabled": subtitle_enabled,
+            "subtitle_generated": bool(subtitle_segments),
+            "subtitles_burned": bool(burned_segments),
+            "captions_requested": subtitle_enabled,
+            "subtitle_status": subtitle_status,
+            "subtitle_word_count": int(render_prep.get("subtitle_word_count") or 0),
+            "storyboard": {
+                "storyboard_id": render_storyboard.get("storyboard_id"),
+                "status": render_storyboard.get("status"),
+                "beat_count": len(render_storyboard.get("beats") or []),
+                "planned_duration_seconds": planned_duration,
+                "subtitle_segments": subtitle_segments,
+                "crop_segments": int(render_prep.get("crop_segments") or 0),
+            },
+        }
+        moment = self._ensure_moment_identity(moment, output_path)
+        self._results.append(output_path)
+        self._moments.append(moment)
+        metadata = {}
+        if final:
+            idx = len(self._results) - 1
+            metadata = self._write_montage_metadata(idx, render_storyboard)
+        self._save_state()
+        clip = self._clip_payload(len(self._results) - 1, output_path, include_url=False)
+        return {
+            "ok": True,
+            "render": render,
+            "storyboard": render_storyboard,
+            "path": str(output_path),
+            "debug_path": str(debug_path),
+            "clip": clip,
+            "metadata": metadata,
+        }
+
+    def render_montage_draft(self, storyboard_path=None):
+        """Render a storyboard as a draft hard-cut montage and add it to Results."""
+        return self._render_montage_from_storyboard(storyboard_path, final=False)
+
+    def render_montage_final(self, storyboard_path=None):
+        """Render a storyboard as an upload-ready hard-cut montage with metadata."""
+        return self._render_montage_from_storyboard(storyboard_path, final=True)
+
+    def record_montage_feedback(self, feedback):
+        """Record compact whole-montage or beat-level feedback in run learning."""
+        if not isinstance(feedback, dict):
+            return {"ok": False, "error": "Montage feedback payload must be an object."}
+        feedback_type = str(feedback.get("feedback_type") or feedback.get("event_type") or feedback.get("type") or "").strip().lower()
+        if feedback_type not in {"like", "dislike", "favorite"}:
+            return {"ok": False, "error": "feedback_type must be like, dislike, or favorite."}
+
+        storyboard_result = self.get_montage_storyboard(
+            feedback.get("storyboard_path") or feedback.get("path") or None
+        )
+        if not storyboard_result.get("ok"):
+            return {
+                "ok": False,
+                "error": storyboard_result.get("error") or "No montage storyboard is available.",
+            }
+        storyboard = storyboard_result.get("storyboard")
+        if not isinstance(storyboard, dict):
+            return {"ok": False, "error": "Storyboard JSON is invalid."}
+
+        storyboard_id = str(storyboard.get("storyboard_id") or "").strip()
+        requested_id = str(feedback.get("storyboard_id") or "").strip()
+        if requested_id and requested_id != storyboard_id:
+            return {"ok": False, "error": "Feedback storyboard_id does not match the storyboard file."}
+        if not storyboard_id:
+            return {"ok": False, "error": "Storyboard is missing storyboard_id."}
+
+        beat_snapshot = None
+        beat_id = str(feedback.get("beat_id") or "").strip()
+        if beat_id:
+            beats = storyboard.get("beats") if isinstance(storyboard.get("beats"), list) else []
+            for beat in beats:
+                if isinstance(beat, dict) and str(beat.get("beat_id") or "").strip() == beat_id:
+                    beat_snapshot = beat
+                    break
+            if beat_snapshot is None:
+                return {"ok": False, "error": "beat_id does not exist in the storyboard."}
+
+        active = self._feedback_active_flag(feedback.get("active", True))
+        reason = str(feedback.get("reason") or "").strip()[:1000]
+        timestamp = self._utc_now_label()
+        source = storyboard.get("source") if isinstance(storyboard.get("source"), dict) else {}
+        source_ids = storyboard.get("source_ids") if isinstance(storyboard.get("source_ids"), list) else []
+        event = build_montage_feedback_event(
+            event_id=self._hash_id("mfb", timestamp, storyboard_id, beat_id, feedback_type, reason, length=18),
+            feedback_type=feedback_type,
+            active=active,
+            timestamp=timestamp,
+            storyboard_id=storyboard_id,
+            source_id=str(source_ids[0]) if source_ids else "",
+            source_stem=str(source.get("source_stem") or ""),
+            reason=reason,
+            storyboard_snapshot=storyboard,
+            beat_snapshot=beat_snapshot,
+        )
+        try:
+            self._record_run_learning_event(event)
+        except Exception as exc:
+            return {"ok": False, "error": f"Could not save montage feedback: {exc}"}
+
+        return {
+            "ok": True,
+            "event": event,
+            "storyboard_id": storyboard_id,
+            "beat_id": beat_id,
+            "run_learning": self.get_run_learning_summary(),
+        }
+
+    def _montage_storyboard_metadata_context(self, storyboard: dict) -> dict:
+        """Build compact, beat-aware context for montage titles and descriptions."""
+        beats = storyboard.get("beats") if isinstance(storyboard.get("beats"), list) else []
+        lines: list[str] = []
+        beat_context: list[dict] = []
+        for index, beat in enumerate(beats, 1):
+            if not isinstance(beat, dict):
+                continue
+            role = re.sub(r"[^a-z0-9_ -]", "", str(beat.get("role") or f"beat {index}").lower()).strip() or f"beat {index}"
+            category = re.sub(r"[^a-z0-9_ -]", "", str(beat.get("category") or "gameplay").lower()).strip() or "gameplay"
+            text = sanitize_creator_title_context(str(beat.get("hook_text") or ""), limit=220)
+            line = f"{role}: {text}" if text else f"{role}: {category.replace('_', ' ')} moment"
+            lines.append(line)
+            beat_context.append(
+                {
+                    "role": role,
+                    "category": category,
+                    "text": text,
+                    "source_start": beat.get("source_start"),
+                    "source_end": beat.get("source_end"),
+                    "context_only": bool(beat.get("context_only")),
+                    "repetition_penalty": _safe_float_value(beat.get("repetition_penalty"), 0.0),
+                }
+            )
+        transcript = "\n".join(lines).strip()
+        if not transcript:
+            transcript = "montage built from selected gameplay beats"
+        creator_context = (
+            "Montage storyboard beats: "
+            + " | ".join(lines[:5])
+        )
+        return {
+            "transcript": transcript,
+            "beats": beat_context,
+            "creator_context": sanitize_creator_title_context(creator_context, limit=420),
+        }
+
+    def _is_generic_montage_title(self, title: str, game_title: str = "") -> bool:
+        clean = str(title or "").lower()
+        game = str(game_title or "").lower()
+        clean_no_tags = re.sub(r"#\w+", "", clean).strip()
+        generic_bits = (
+            "montage highlights",
+            "gameplay montage",
+            "short montage",
+            "gaming moment",
+            "gameplay highlights",
+        )
+        if any(bit in clean_no_tags for bit in generic_bits):
+            return True
+        if game and clean_no_tags in {game, f"{game} montage", f"{game} highlights"}:
+            return True
+        return not clean_no_tags
+
+    def _fallback_montage_title(self, game_title: str, montage_context: dict) -> str:
+        beats = montage_context.get("beats") if isinstance(montage_context.get("beats"), list) else []
+        text_candidates = [
+            str(beat.get("text") or "").strip()
+            for beat in beats
+            if isinstance(beat, dict) and str(beat.get("text") or "").strip()
+        ]
+        source = max(text_candidates, key=len) if text_candidates else str(montage_context.get("transcript") or "")
+        source = re.sub(r"\b(oh my god|like|literally|actually|basically|i guess|you know)\b", " ", source, flags=re.IGNORECASE)
+        source = re.sub(r"[^A-Za-z0-9' ]+", " ", source)
+        words = [word for word in source.split() if len(word) > 1]
+        title = " ".join(words[:7]).strip()
+        if not title:
+            title = f"{game_title or 'Gameplay'} Montage"
+        elif len(title) < 18 and game_title:
+            title = f"{title} in {game_title}"
+        return format_short_title(title.title(), game_title)
+
+    def _montage_quality_explanation(self, storyboard: dict) -> dict:
+        beats = storyboard.get("beats") if isinstance(storyboard.get("beats"), list) else []
+        categories: dict[str, int] = {}
+        roles: list[str] = []
+        context_only_count = 0
+        repeated_count = 0
+        for beat in beats:
+            if not isinstance(beat, dict):
+                continue
+            category = str(beat.get("category") or "unknown")
+            categories[category] = categories.get(category, 0) + 1
+            role = str(beat.get("role") or "").strip()
+            if role:
+                roles.append(role)
+            if beat.get("context_only"):
+                context_only_count += 1
+            if (_safe_float_value(beat.get("repetition_penalty"), 0.0) or 0.0) >= 0.10:
+                repeated_count += 1
+        summary = storyboard.get("summary") if isinstance(storyboard.get("summary"), dict) else {}
+        warnings: list[str] = []
+        if context_only_count:
+            warnings.append(f"{context_only_count} context beat(s) were included to keep the story connected.")
+        if repeated_count:
+            warnings.append(f"{repeated_count} beat(s) contain repeated chatter and may need review.")
+        if len(categories) <= 1 and len(beats) > 2:
+            warnings.append("Most beats share one category, so pacing may feel less varied.")
+        strengths = []
+        if len(beats) >= 3:
+            strengths.append("Has setup, escalation, and payoff structure.")
+        if len(categories) > 1:
+            strengths.append("Mixes more than one moment type.")
+        return {
+            "schema_version": 1,
+            "beat_count": len(beats),
+            "planned_duration_seconds": summary.get("planned_duration_seconds"),
+            "roles": roles,
+            "categories": categories,
+            "strengths": strengths,
+            "warnings": warnings,
+        }
+
+    def _write_montage_metadata(self, clip_index: int, storyboard: dict) -> dict:
+        if clip_index < 0 or clip_index >= len(self._results):
+            return {}
+        source = storyboard.get("source") if isinstance(storyboard.get("source"), dict) else {}
+        game_title = str(source.get("game_title") or "")
+        beats = storyboard.get("beats") if isinstance(storyboard.get("beats"), list) else []
+        montage_context = self._montage_storyboard_metadata_context(storyboard)
+        transcript = montage_context["transcript"]
+        quality_explanation = self._montage_quality_explanation(storyboard)
+        clip_context = {
+            "transcript": transcript,
+            "primary_category": "montage",
+            "moment_categories": {"primary": "montage", "confidence": 1.0},
+            "quality_score": (storyboard.get("summary") or {}).get("beat_count"),
+            "selection_quality_score": (storyboard.get("summary") or {}).get("planned_duration_seconds"),
+            "creator_title_context": montage_context["creator_context"],
+            "game_context": self._game_context_for_title(game_title, allow_network=False) if game_title else {},
+            "feedback_learning_context": self._feedback_learning_prompt_context(),
+            "montage_storyboard": montage_context["beats"],
+            "montage_quality_explanation": quality_explanation,
+        }
+        title = generate_title(transcript, game_title=game_title, clip_context=clip_context)
+        if self._is_generic_montage_title(title, game_title):
+            title = self._fallback_montage_title(game_title, montage_context)
+        generated_description = self._generated_description_for_clip(
+            title,
+            transcript,
+            game_title,
+            clip_context,
+        )
+        desc_parts = self._compose_clip_description(
+            title,
+            game_title,
+            clip_context=clip_context,
+            generated_text=generated_description,
+        )
+        tags = self._tags_for_game(game_title, transcript, clip_context=clip_context)
+        metadata_file = self._write_metadata_sidecar(
+            clip_index,
+            title,
+            game_title,
+            desc_parts["description"],
+            tags,
+            clip_context,
+        )
+        self._store_generated_metadata(
+            clip_index,
+            title,
+            desc_parts["description"],
+            tags,
+            game_title,
+            metadata_file,
+            clip_context,
+            generated_description=desc_parts["generated_description"],
+            custom_text=desc_parts["description_custom_text"],
+            auto_hashtags=desc_parts["description_auto_hashtags"],
+        )
+        if 0 <= clip_index < len(self._moments) and isinstance(self._moments[clip_index], dict):
+            self._moments[clip_index]["montage_quality_explanation"] = quality_explanation
+            generated = self._moments[clip_index].get("generated_metadata")
+            if isinstance(generated, dict):
+                generated["montage_quality_explanation"] = quality_explanation
+        return {
+            "title": title,
+            "game_title": game_title,
+            "description": desc_parts["description"],
+            "tags": tags,
+            "metadata_file": metadata_file,
+        }
+
     def _selected_items_from_candidate_debug(self, payload: dict) -> list[dict]:
         """Rebuild the selected-evaluation shape from a candidate debug report."""
         items: list[dict] = []
@@ -6714,6 +8323,12 @@ class ApiBridge:
                 speech_stream = None
             commentary_guard_policy = normalize_commentary_subtitle_policy(audio_source_debug.get("subtitle_policy"))
             allow_stream_retry = bool(audio_source_debug.get("alternate_stream_retry", True))
+            manual_stream_locked = (
+                str(audio_source_debug.get("mode") or "").strip().lower() == "stream"
+                and speech_stream is not None
+            )
+            if manual_stream_locked:
+                allow_stream_retry = False
             commentary_guard_enabled = bool(
                 audio_source_debug.get(
                     "commentary_guard_enabled",
@@ -6790,9 +8405,12 @@ class ApiBridge:
                 m["game_identity"] = source_game_identity
                 m["game_context"] = source_game_context
                 m["clip_id"] = self._clip_id_for(m)
+                moment_stream = speech_stream if manual_stream_locked else m.get("speech_stream", speech_stream)
+                if manual_stream_locked:
+                    m["speech_stream"] = moment_stream
                 m["audio_source"] = {
                     "mode": audio_source_debug.get("mode", "auto"),
-                    "selected_stream": m.get("speech_stream", speech_stream),
+                    "selected_stream": moment_stream,
                     "selected_reason": audio_source_debug.get("selected_reason"),
                     "selected_confidence": audio_source_debug.get("selected_confidence"),
                     "runner_up_stream": audio_source_debug.get("runner_up_stream"),
@@ -6807,7 +8425,7 @@ class ApiBridge:
                     ),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
-                        selected_stream=m.get("speech_stream", speech_stream),
+                        selected_stream=moment_stream,
                     ),
                 }
                 m["stream_selection"] = m["audio_source"]["stream_selection"]
@@ -6861,7 +8479,7 @@ class ApiBridge:
                 self._clip_push(idx, total, "audio", 40, f"Clip {idx}/{total}: Final transcription...")
                 final_probe_end = min(end + 8, int(vid_duration))
                 final_words = []
-                final_stream = m.get("speech_stream", speech_stream)
+                final_stream = speech_stream if manual_stream_locked else m.get("speech_stream", speech_stream)
                 final_retry_report = None
                 if extract_audio_clip(video_path, start, final_probe_end, wav, audio_stream=final_stream):
                     final_words = transcribe_clip(wav, model_size=model, language=language)
@@ -6979,6 +8597,33 @@ class ApiBridge:
                     ),
                 }
                 m["stream_selection"] = m["audio_source"]["stream_selection"]
+                m["subtitle_enabled"] = bool(subtitle_enabled)
+                m["captions_requested"] = bool(subtitle_enabled)
+                m["speech_policy"] = _clip_speech_policy_summary(m)
+                if _creator_caption_speech_missing(
+                    m,
+                    subtitle_enabled=bool(subtitle_enabled),
+                    subtitle_policy=commentary_guard_policy,
+                ):
+                    m["final_render_rejected"] = True
+                    m["final_render_reject_reason"] = "no_selected_commentary_transcript"
+                    if m["speech_policy"].get("warning"):
+                        m["metadata_warning"] = m["speech_policy"]["warning"]
+                    m["metadata_needs_context"] = True
+                    run_warnings.append(f"clip_{idx}_no_selected_commentary_transcript")
+                    self._clip_push(
+                        idx,
+                        total,
+                        "subtitle",
+                        100,
+                        f"Clip {idx}/{total}: Skipped, no commentary transcript",
+                    )
+                    for stale in (wav, ass, out):
+                        try:
+                            stale.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    continue
 
                 crop_params = None
                 crop_w, crop_h = get_dimensions(video_path)
@@ -7017,6 +8662,11 @@ class ApiBridge:
                     ass_path = None
                 m["subtitle_generated"] = bool(ass_path)
                 m["subtitle_placement"] = resolved_subtitle_placement
+                m["processing_depth"] = processing_depth
+                m["speech_policy"] = _clip_speech_policy_summary(m)
+                if m["speech_policy"].get("warning"):
+                    m["metadata_warning"] = m["speech_policy"]["warning"]
+                m["metadata_needs_context"] = bool(m["speech_policy"].get("metadata_backfill_blocked"))
                 self._clip_push(
                     idx, total, "subtitle", 100,
                     "Subtitles generated" if ass_path else ("Captions disabled" if not subtitle_enabled else "No subtitles generated"),
@@ -7045,6 +8695,10 @@ class ApiBridge:
                     if clip_result.warning:
                         m["render_warning"] = clip_result.warning
                         run_warnings.append(f"clip_{idx}_{clip_result.warning}")
+                    m["speech_policy"] = _clip_speech_policy_summary(m)
+                    if m["speech_policy"].get("warning"):
+                        m["metadata_warning"] = m["speech_policy"]["warning"]
+                    m["metadata_needs_context"] = bool(m["speech_policy"].get("metadata_backfill_blocked"))
                     m["truth_summary"] = self._clip_truth_summary(m, clip_result.path)
                     done.append(clip_result.path)
                     done_moments.append(m)
@@ -7123,6 +8777,9 @@ class ApiBridge:
                         "subtitle_generated": m.get("subtitle_generated"),
                         "subtitles_burned": m.get("subtitles_burned"),
                         "subtitle_placement": m.get("subtitle_placement"),
+                        "speech_policy": m.get("speech_policy"),
+                        "metadata_warning": m.get("metadata_warning", ""),
+                        "metadata_needs_context": m.get("metadata_needs_context", False),
                         "render_warning": m.get("render_warning", ""),
                         "transcript": m.get("transcript", ""),
                         "recovered_from_candidate_debug": True,
@@ -7212,12 +8869,13 @@ class ApiBridge:
                 f"game_hint={'set' if game_title_hint else 'auto'}"
             )
             if generation_mode == "montage":
-                run_warnings.append("montage_renderer_pending")
+                montage_count = int(montage_settings.get("count") or 1)
                 print(
                     "[montage] Montage intent received "
                     f"(template={montage_settings.get('template')}, "
-                    f"target={montage_settings.get('target_duration')}s). "
-                    "Current build records the plan settings; montage rendering lands in a follow-up pass."
+                    f"target={montage_settings.get('target_duration')}s, "
+                    f"count={montage_count}). "
+                    "This run will build distinct storyboards from selected beats and render final hard-cut montages."
                 )
             clip_duration = _normalize_clip_duration(settings.get("clip_duration", CLIP_DURATION))
             min_gap = _normalize_min_gap(settings.get("min_gap", MIN_GAP))
@@ -7318,10 +8976,14 @@ class ApiBridge:
             source_audio_streams = [_public_audio_stream(s) for s in get_audio_streams(video_path)]
             source_audio_ordinals = {int(s["ordinal"]) for s in source_audio_streams}
             requested_stream = audio_source.get("stream")
+            try:
+                requested_stream_ordinal = int(requested_stream)
+            except (TypeError, ValueError):
+                requested_stream_ordinal = None
             forced_speech_stream = None
             if audio_source["mode"] == "stream":
-                if requested_stream in source_audio_ordinals:
-                    forced_speech_stream = int(requested_stream)
+                if requested_stream_ordinal in source_audio_ordinals:
+                    forced_speech_stream = int(requested_stream_ordinal)
                 else:
                     run_warnings.append("audio_source_stream_unavailable")
                     print(
@@ -7329,6 +8991,7 @@ class ApiBridge:
                         f"0:a:{requested_stream} is unavailable; falling back to auto"
                     )
             allow_stream_retry = forced_speech_stream is None
+            manual_stream_locked = forced_speech_stream is not None
             commentary_guard_policy = normalize_commentary_subtitle_policy(
                 audio_source.get("subtitle_policy", "creator")
             )
@@ -7428,21 +9091,72 @@ class ApiBridge:
             candidate_pool_cap = int(depth_profile.get("candidate_pool_cap") or 0)
             scene_mode = str(depth_profile["scene_mode"])
             candidate_model = _candidate_model_for_depth(processing_depth, model)
+            estimate_fingerprint = {
+                "generation_mode": generation_mode,
+                "montage_template": montage_settings.get("template"),
+                "montage_target_duration": montage_settings.get("target_duration"),
+                "candidate_whisper_model": candidate_model,
+                "scene_mode": scene_mode,
+                "candidate_multiplier": candidate_multiplier,
+                "candidate_pool_cap": candidate_pool_cap,
+                "visual_analysis": bool(
+                    visual_diagnostics_enabled
+                    if depth_profile["visual_diagnostics"] is None
+                    else depth_profile["visual_diagnostics"]
+                ),
+                "multimodal_analysis": bool(depth_profile.get("multimodal_analysis")),
+                "ai_moment_labels": bool(
+                    ai_moment_classification_enabled
+                    if depth_profile["ai_moment_classification"] is None
+                    else depth_profile["ai_moment_classification"]
+                ),
+                "moment_label_ranking": bool(
+                    moment_category_ranking_enabled
+                    if depth_profile["moment_category_ranking"] is None
+                    else depth_profile["moment_category_ranking"]
+                ),
+                "voice_profile_ranking": bool(
+                    voice_profile_ranking_enabled
+                    if depth_profile["voice_profile_ranking"] is None
+                    else depth_profile["voice_profile_ranking"]
+                ),
+                "game_context": bool(source_game_context_prompt.get("available")),
+                "subtitle_style": style,
+            }
             estimate_total_seconds, estimate_source = self._estimate_processing_seconds_from_history(
                 processing_depth,
                 vid_duration,
+                settings_fingerprint=estimate_fingerprint,
             )
+            eta_stage_plan = self._estimate_processing_stage_plan_from_history(
+                processing_depth,
+                vid_duration,
+                settings_fingerprint=estimate_fingerprint,
+            )
+            if eta_stage_plan and eta_stage_plan.get("estimatedTotalSeconds"):
+                estimate_total_seconds = float(eta_stage_plan["estimatedTotalSeconds"])
+                estimate_source = str(eta_stage_plan.get("source") or estimate_source)
             if estimate_total_seconds:
                 print(
                     "[timing] Local estimate for this run: "
                     f"{estimate_total_seconds:.0f}s ({estimate_source})"
                 )
-                self._active_progress_context = {
+                progress_context = {
                     **(self._active_progress_context or {}),
                     "estimatedTotalSeconds": round(float(estimate_total_seconds), 3),
                     "estimateSource": estimate_source,
                     "estimateStartedAt": time.time(),
                 }
+                if eta_stage_plan:
+                    progress_context.update(
+                        {
+                            "etaStagePlan": eta_stage_plan.get("stages") or {},
+                            "etaStageRates": eta_stage_plan.get("stageRates") or {},
+                            "etaStageSampleCount": int(eta_stage_plan.get("sampleCount") or 0),
+                            "etaStageConfidence": str(eta_stage_plan.get("confidence") or "low"),
+                        }
+                    )
+                self._active_progress_context = progress_context
             if depth_profile["visual_diagnostics"] is not None:
                 visual_diagnostics_enabled = bool(depth_profile["visual_diagnostics"])
             if depth_profile["ai_moment_classification"] is not None:
@@ -7547,33 +9261,37 @@ class ApiBridge:
             # moments. OBS track labels are often misleading.
             self._push("detect", 60, "Inspecting audio tracks...")
             speech_stream = None
+            stream_probe_samples = 2 if processing_depth == "fast" else (4 if processing_depth == "balanced" else 6)
+            stream_probe_seconds = 12 if processing_depth == "fast" else (16 if processing_depth == "balanced" else 20)
             if forced_speech_stream is not None:
                 speech_stream = forced_speech_stream
+                manual_selected_title = next(
+                    (
+                        stream.get("title")
+                        for stream in source_audio_streams
+                        if int(stream.get("ordinal", -1)) == speech_stream
+                    ),
+                    None,
+                )
                 audio_source_debug["stream_selection"] = {
                     "schema_version": 1,
                     "status": "forced",
                     "mode": "manual_stream",
                     "selection_impact": "user_selected_stream",
                     "selected_stream": speech_stream,
-                    "selected_title": next(
-                        (
-                            stream.get("title")
-                            for stream in source_audio_streams
-                            if int(stream.get("ordinal", -1)) == speech_stream
-                        ),
-                        None,
-                    ),
+                    "selected_title": manual_selected_title,
                     "selected_reason": "user_selected_stream",
                     "runner_up_stream": None,
                     "confidence": 1.0,
                     "stream_profiles": [],
                 }
                 self._push("detect", 62, f"Using selected transcription track 0:a:{speech_stream}")
-                print(f"[audio] User-selected transcription stream: 0:a:{speech_stream}")
+                print(
+                    "[audio] User-selected transcription stream locked: "
+                    f"0:a:{speech_stream} ({manual_selected_title or 'unknown title'})"
+                )
             else:
                 try:
-                    stream_probe_samples = 2 if processing_depth == "fast" else (4 if processing_depth == "balanced" else 6)
-                    stream_probe_seconds = 12 if processing_depth == "fast" else (16 if processing_depth == "balanced" else 20)
                     speech_stream = select_speech_stream(
                         video_path,
                         candidates,
@@ -7773,9 +9491,12 @@ class ApiBridge:
 
             with self._personalization_lock:
                 personalization_snapshot = json.loads(json.dumps(self._personalization))
+            with getattr(self, "_run_learning_lock", threading.RLock()):
+                run_learning_snapshot = json.loads(json.dumps(getattr(self, "_run_learning", empty_run_learning())))
             apply_learned_scoring(
                 evaluations,
                 personalization_snapshot,
+                run_learning=run_learning_snapshot,
                 source_id=source_id,
                 source_stem=source_stem,
             )
@@ -7789,6 +9510,7 @@ class ApiBridge:
                 evaluations,
                 learned_selected,
                 personalization_snapshot,
+                run_learning=run_learning_snapshot,
                 source_id=source_id,
                 source_stem=source_stem,
                 max_count=num_clips,
@@ -7869,6 +9591,18 @@ class ApiBridge:
                 score_key=category_score_key,
                 ai_score_key="ai_moment_quality_score",
             )
+            multimodal_max_count = int(depth_profile.get("multimodal_max_candidates") or 0)
+            if processing_depth == "deep" and multimodal_analysis_enabled:
+                selected_count_for_vision = len(ai_selected or [])
+                if selected_count_for_vision:
+                    multimodal_max_count = max(
+                        multimodal_max_count,
+                        min(
+                            len(evaluations),
+                            selected_count_for_vision + min(6, max(2, math.ceil(selected_count_for_vision * 0.18))),
+                        ),
+                    )
+                    multimodal_max_count = min(multimodal_max_count, 48)
             multimodal_analysis_report = self._analyze_multimodal_candidate_shortlist(
                 evaluations,
                 ai_selected,
@@ -7876,7 +9610,7 @@ class ApiBridge:
                 enabled=bool(processing_depth == "deep" and multimodal_analysis_enabled),
                 score_key=ai_score_key,
                 video_duration=float(vid_duration),
-                max_count=int(depth_profile.get("multimodal_max_candidates") or 0),
+                max_count=multimodal_max_count,
                 game_context=source_game_context,
             )
             multimodal_scoring = apply_multimodal_scoring(
@@ -8004,6 +9738,7 @@ class ApiBridge:
                     existing_selected=selected,
                     allow_partial=should_fill_partial,
                     reason=fallback_reason,
+                    subtitle_policy=commentary_guard_policy,
                 )
                 if fallback_selected:
                     selected = fallback_selected
@@ -8034,10 +9769,7 @@ class ApiBridge:
                             "[rank] Strict quality selected zero clips; "
                             f"using {len(selected)} near-quality fallback candidate(s)."
                         )
-            remaining_ai_ollama = max(
-                0,
-                min(8, len(selected)) - int(ai_moment_classification_shadow.get("ollama_attempted_count") or 0),
-            )
+            remaining_ai_ollama = min(8, len(selected))
             ai_moment_classification_report = self._classify_selected_moments(
                 selected,
                 video_path,
@@ -8085,11 +9817,17 @@ class ApiBridge:
             debug_path = SUBTITLES_DIR / f"{stem}_candidate_debug.json"
             run_debug_path = SUBTITLES_DIR / f"{stem}_run_debug.json"
             debug_settings = {
+                "generation_mode": generation_mode,
+                "montage": montage_settings,
                 "generation": {
                     "mode": generation_mode,
                     "montage": montage_settings,
-                    "montage_renderer_ready": False,
-                    "selection_impact": "none_currently_records_intent_only",
+                    "montage_renderer_ready": generation_mode == "montage",
+                    "selection_impact": (
+                        "storyboard_and_final_montage_render"
+                        if generation_mode == "montage"
+                        else "normal_clip_render"
+                    ),
                 },
                 "num_clips": num_clips,
                 "detection_preference": detection_preference,
@@ -8226,6 +9964,7 @@ class ApiBridge:
                         "montage_target_duration": montage_settings.get("target_duration"),
                         "candidate_whisper_model": candidate_model,
                         "scene_mode": scene_mode,
+                        "candidate_multiplier": candidate_multiplier,
                         "candidate_pool_cap": candidate_pool_cap,
                         "visual_analysis": bool(visual_diagnostics_enabled),
                         "multimodal_analysis": bool(multimodal_analysis_enabled),
@@ -8297,6 +10036,25 @@ class ApiBridge:
                 except Exception as e:
                     print(f"[timing] Failed to record no-quality processing history: {e}")
                 try:
+                    self._record_run_learning_summary(
+                        self._build_run_learning_summary(
+                            timing=no_quality_timing,
+                            video_path=video_path,
+                            source_id=source_id,
+                            source_stem=source_stem,
+                            game_title=source_game_context.get("label") or source_game_title,
+                            settings=debug_settings,
+                            candidates=candidates,
+                            evaluations=evaluations,
+                            selected=[],
+                            final_clips=[],
+                            debug_path=run_debug_path,
+                            status="no_quality_clips",
+                        )
+                    )
+                except Exception as e:
+                    print(f"[learning] Failed to record no-quality run summary: {e}")
+                try:
                     write_debug_report(
                         run_debug_path,
                         video_path,
@@ -8352,9 +10110,12 @@ class ApiBridge:
                 m["game_identity"] = source_game_identity
                 m["game_context"] = source_game_context
                 m["clip_id"] = self._clip_id_for(m)
+                moment_stream = speech_stream if manual_stream_locked else m.get("speech_stream", speech_stream)
+                if manual_stream_locked:
+                    m["speech_stream"] = moment_stream
                 m["audio_source"] = {
                     "mode": audio_source_debug.get("mode"),
-                    "selected_stream": m.get("speech_stream", speech_stream),
+                    "selected_stream": moment_stream,
                     "selected_reason": audio_source_debug.get("selected_reason"),
                     "selected_confidence": audio_source_debug.get("selected_confidence"),
                     "runner_up_stream": audio_source_debug.get("runner_up_stream"),
@@ -8366,7 +10127,7 @@ class ApiBridge:
                     "single_track_commentary_guard": audio_source_debug.get("single_track_commentary_guard"),
                     "stream_selection": _audio_stream_selection_summary(
                         audio_source_debug,
-                        selected_stream=m.get("speech_stream", speech_stream),
+                        selected_stream=moment_stream,
                     ),
                 }
                 m["stream_selection"] = m["audio_source"]["stream_selection"]
@@ -8377,13 +10138,330 @@ class ApiBridge:
             self._push("candidates", 100, f"Selected {len(moments)} good clips from {len(candidates)} candidates")
             self._js(f"window.onMomentsDetected({json.dumps(moments)})")
 
+            if generation_mode == "montage":
+                montage_started = time.monotonic()
+                montage_target = int(montage_settings.get("target_duration") or 60)
+                montage_requested_count = int(montage_settings.get("count") or 1)
+                montage_template = _normalize_montage_template(montage_settings.get("template"))
+                montage_story_shape = _montage_story_shape_for_template(montage_template)
+                self._push("render", 5, "Building montage storyboard...")
+                try:
+                    candidate_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(f"Could not read candidate debug for montage render: {exc}") from exc
+
+                audit = build_candidate_audit(
+                    candidate_payload,
+                    target_beats=3,
+                    target_duration_seconds=montage_target,
+                )
+                safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "latest"
+                audit_path = MONTAGES_DIR / f"{safe_stem}_montage_audit.json"
+                write_candidate_audit(audit_path, audit)
+
+                render_options = {
+                    "processing_depth": processing_depth,
+                    "subtitle_style": style,
+                    "subtitle_enabled": subtitle_enabled,
+                    "subtitle_placement": subtitle_placement,
+                    "crop_vertical": crop_vertical,
+                    "whisper_model": model,
+                    "whisper_language": language,
+                    "speech_stream": speech_stream,
+                    "allow_stream_retry": allow_stream_retry,
+                    "commentary_guard_policy": commentary_guard_policy,
+                    "commentary_guard_enabled": commentary_guard_enabled,
+                    "audio_source_debug": audio_source_debug,
+                }
+                used_montage_beat_ids: set[str] = set()
+                montage_results: list[dict] = []
+                storyboard_records: list[dict] = []
+                final_clip_debug: list[dict] = []
+                last_storyboard = None
+                last_storyboard_path = None
+                for montage_index in range(1, montage_requested_count + 1):
+                    self._push(
+                        "render",
+                        max(8, min(90, 8 + int((montage_index - 1) / max(1, montage_requested_count) * 72))),
+                        f"Building montage {montage_index}/{montage_requested_count} storyboard...",
+                    )
+                    storyboard = build_storyboard_from_audit(
+                        audit,
+                        target_duration_seconds=montage_target,
+                        story_shape=montage_story_shape,
+                        memory_enabled=True,
+                        render_quality="final",
+                        excluded_beat_ids=used_montage_beat_ids,
+                        storyboard_index=montage_index,
+                    )
+                    storyboard_path = MONTAGES_DIR / (
+                        f"{safe_stem}_montage_storyboard.json"
+                        if montage_requested_count == 1
+                        else f"{safe_stem}_montage_storyboard{montage_index}.json"
+                    )
+                    write_storyboard(storyboard_path, storyboard)
+                    last_storyboard = storyboard
+                    last_storyboard_path = storyboard_path
+                    beat_count = len(storyboard.get("beats") or [])
+                    if storyboard.get("status") == "no_storyboard" or beat_count <= 0:
+                        if montage_index == 1:
+                            run_warnings.append("montage_no_usable_beats")
+                        else:
+                            run_warnings.append("montage_requested_more_than_available")
+                        break
+
+                    self._push(
+                        "render",
+                        max(20, min(95, 20 + int((montage_index - 1) / max(1, montage_requested_count) * 70))),
+                        f"Rendering montage {montage_index}/{montage_requested_count} from {beat_count} beats...",
+                    )
+                    montage_result = self._render_montage_storyboard_payload(
+                        storyboard,
+                        storyboard_path=str(storyboard_path),
+                        final=True,
+                        render_options=render_options,
+                    )
+                    if not montage_result.get("ok"):
+                        if montage_results:
+                            run_warnings.append("montage_partial_render_failure")
+                            print(f"[montage] Stopping after partial render failure: {montage_result.get('error')}")
+                            break
+                        raise RuntimeError(montage_result.get("error") or "Montage render failed.")
+
+                    montage_results.append(montage_result)
+                    for beat in storyboard.get("beats") or []:
+                        if isinstance(beat, dict) and beat.get("beat_id"):
+                            used_montage_beat_ids.add(str(beat.get("beat_id")))
+                    clip_payload = montage_result.get("clip") if isinstance(montage_result.get("clip"), dict) else {}
+                    render_payload = montage_result.get("render") if isinstance(montage_result.get("render"), dict) else {}
+                    storyboard_records.append(
+                        {
+                            "index": montage_index,
+                            "path": montage_result.get("path"),
+                            "storyboard_path": str(storyboard_path),
+                            "storyboard_id": storyboard.get("storyboard_id"),
+                            "render_debug_path": montage_result.get("debug_path"),
+                            "beat_count": beat_count,
+                            "planned_duration_seconds": (storyboard.get("summary") or {}).get("planned_duration_seconds"),
+                        }
+                    )
+                    final_clip_debug.append(
+                        {
+                            "index": montage_index,
+                            "path": montage_result.get("path"),
+                            "clip_id": clip_payload.get("clip_id"),
+                            "source_id": source_id,
+                            "source_path": str(video_path),
+                            "source_stem": source_stem,
+                            "game_title": source_game_context.get("label") or source_game_title,
+                            "montage": True,
+                            "montage_template": montage_template,
+                            "montage_target_duration": montage_target,
+                            "montage_requested_count": montage_requested_count,
+                            "montage_story_shape": montage_story_shape,
+                            "montage_storyboard_id": storyboard.get("storyboard_id"),
+                            "montage_storyboard_path": str(storyboard_path),
+                            "montage_audit_path": str(audit_path),
+                            "montage_render_debug_path": montage_result.get("debug_path"),
+                            "montage_render_type": render_payload.get("render_type"),
+                            "beat_count": beat_count,
+                            "planned_duration_seconds": (storyboard.get("summary") or {}).get("planned_duration_seconds"),
+                            "size_bytes": render_payload.get("size_bytes"),
+                            "metadata": montage_result.get("metadata"),
+                        }
+                    )
+
+                stage_timings["montage_render"] = round(time.monotonic() - montage_started, 3)
+                if len(montage_results) < montage_requested_count:
+                    run_warnings.append(f"montage_requested_{montage_requested_count}_created_{len(montage_results)}")
+                if not montage_results:
+                    storyboard = last_storyboard or {}
+                    storyboard_path = last_storyboard_path or (MONTAGES_DIR / f"{safe_stem}_montage_storyboard.json")
+                    beat_count = len(storyboard.get("beats") or [])
+                    run_warnings.append("montage_no_usable_beats")
+                    final_timing = _timing_payload("no_montage_beats", rendered_clip_count=0)
+                    final_timing["montage"] = {
+                        "status": storyboard.get("status"),
+                        "requested_count": montage_requested_count,
+                        "created_count": 0,
+                        "audit_path": str(audit_path),
+                        "storyboard_path": str(storyboard_path),
+                        "beat_count": beat_count,
+                    }
+                    try:
+                        final_timing["history_summary_after_run"] = self._record_processing_history(final_timing)
+                    except Exception as e:
+                        print(f"[timing] Failed to record montage processing history: {e}")
+                    try:
+                        self._record_run_learning_summary(
+                            self._build_run_learning_summary(
+                                timing=final_timing,
+                                video_path=video_path,
+                                source_id=source_id,
+                                source_stem=source_stem,
+                                game_title=source_game_context.get("label") or source_game_title,
+                                settings=debug_settings,
+                                candidates=candidates,
+                                evaluations=evaluations,
+                                selected=selected,
+                                final_clips=[],
+                                debug_path=run_debug_path,
+                                status="no_montage_beats",
+                            )
+                        )
+                    except Exception as e:
+                        print(f"[learning] Failed to record montage no-output summary: {e}")
+                    write_debug_report(
+                        run_debug_path,
+                        video_path,
+                        candidates,
+                        evaluations,
+                        selected,
+                        scene_detection=scene_detection,
+                        settings=debug_settings,
+                        video_duration=vid_duration,
+                        final_clips=[],
+                        warnings=run_warnings,
+                        shadow_scoring=shadow_scoring,
+                        voice_profile_shadow=voice_profile_shadow,
+                        voice_profile_ranking=voice_profile_ranking,
+                        moment_category_ranking=moment_category_ranking,
+                        ai_moment_ranking=ai_moment_ranking,
+                        multimodal_ranking=multimodal_ranking,
+                        multi_signal_ai_ranking=multi_signal_ai_ranking,
+                        visual_diagnostics=visual_diagnostics_report,
+                        multimodal_analysis=multimodal_analysis_report,
+                        ai_moment_classification=ai_moment_classification_report,
+                        ai_moment_classification_shadow=ai_moment_classification_shadow,
+                        timing=final_timing,
+                        run_id=run_id,
+                        debug_stage="run_no_montage_beats",
+                    )
+                    details = {
+                        "completion_state": "no_montage_beats",
+                        "message": "No montage could be assembled from this run.",
+                        "guidance": "Try Balanced or Deep Analysis, a longer source, or a broader montage template.",
+                        "requested_count": montage_requested_count,
+                        "created_count": 0,
+                        "audit_path": str(audit_path),
+                        "storyboard_path": str(storyboard_path),
+                        "beat_count": beat_count,
+                    }
+                    self._save_state()
+                    self._js(f"window.onPipelineComplete(true, 0, 1, null, {json.dumps(details)})")
+                    return
+
+                final_timing = _timing_payload("success", rendered_clip_count=len(montage_results))
+                final_timing["auto_metadata_count"] = sum(1 for item in montage_results if item.get("metadata"))
+                final_timing["montage"] = {
+                    "status": "rendered",
+                    "template": montage_template,
+                    "target_duration": montage_target,
+                    "requested_count": montage_requested_count,
+                    "created_count": len(montage_results),
+                    "story_shape": montage_story_shape,
+                    "audit_path": str(audit_path),
+                    "storyboards": storyboard_records,
+                }
+                try:
+                    final_timing["history_summary_after_run"] = self._record_processing_history(final_timing)
+                except Exception as e:
+                    print(f"[timing] Failed to record montage processing history: {e}")
+                try:
+                    self._record_run_learning_summary(
+                        self._build_run_learning_summary(
+                            timing=final_timing,
+                            video_path=video_path,
+                            source_id=source_id,
+                            source_stem=source_stem,
+                            game_title=source_game_context.get("label") or source_game_title,
+                            settings=debug_settings,
+                            candidates=candidates,
+                            evaluations=evaluations,
+                            selected=selected,
+                            final_clips=final_clip_debug,
+                            debug_path=run_debug_path,
+                            status="success",
+                        )
+                    )
+                except Exception as e:
+                    print(f"[learning] Failed to record montage run summary: {e}")
+                write_debug_report(
+                    run_debug_path,
+                    video_path,
+                    candidates,
+                    evaluations,
+                    selected,
+                    scene_detection=scene_detection,
+                    settings=debug_settings,
+                    video_duration=vid_duration,
+                    final_clips=final_clip_debug,
+                    warnings=run_warnings,
+                    shadow_scoring=shadow_scoring,
+                    voice_profile_shadow=voice_profile_shadow,
+                    voice_profile_ranking=voice_profile_ranking,
+                    moment_category_ranking=moment_category_ranking,
+                    ai_moment_ranking=ai_moment_ranking,
+                    multimodal_ranking=multimodal_ranking,
+                    multi_signal_ai_ranking=multi_signal_ai_ranking,
+                    visual_diagnostics=visual_diagnostics_report,
+                    multimodal_analysis=multimodal_analysis_report,
+                    ai_moment_classification=ai_moment_classification_report,
+                    ai_moment_classification_shadow=ai_moment_classification_shadow,
+                    timing=final_timing,
+                    run_id=run_id,
+                )
+                print(f"[montage] Final montages saved: {len(montage_results)}")
+                self._push("render", 100, f"{len(montage_results)} montage{'s' if len(montage_results) != 1 else ''} created")
+                self._save_state()
+                first_result = montage_results[0]
+                created_count = len(montage_results)
+                details = {
+                    "completion_state": "montage_created",
+                    "message": (
+                        f"Created {created_count} montage{'s' if created_count != 1 else ''}."
+                        if created_count == montage_requested_count
+                        else f"Created {created_count} of {montage_requested_count} requested montages from the available beats."
+                    ),
+                    "path": first_result.get("path"),
+                    "paths": [item.get("path") for item in montage_results if item.get("path")],
+                    "requested_count": montage_requested_count,
+                    "created_count": created_count,
+                    "beat_count": sum(int((record or {}).get("beat_count") or 0) for record in storyboard_records),
+                    "storyboard_path": storyboard_records[0]["storyboard_path"] if storyboard_records else "",
+                    "storyboards": storyboard_records,
+                    "debug_path": str(run_debug_path),
+                }
+                self._js(f"window.onPipelineComplete(true, {created_count}, 1, null, {json.dumps(details)})")
+                return
+
             # ── 4. Render accepted clips ──────────────────────────────
             done: list[Path] = []
             done_moments: list[dict] = []
             final_clip_debug: list[dict] = []
             total = len(selected)
+            render_queue = list(selected)
+            if processing_depth == "deep" and total > 0:
+                selected_ids = {id(row) for row in selected}
+                backup_selection = select_near_quality_fallback_candidates(
+                    evaluations,
+                    total + min(6, max(2, total // 4)),
+                    min_gap=min_gap,
+                    score_key=selection_score_key,
+                    existing_selected=selected,
+                    allow_partial=True,
+                    reason="final_creator_speech_replacement_pool",
+                    subtitle_policy=commentary_guard_policy,
+                )
+                backups = [row for row in backup_selection if id(row) not in selected_ids]
+                if backups:
+                    render_queue.extend(backups)
+                    run_warnings.append("final_render_replacement_pool_available")
+            render_started = time.monotonic()
 
-            for idx, item in enumerate(selected, 1):
+            for idx, item in enumerate(render_queue, 1):
+                if len(done) >= total:
+                    break
                 if self._cancel:
                     return self._cancelled()
                 m = item["moment"]
@@ -8409,7 +10487,7 @@ class ApiBridge:
                 m["render_start"] = start
                 m["render_end"] = end
                 m["render_duration"] = end - start
-                clip_num = idx
+                clip_num = len(done) + 1
                 out = self._unique_clip_output_path(stem, clip_num)
                 wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
                 ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
@@ -8422,7 +10500,7 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "audio", 40, f"Clip {clip_num}/{total}: Final transcription...")
                 final_probe_end = min(end + 8, int(vid_duration))
                 final_words = []
-                final_stream = m.get("speech_stream", speech_stream)
+                final_stream = speech_stream if manual_stream_locked else m.get("speech_stream", speech_stream)
                 final_retry_report = None
                 if extract_audio_clip(video_path, start, final_probe_end, wav, audio_stream=final_stream):
                     final_words = transcribe_clip(wav, model_size=model, language=language)
@@ -8446,6 +10524,14 @@ class ApiBridge:
                     if voice_profile_debug.get("ranking_active")
                     else self._voice_profile_inactive_score(voice_profile_snapshot)
                 )
+
+                if not final_words:
+                    words = []
+                    m["word_count"] = 0
+                    m["subtitle_word_count"] = 0
+                    m["analysis_word_count"] = 0
+                    m["transcript"] = ""
+                    m["final_transcription_warning"] = "no_final_words"
 
                 if final_words:
                     final_stream_profile = _selected_audio_stream_profile(
@@ -8624,6 +10710,31 @@ class ApiBridge:
                 m["subtitle_style"] = style
                 m["captions_requested"] = bool(subtitle_enabled)
                 m["subtitle_enabled"] = bool(subtitle_enabled)
+                m["speech_policy"] = _clip_speech_policy_summary(m)
+                if _creator_caption_speech_missing(
+                    m,
+                    subtitle_enabled=bool(subtitle_enabled),
+                    subtitle_policy=commentary_guard_policy,
+                ):
+                    m["final_render_rejected"] = True
+                    m["final_render_reject_reason"] = "no_selected_commentary_transcript"
+                    if m["speech_policy"].get("warning"):
+                        m["metadata_warning"] = m["speech_policy"]["warning"]
+                    m["metadata_needs_context"] = True
+                    run_warnings.append(f"clip_{clip_num}_no_selected_commentary_transcript")
+                    self._clip_push(
+                        clip_num,
+                        total,
+                        "subtitle",
+                        100,
+                        f"Clip {clip_num}/{total}: Skipped, no commentary transcript",
+                    )
+                    for stale in (wav, ass, out):
+                        try:
+                            stale.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    continue
 
                 self._clip_push(clip_num, total, "audio", 100, f"Clip {clip_num}/{total}: Preparing...")
 
@@ -8669,6 +10780,11 @@ class ApiBridge:
                     ass_path = None
                 m["subtitle_generated"] = bool(ass_path)
                 m["subtitle_placement"] = resolved_subtitle_placement
+                m["processing_depth"] = processing_depth
+                m["speech_policy"] = _clip_speech_policy_summary(m)
+                if m["speech_policy"].get("warning"):
+                    m["metadata_warning"] = m["speech_policy"]["warning"]
+                m["metadata_needs_context"] = bool(m["speech_policy"].get("metadata_backfill_blocked"))
                 self._clip_push(
                     clip_num, total, "subtitle", 100,
                     "Subtitles generated" if ass_path else ("Captions disabled" if not subtitle_enabled else "No subtitles generated"),
@@ -8697,6 +10813,10 @@ class ApiBridge:
                     if clip_result.warning:
                         m["render_warning"] = clip_result.warning
                         run_warnings.append(f"clip_{clip_num}_{clip_result.warning}")
+                    m["speech_policy"] = _clip_speech_policy_summary(m)
+                    if m["speech_policy"].get("warning"):
+                        m["metadata_warning"] = m["speech_policy"]["warning"]
+                    m["metadata_needs_context"] = bool(m["speech_policy"].get("metadata_backfill_blocked"))
 
                     # Post-processing: apply video effect
                     if effect and effect != "none":
@@ -8828,6 +10948,9 @@ class ApiBridge:
                             "subtitle_generated": m.get("subtitle_generated"),
                             "subtitles_burned": m.get("subtitles_burned"),
                             "subtitle_placement": m.get("subtitle_placement"),
+                            "speech_policy": m.get("speech_policy"),
+                            "metadata_warning": m.get("metadata_warning", ""),
+                            "metadata_needs_context": m.get("metadata_needs_context", False),
                             "render_warning": m.get("render_warning", ""),
                             "transcript": m.get("transcript", ""),
                         }
@@ -8848,21 +10971,43 @@ class ApiBridge:
                     pass
 
             # Append results (batch mode: preserve previous video's clips)
+            stage_timings["final_render"] = round(time.monotonic() - render_started, 3)
             first_new_clip_index = len(self._results)
             self._results.extend(done)
             self._moments.extend(done_moments)
+            metadata_started = time.monotonic()
             auto_metadata = self._generate_auto_metadata_for_results(
                 first_new_clip_index,
                 len(done),
                 final_clip_debug,
                 run_warnings,
             ) if done else []
+            stage_timings["auto_metadata"] = round(time.monotonic() - metadata_started, 3)
             final_timing = _timing_payload("success", rendered_clip_count=len(done))
             final_timing["auto_metadata_count"] = len(auto_metadata)
             try:
                 final_timing["history_summary_after_run"] = self._record_processing_history(final_timing)
             except Exception as e:
                 print(f"[timing] Failed to record processing history: {e}")
+            try:
+                self._record_run_learning_summary(
+                    self._build_run_learning_summary(
+                        timing=final_timing,
+                        video_path=video_path,
+                        source_id=source_id,
+                        source_stem=source_stem,
+                        game_title=source_game_context.get("label") or source_game_title,
+                        settings=debug_settings,
+                        candidates=candidates,
+                        evaluations=evaluations,
+                        selected=selected,
+                        final_clips=final_clip_debug,
+                        debug_path=run_debug_path,
+                        status="success",
+                    )
+                )
+            except Exception as e:
+                print(f"[learning] Failed to record run summary: {e}")
             try:
                 write_debug_report(
                     run_debug_path,
@@ -9037,7 +11182,7 @@ class ApiBridge:
             if progress_stage == "candidates":
                 pct = int(progress_percent) if progress_percent is not None else 0
                 self._push("candidates", pct, f"Candidate {clip_num}/{total}: trying audio track {ordinal + 1}...")
-            else:
+            elif progress_stage != "silent":
                 self._clip_push(
                     clip_num, total, "transcribe", 40,
                     f"Clip {clip_num}/{total}: Trying audio track {ordinal + 1}..."
@@ -9638,7 +11783,7 @@ class ApiBridge:
         return backup
 
     def _write_json_atomic(self, path: Path, data: dict):
-        path.parent.mkdir(exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             with tmp.open("w", encoding="utf-8", newline="\n") as f:
@@ -9694,6 +11839,157 @@ class ApiBridge:
                 self._write_json_atomic(PROCESSING_HISTORY_FILE, data)
             except Exception as e:
                 print(f"[timing] Failed to save processing history: {e}")
+
+    def _save_run_learning(self):
+        """Persist compact local outcome memory used by future clip/montage learning."""
+        lock = getattr(self, "_run_learning_lock", threading.RLock())
+        self._run_learning_lock = lock
+        with lock:
+            self._run_learning = sanitize_run_learning(getattr(self, "_run_learning", empty_run_learning()))
+            try:
+                self._write_json_atomic(RUN_LEARNING_FILE, self._run_learning)
+            except Exception as e:
+                print(f"[learning] Failed to save run learning: {e}")
+
+    def _load_run_learning(self):
+        """Load compact local outcome memory for future clip and montage learning."""
+        if not RUN_LEARNING_FILE.exists():
+            self._run_learning = empty_run_learning()
+            self._save_run_learning()
+            return
+        lock = getattr(self, "_run_learning_lock", threading.RLock())
+        self._run_learning_lock = lock
+        with lock:
+            try:
+                data = json.loads(RUN_LEARNING_FILE.read_text(encoding="utf-8"))
+                self._run_learning = sanitize_run_learning(data)
+                if data.get("schema_version") != RUN_LEARNING_SCHEMA_VERSION:
+                    self._save_run_learning()
+                summary = run_learning_redacted_summary(self._run_learning)
+                print(
+                    "[learning] Restored run learning: "
+                    f"{summary.get('run_count', 0)} run(s), "
+                    f"{summary.get('event_count', 0)} event(s)"
+                )
+            except Exception as e:
+                backup = self._backup_json_file(RUN_LEARNING_FILE, "corrupt")
+                if backup:
+                    print(f"[learning] Backed up corrupt run learning file: {backup}")
+                print(f"[learning] Failed to load run learning: {e}")
+                self._run_learning = empty_run_learning()
+
+    def _record_run_learning_event(self, event: dict):
+        if not isinstance(event, dict):
+            return
+        lock = getattr(self, "_run_learning_lock", threading.RLock())
+        self._run_learning_lock = lock
+        with lock:
+            self._run_learning = append_run_learning_event(
+                getattr(self, "_run_learning", empty_run_learning()),
+                event,
+            )
+            self._save_run_learning()
+
+    def _record_run_learning_summary(self, summary: dict):
+        if not isinstance(summary, dict):
+            return
+        lock = getattr(self, "_run_learning_lock", threading.RLock())
+        self._run_learning_lock = lock
+        with lock:
+            self._run_learning = append_run_summary(
+                getattr(self, "_run_learning", empty_run_learning()),
+                summary,
+            )
+            self._save_run_learning()
+
+    def _build_run_learning_summary(
+        self,
+        *,
+        timing: dict,
+        video_path: Path,
+        source_id: str,
+        source_stem: str,
+        game_title: str,
+        settings: dict,
+        candidates: list[dict],
+        evaluations: list[dict],
+        selected: list[dict],
+        final_clips: list[dict] | None,
+        debug_path: Path,
+        status: str,
+    ) -> dict:
+        selected_snapshots: list[dict] = []
+        selected_clip_ids: list[str] = []
+        for row in selected or []:
+            if not isinstance(row, dict):
+                continue
+            moment = row.get("moment") if isinstance(row.get("moment"), dict) else {}
+            if not moment:
+                moment = row.get("selection_moment") if isinstance(row.get("selection_moment"), dict) else {}
+            if not isinstance(moment, dict):
+                continue
+            snapshot = dict(moment)
+            snapshot.setdefault("source_id", source_id)
+            snapshot.setdefault("source_stem", source_stem)
+            snapshot.setdefault("source_path", str(video_path))
+            snapshot.setdefault("game_title", game_title)
+            snapshot = self._ensure_moment_identity(snapshot, video_path)
+            selected_clip_ids.append(snapshot.get("clip_id", ""))
+            selected_snapshots.append(compact_clip_snapshot(snapshot))
+
+        feature_status = {}
+        if isinstance(settings, dict):
+            feature_status = settings.get("local_analysis_feature_statuses")
+            if not isinstance(feature_status, dict):
+                feature_status = {
+                    key: value
+                    for key, value in {
+                        "visual_diagnostics": settings.get("visual_diagnostics"),
+                        "multimodal_analysis": settings.get("multimodal_analysis"),
+                        "moment_category_ranking": settings.get("moment_category_ranking"),
+                        "ai_moment_ranking": settings.get("ai_moment_ranking"),
+                        "voice_profile_ranking": settings.get("voice_profile_ranking"),
+                    }.items()
+                    if isinstance(value, dict)
+                }
+
+        return {
+            "run_id": str((timing or {}).get("run_id") or ""),
+            "status": status,
+            "source_id": source_id,
+            "source_stem": source_stem,
+            "game_title": game_title,
+            "debug_path": str(debug_path),
+            "timing": timing or {},
+            "settings": settings or {},
+            "video_duration_seconds": (timing or {}).get("video_duration_seconds"),
+            "candidate_count": len(candidates or []),
+            "accepted_candidate_count": sum(1 for item in evaluations or [] if isinstance(item, dict) and item.get("accepted")),
+            "selected_count": len(selected or []),
+            "rendered_clip_count": len(final_clips or []),
+            "selected_clip_ids": [item for item in selected_clip_ids if item],
+            "selected": selected_snapshots,
+            "final_clips": final_clips or [],
+            "feature_status": feature_status,
+        }
+
+    def get_run_learning_summary(self):
+        """Return a redacted local learning summary for diagnostics/settings UI."""
+        lock = getattr(self, "_run_learning_lock", threading.RLock())
+        self._run_learning_lock = lock
+        with lock:
+            data = sanitize_run_learning(getattr(self, "_run_learning", empty_run_learning()))
+            try:
+                size = RUN_LEARNING_FILE.stat().st_size if RUN_LEARNING_FILE.exists() else 0
+            except Exception:
+                size = 0
+        return {
+            "path": str(RUN_LEARNING_FILE),
+            "exists": RUN_LEARNING_FILE.exists(),
+            "size_bytes": size,
+            "local_only": True,
+            **run_learning_redacted_summary(data),
+        }
 
     def _load_voice_profile(self):
         """Load the local creator voice profile."""

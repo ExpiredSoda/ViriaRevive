@@ -1020,6 +1020,12 @@ textarea:focus-visible,
     max-width: 100%;
 }
 
+.truth-chip.is-warning {
+    color: var(--warning);
+    border-color: rgba(253,203,110,0.30);
+    background: rgba(253,203,110,0.08);
+}
+
 .truth-chip-btn {
     cursor: pointer;
     color: var(--accent-light);
@@ -3170,6 +3176,13 @@ textarea:focus-visible,
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+}
+.output-folder-input {
+    font-size: 11px;
+    text-overflow: ellipsis;
+}
+.output-folder-actions {
+    margin-top: 8px;
 }
 
 @media (max-width: 640px) {

@@ -13,12 +13,13 @@ import json
 import math
 import re
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 from title_generator import OLLAMA_URL, list_ollama_models
 from game_context import compact_game_context_for_prompt
-from visual_diagnostics import _candidate_sample_times, _read_frame_at
+from visual_diagnostics import _candidate_sample_times, _read_frame_at, score_visual_frames
 from speech_source_classifier import positive_boost_block_reason as speech_source_positive_boost_block_reason
 
 
@@ -26,6 +27,7 @@ MULTIMODAL_ANALYSIS_SCHEMA_VERSION = 1
 MULTIMODAL_SELECTION_SCHEMA_VERSION = 1
 MULTIMODAL_SELECTION_MAX_ADJUSTMENT = 0.020
 VISION_ANALYSIS_TIMEOUT = 35
+VISION_PREFLIGHT_TIMEOUT = 45
 VISION_FRAME_WIDTH = 512
 VISION_JPEG_QUALITY = 82
 DEFAULT_VISION_MODEL = "qwen3-vl:latest"
@@ -87,6 +89,11 @@ REJECT_FLAGS = {
     "only_static_overlay",
     "unclear_frames",
 }
+_VISION_TEST_IMAGE = (
+    # A valid 1x1 PNG. Keep this tiny so the preflight checks capability, not speed.
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+_VISION_PREFLIGHT_CACHE: dict[str, dict] = {}
 
 
 def select_ollama_vision_model(models: list[str] | None = None) -> str:
@@ -123,9 +130,73 @@ def ollama_vision_status(models: list[str] | None = None) -> dict:
         "running": bool(installed),
         "model_ready": bool(model),
         "model": model,
+        "preferred_model": DEFAULT_VISION_MODEL,
         "models": installed,
         "supported_model_hints": list(VISION_MODEL_NAME_HINTS),
     }
+
+
+def preflight_ollama_vision_model(
+    model: str,
+    *,
+    timeout: int = VISION_PREFLIGHT_TIMEOUT,
+    force: bool = False,
+) -> dict:
+    """Verify an installed Ollama model actually accepts image input."""
+    selected_model = str(model or "").strip()
+    if not selected_model:
+        return {
+            "schema_version": MULTIMODAL_ANALYSIS_SCHEMA_VERSION,
+            "status": "model_missing",
+            "model": "",
+            "ok": False,
+        }
+    cache_key = selected_model.lower()
+    if not force and cache_key in _VISION_PREFLIGHT_CACHE:
+        cached = dict(_VISION_PREFLIGHT_CACHE[cache_key])
+        cached["cached"] = True
+        return cached
+    started = time.monotonic()
+    prompt = (
+        "This is a vision capability check for a local app. Inspect the image and "
+        "return exactly JSON: {\"primary_visual_label\":\"unclear\",\"confidence\":0.5}."
+    )
+    try:
+        response = _ask_ollama_vision_json(
+            prompt,
+            [_VISION_TEST_IMAGE],
+            selected_model,
+            timeout=max(3, int(timeout or VISION_PREFLIGHT_TIMEOUT)),
+        )
+    except TimeoutError as exc:
+        result = {
+            "schema_version": MULTIMODAL_ANALYSIS_SCHEMA_VERSION,
+            "status": "timeout",
+            "model": selected_model,
+            "ok": False,
+            "error": str(exc)[:180],
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    except Exception as exc:
+        result = {
+            "schema_version": MULTIMODAL_ANALYSIS_SCHEMA_VERSION,
+            "status": "ollama_error",
+            "model": selected_model,
+            "ok": False,
+            "error": str(exc)[:180],
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    else:
+        ok = isinstance(response, dict) and bool(response)
+        result = {
+            "schema_version": MULTIMODAL_ANALYSIS_SCHEMA_VERSION,
+            "status": "ok" if ok else "bad_json",
+            "model": selected_model,
+            "ok": ok,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    _VISION_PREFLIGHT_CACHE[cache_key] = dict(result)
+    return result
 
 
 def analyze_candidate_frames_with_ollama(
@@ -139,7 +210,7 @@ def analyze_candidate_frames_with_ollama(
     video_duration: float = 0.0,
     enabled: bool = True,
     model: str | None = None,
-    max_frames: int = 3,
+    max_frames: int = 6,
     timeout: int = VISION_ANALYSIS_TIMEOUT,
 ) -> dict:
     """Analyze sampled candidate frames with a local Ollama vision model."""
@@ -164,6 +235,7 @@ def analyze_candidate_frames_with_ollama(
         game_title,
         game_context=game_context,
         learning_context=learning_context,
+        frames=frames,
     )
     try:
         response = _ask_ollama_vision_json(
@@ -173,6 +245,22 @@ def analyze_candidate_frames_with_ollama(
             timeout=timeout,
         )
     except TimeoutError as exc:
+        retry = _retry_ollama_vision(
+            prompt,
+            frames,
+            selected_model,
+            timeout=max(8, min(int(timeout or VISION_ANALYSIS_TIMEOUT), 18)),
+        )
+        if isinstance(retry, dict):
+            clean = sanitize_vision_analysis(
+                retry,
+                model=selected_model,
+                frames=frames[: min(3, len(frames))],
+                elapsed=time.monotonic() - started,
+                fallback_used=True,
+            )
+            clean["initial_status"] = "timeout"
+            return clean
         return _empty_analysis(
             "timeout",
             model=selected_model,
@@ -189,12 +277,23 @@ def analyze_candidate_frames_with_ollama(
             elapsed=time.monotonic() - started,
         )
 
-    clean = sanitize_vision_analysis(
-        response,
-        model=selected_model,
-        frames=frames,
-        elapsed=time.monotonic() - started,
-    )
+    clean = sanitize_vision_analysis(response, model=selected_model, frames=frames, elapsed=time.monotonic() - started)
+    if clean["status"] == "invalid_response" and len(frames) > 3:
+        retry = _retry_ollama_vision(
+            prompt,
+            frames,
+            selected_model,
+            timeout=max(8, min(int(timeout or VISION_ANALYSIS_TIMEOUT), 18)),
+        )
+        if isinstance(retry, dict):
+            clean = sanitize_vision_analysis(
+                retry,
+                model=selected_model,
+                frames=frames[:3],
+                elapsed=time.monotonic() - started,
+                fallback_used=True,
+            )
+            clean["initial_status"] = "bad_json"
     if clean["status"] == "ok":
         print(
             "[vision] "
@@ -468,15 +567,102 @@ def _extract_frame_images(
         return []
     path = Path(video_path)
     frames = []
-    for sample_time in _candidate_sample_times(candidate, float(video_duration or 0.0))[: max(1, int(max_frames or 1))]:
+    last_small = None
+    for sample_time, source in _candidate_frame_packet_times(candidate, float(video_duration or 0.0)):
         ok, frame, status = _read_frame_at(cv2, path, sample_time, timeout=5.0)
         if not ok or frame is None:
             continue
+        summary = score_visual_frames([frame], sample_times=[round(float(sample_time), 3)])
+        if _is_unhelpful_vision_frame(summary):
+            continue
+        small = _small_gray_for_duplicate_check(cv2, frame)
+        if last_small is not None and _frame_difference(last_small, small) < 0.018:
+            continue
+        last_small = small
         image = _encode_frame(cv2, frame)
         if not image:
             continue
-        frames.append({"time": round(float(sample_time), 3), "image": image, "read_status": status})
+        frames.append(
+            {
+                "time": round(float(sample_time), 3),
+                "source": source,
+                "image": image,
+                "read_status": status,
+                "visual_summary": {
+                    "visual_energy": summary.get("visual_energy"),
+                    "black_frame_ratio": summary.get("black_frame_ratio"),
+                    "ui_density": summary.get("ui_density"),
+                    "labels": summary.get("labels", []),
+                },
+            }
+        )
+        if len(frames) >= max(1, int(max_frames or 1)):
+            break
     return frames
+
+
+def _candidate_frame_packet_times(candidate: dict, video_duration: float) -> list[tuple[float, str]]:
+    start = _safe_float(candidate.get("start"), 0.0) or 0.0
+    end = _safe_float(candidate.get("end"), start + 1.0) or (start + 1.0)
+    if end <= start:
+        end = start + 1.0
+    duration = max(0.1, end - start)
+    peak = _safe_float(candidate.get("peak_time"), start + duration * 0.5) or (start + duration * 0.5)
+    raw: list[tuple[float, str]] = [
+        (start + min(1.0, duration * 0.08), "early_context"),
+        (start + duration * 0.18, "setup"),
+        (start + duration * 0.35, "rising_action"),
+        (peak, "candidate_peak"),
+        (start + duration * 0.62, "payoff"),
+        (start + duration * 0.82, "late_context"),
+        (max(start, end - min(1.0, duration * 0.08)), "final_frame"),
+    ]
+    visual = candidate.get("visual_diagnostics") if isinstance(candidate.get("visual_diagnostics"), dict) else {}
+    for value in visual.get("sample_times") or []:
+        raw.append((_safe_float(value, start) or start, "local_visual_sample"))
+    for value in _candidate_sample_times(candidate, video_duration):
+        raw.append((_safe_float(value, start) or start, "default_sample"))
+    duration_limit = max(0.0, float(video_duration or 0.0))
+    times: list[tuple[float, str]] = []
+    for value, source in raw:
+        value = max(0.0, float(value))
+        if duration_limit > 0:
+            value = min(duration_limit, value)
+        rounded = round(value, 3)
+        if all(abs(rounded - existing) >= 0.4 for existing, _ in times):
+            times.append((rounded, source))
+    times.sort(key=lambda row: row[0])
+    return times
+
+
+def _is_unhelpful_vision_frame(summary: dict) -> bool:
+    if not isinstance(summary, dict) or summary.get("status") != "ok":
+        return True
+    black = _safe_float(summary.get("black_frame_ratio"), 0.0) or 0.0
+    brightness = _safe_float(summary.get("brightness"), 0.0) or 0.0
+    energy = _safe_float(summary.get("visual_energy"), 0.0) or 0.0
+    ui_density = _safe_float(summary.get("ui_density"), 0.0) or 0.0
+    if black >= 0.75:
+        return True
+    if brightness < 0.055 and energy < 0.08:
+        return True
+    if ui_density >= 0.88 and energy < 0.12:
+        return True
+    return False
+
+
+def _small_gray_for_duplicate_check(cv2, frame):
+    small = cv2.resize(frame, (48, 48), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return gray
+
+
+def _frame_difference(previous, current) -> float:
+    try:
+        import numpy as np
+        return float(np.mean(np.abs(current.astype("float32") - previous.astype("float32"))) / 255.0)
+    except Exception:
+        return 1.0
 
 
 def _encode_frame(cv2, frame) -> str:
@@ -497,6 +683,7 @@ def _build_vision_prompt(
     *,
     game_context: dict | None = None,
     learning_context: dict | None = None,
+    frames: list[dict] | None = None,
 ) -> str:
     learning = learning_context if isinstance(learning_context, dict) else {}
     game_knowledge = compact_game_context_for_prompt(game_context)
@@ -528,11 +715,20 @@ def _build_vision_prompt(
             "variance_score": candidate.get("variance_score"),
             "visual_diagnostics": candidate.get("visual_diagnostics"),
         },
+        "frame_packet": [
+            {
+                "index": idx + 1,
+                "time": row.get("time"),
+                "source": row.get("source"),
+                "local_visual_summary": row.get("visual_summary"),
+            }
+            for idx, row in enumerate(frames or [])
+        ],
         "transcript_preview": _prompt_safe_text(transcript, limit=900),
     }
     return (
         "You inspect sampled frames from a gameplay clip for a local Shorts clipping app.\n"
-        "Use the images plus transcript preview. Use game knowledge as background only. "
+        "Use the ordered image packet plus transcript preview. Frame order and timestamps are listed in Clip metadata JSON. Use game knowledge as background only. "
         "Do not invent game names, enemy names, places, or events.\n"
         "Return exactly one JSON object with this schema:\n"
         "{\"primary_visual_label\":\"allowed label\",\"visible_summary\":\"short grounded visual summary\","
@@ -571,9 +767,27 @@ def _ask_ollama_vision_json(prompt: str, images: list[str], model: str, *, timeo
             data = json.loads(resp.read())
     except TimeoutError:
         raise
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Ollama HTTP {exc.code}: {detail[:260]}") from exc
     response = _ollama_response_text(data)
     parsed = _extract_json_object(response)
     return parsed if isinstance(parsed, dict) else None
+
+
+def _retry_ollama_vision(prompt: str, frames: list[dict], model: str, *, timeout: int) -> dict | None:
+    retry_frames = frames[: min(3, len(frames))]
+    if not retry_frames:
+        return None
+    return _ask_ollama_vision_json(
+        prompt + "\nRetry mode: use the smaller first-frame packet and return only valid JSON.",
+        [row["image"] for row in retry_frames],
+        model,
+        timeout=timeout,
+    )
 
 
 def sanitize_vision_analysis(
@@ -582,6 +796,7 @@ def sanitize_vision_analysis(
     model: str = "",
     frames: list[dict] | None = None,
     elapsed: float = 0.0,
+    fallback_used: bool = False,
 ) -> dict:
     if not isinstance(response, dict):
         return _empty_analysis("invalid_response", model=model, frames=frames, elapsed=elapsed)
@@ -624,6 +839,7 @@ def sanitize_vision_analysis(
         "confidence": round(confidence, 4),
         "ranking_adjustment": round(adjustment, 4),
         "reject_flags": reject_flags,
+        "fallback_used": bool(fallback_used),
         "elapsed_seconds": round(float(elapsed or 0.0), 3),
     }
 
@@ -653,6 +869,7 @@ def _empty_analysis(
         "confidence": 0.0,
         "ranking_adjustment": 0.0,
         "reject_flags": [],
+        "fallback_used": False,
         "error": error,
         "elapsed_seconds": round(float(elapsed or 0.0), 3),
     }

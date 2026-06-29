@@ -1,11 +1,17 @@
-# ViriaRevive Montage Plan
+# ViriaRevive Gameplay Montage Plan
 
 Research checked: 2026-06-26
 
-This plan proposes a staged montage system for ViriaRevive without replacing the
-current clip pipeline. The near-term goal is to turn existing candidate, result,
-feedback, voice, game-context, and visual-debug data into a reviewable montage
-storyboard, then render a multi-beat short from approved clips.
+This plan tracks the gameplay-focused montage system in this fork. The goal is
+not to turn ViriaRevive into a full manual editor; it is to let the same local
+analysis used for single clips build multi-beat gaming shorts with a clearer
+hook, escalation, and payoff.
+
+The current foundation can analyze gameplay candidates, build local storyboard
+beats, render hard-cut vertical montages, write metadata sidecars, and record
+compact montage feedback. The remaining work is quality polish: better beat
+continuity, stronger pacing, clearer review UI, and more useful learning from
+approved/rejected montage sequences.
 
 ## Research Snapshot
 
@@ -24,11 +30,34 @@ Current AI clipping tools generally converge on the same product shape:
   scene cuts, media rendering, speech timing, visual stats, and silence removal.
   They do not provide a full creator-aware montage editor by themselves.
 
-The gap ViriaRevive can own: current tools mostly select highlights and package
+The gap this fork can own: current tools mostly select highlights and package
 them for short-form platforms. They generally do not build a local, inspectable
-**creator memory storyboard** that combines feedback history, creator voice
-confidence, game context, visual diagnostics, and prior review decisions to
-sequence a montage around the creator's actual style.
+**creator memory storyboard** for video-game footage that combines feedback
+history, creator voice confidence, game context, visual diagnostics, and prior
+review decisions to sequence a montage around the creator's actual style.
+
+## Current Focus: Learning And Montage, Not Manual Editing
+
+ViriaRevive should not become a full timeline editor in the near term. The next
+product advantage is a better local learning loop plus montage generation.
+
+The app should learn from every useful outcome:
+
+- Which candidates were found, accepted, selected, rendered, or rejected.
+- Which clips the user liked, disliked, favorited, deleted, kept, uploaded, or
+  rerolled metadata for.
+- Which audio stream/subtitle source ended up correct.
+- Which moment categories, game context, vision labels, and creator-voice
+  signals were present when the user approved or rejected a clip.
+- Which processing settings produced no clips, too few clips, or strong clips.
+
+This should feed two future systems:
+
+- **Single-clip ranking:** a bounded preference nudge that can compare liked
+  clips against disliked/deleted clips from similar runs.
+- **Montage storyboards:** a memory-aware sequence planner that understands the
+  creator's preferred hooks, setup length, pacing, reaction value, cutscene
+  tolerance, and payoff style.
 
 ## Repo Fit
 
@@ -52,7 +81,10 @@ The plan should reuse these existing files before adding new dependencies:
   All Videos, Upload, Settings, feedback, AI Notes, and Data & Privacy UI.
 - `config.py`: current runtime artifact roots: `CLIPS_DIR`, `SUBTITLES_DIR`,
   `ANALYSIS_CACHE_DIR`, `PERSONALIZATION_FILE`, `VOICE_PROFILE_FILE`,
-  `GAME_CONTEXT_DB_FILE`.
+  `GAME_CONTEXT_DB_FILE`, `RUN_LEARNING_FILE`.
+- `run_learning.py`: compact local run/outcome memory. Stores run summaries,
+  feedback/delete/metadata events, and clip-outcome summaries without raw media,
+  thumbnails, raw audio, or full transcripts.
 - `tests/`: existing guards for API path safety, feedback learning, data
   privacy, visual diagnostics, game context, multimodal analysis, voice profile,
   GUI wiring, and release/dependency safety.
@@ -66,6 +98,9 @@ Creator memory inputs:
 
 - Local feedback: like/dislike/favorite, reason chips, notes, compact
   `learning_terms`, deleted-file learning preservation from `personalization.json`.
+- Run learning: `run_learning.json` summaries for candidate counts, selected
+  clips, no-quality runs, metadata rerolls, deleted clips, and compact outcome
+  history.
 - Local voice profile: creator-speech confidence and ranking readiness from
   `voice_profile.json`, used only as a small opt-in signal.
 - Game context: resolved source/game identity and compact facts from
@@ -108,6 +143,11 @@ Add new artifacts only when implementation begins:
 - `personalization.json`
   - Add compact montage feedback only after the user rates a montage. Store
     beat ids, action, reason chips, and learning terms; do not store raw media.
+- `run_learning.json`
+  - New compact memory file for run summaries and clip outcome events.
+  - Stores selected/rendered counts, feature status, compact category/vision
+    evidence, feedback events, delete events, and metadata-generation events.
+  - Does not store raw video, thumbnails, raw audio, or full transcripts.
 
 Suggested `montage_storyboard` schema fields:
 
@@ -163,10 +203,13 @@ Stage the backend as additive functions, not a rewrite.
 2. **Build memory context**
    - Add a small helper near candidate ranking, likely in a new
      `montage_storyboard.py`, that consumes sanitized snapshots from
-     `candidate_ranker.py`, `voice_profile.py`, `game_context.py`, and
-     `visual_diagnostics.py`.
+     `run_learning.py`, `candidate_ranker.py`, `voice_profile.py`,
+     `game_context.py`, and `visual_diagnostics.py`.
    - Keep influence caps separate from current single-clip ranking caps. Memory
      should reorder or assign beat roles, not silently overpower quality guards.
+   - Use pairwise learning where possible: liked/favorited clips from a source
+     should be compared with disliked/deleted clips from the same or similar
+     source before assigning montage roles.
 
 3. **Sequence beats**
    - Start deterministic: choose one strong hook, one or more escalation beats,
@@ -232,20 +275,93 @@ Keep the first UI practical and review-first.
 
 Use staged runs so long footage does not become an all-or-nothing wait.
 
+- **Run A: Learning foundation**
+  - Add compact `run_learning.json` persistence.
+  - Record run summaries, feedback events, delete outcomes, and metadata rerolls.
+  - Keep the artifact local-first and media-free.
+- **Run B: Pairwise preference scoring**
+  - Compare approved clips against disliked/deleted clips from similar sources.
+  - Add a small capped preference nudge after base quality scoring.
+  - Report score deltas in run debug before increasing caps.
+  - First slice completed: existing learned scoring now builds pairwise
+    positive/negative terms when a source has both approved and rejected
+    examples. Compact `run_learning.json` outcomes can backfill these signals
+    when personalization summaries are missing. The total learned influence
+    remains capped by the existing feedback-learning cap.
 - **Run 0: Candidate audit**
   - Reads existing run debug/results and reports whether enough usable clips
     exist for montage.
+  - Completed first slice: `montage_storyboard.py` builds a compact
+    montage-readiness audit from `*_run_debug.json`, filters weak/music/black
+    candidates, reports usable beat counts/category variety/feature usage, and
+    can persist `analysis_cache/montages/<source>_montage_audit.json`.
 - **Run 1: Storyboard-only**
   - Produces `montage_storyboard.json`; no rendering.
   - Good first implementation target and easy to test.
+  - Completed first slice: `build_storyboard_from_audit(...)` turns a ready or
+    thin audit into a deterministic hook/escalation/payoff storyboard with
+    compact evidence chips and a hard-cut render plan placeholder. `draft_montage`
+    persists `<source>_montage_storyboard.json` without touching video files.
 - **Run 2: Draft render**
   - Renders a quick montage from approved beats; minimal transitions.
   - Captions can be omitted or simplified if word timings are incomplete.
+  - Completed first slice: `montage_renderer.py` renders storyboard beats into
+    normalized temporary segments and concatenates them with hard cuts. The
+    `render_montage_draft` API writes a draft MP4 into `clips/`, adds it to
+    Results state, and saves render debug while refusing storyboard sources that
+    cannot be traced back to saved run debug.
+  - Follow-up completed: segment rendering can now reuse the normal clip
+    extraction path when a storyboard beat carries crop params or subtitle
+    paths, and failed partial segment files are cleaned up.
 - **Run 3: Final render**
   - Full subtitle styling, crop checks, metadata sidecar, and upload-ready file.
+  - Backend foundation completed: `render_montage_final` reuses the guarded
+    storyboard source check, renders a higher-quality hard-cut montage, writes
+    metadata sidecar text, marks the Result as upload-ready, and records subtitle
+    status from actual rendered segments.
+  - Generate-flow wiring completed: when the wizard is in Montage mode, the main
+    pipeline now stops before normal clip rendering, builds a montage audit from
+    the just-analyzed candidates, writes storyboard files, renders 1-5 final
+    hard-cut montages when enough distinct beats exist, adds each montage to
+    Results, and stores montage render metadata in run debug.
+  - Follow-up completed: live Generate montage passes the current crop,
+    subtitle style/placement, Whisper model, and selected commentary stream into
+    the montage render prep step. Storyboard selection now caps beat duration to
+    the requested target and lets template intent, such as funny/punchline
+    moments, influence beat choice without storing full transcripts.
+  - Follow-up completed: montage planning now prefers coherent local beat
+    clusters around a strong anchor instead of stitching unrelated top-scoring
+    moments from across the whole source. Final concat re-encodes the stitched
+    segments to reset timestamps, avoiding files whose audio/container duration
+    outlives the visible video.
+  - Follow-up completed: montage planning can now rescue nearby low-confidence
+    context beats, repair topic jumps, keep payoff lines on screen longer, and
+    avoid reusing the same beat across additional requested montages. If fewer
+    usable sequences exist than requested, the app reports the smaller count
+    instead of padding with duplicates.
+  - Follow-up completed: final montage metadata now uses the actual storyboard
+    roles, beat text, local game context, creator learning context, and compact
+    quality explanations instead of a generic montage-title seed. The planner
+    also applies a narrow repeated-chatter penalty so low-context loops are less
+    likely to win over cleaner story beats.
+  - Follow-up completed: Ollama vision preflight now uses a valid tiny image
+    payload and records the Ollama HTTP error body when a local vision model
+    rejects a request, making vision failures actionable in debug.
 - **Run 4: Learn from montage feedback**
   - User rates the whole montage and individual beats.
   - Store compact learning terms and beat roles back into personalization.
+  - Completed backend first slice: `run_learning.py` now supports
+    `montage_feedback_like`, `montage_feedback_dislike`, and
+    `montage_feedback_favorite` events with per-storyboard and per-beat
+    outcomes. `api_bridge.record_montage_feedback(...)` validates saved
+    storyboard files, accepts optional `beat_id`, and stores only compact role,
+    category, reason, and learning-term data. UI controls for rating rendered
+    montage storyboards are still a follow-up.
+  - Completed memory-consumption slice: montage outcomes now feed the central
+    learned-scoring profile as reduced-weight signals, and Ollama title,
+    description, vision, and moment-label prompts receive the same compact
+    `run_learning.json` context. This follows a local RAG/memory approach rather
+    than retraining Ollama model weights during normal app use.
 - **Run 5: Batch montage**
   - Multiple sources or sessions, after single-source reliability is proven.
 
@@ -258,6 +374,11 @@ Add tests before widening UI exposure.
   - Influence caps for feedback, voice, game, and visual diagnostics.
   - Rejection of weak/menu/black-frame/music-guard candidates.
   - Storyboard schema sanitization and redaction.
+- `tests/test_run_learning.py`
+  - Run summaries preserve selected/outcome counts but not raw transcript text.
+  - Feedback events merge like/dislike/favorite flips correctly.
+  - Deleted clips and metadata rerolls update compact clip outcomes.
+  - Corrupt or malformed learning JSON sanitizes to a safe schema.
 - `tests/test_api_bridge_path_safety.py`
   - Montage artifact paths stay under `ANALYSIS_CACHE_DIR`, `SUBTITLES_DIR`, and
     `CLIPS_DIR`.

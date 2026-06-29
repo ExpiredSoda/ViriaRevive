@@ -114,6 +114,236 @@ class DataPrivacySummaryTests(unittest.TestCase):
         self.assertEqual(history["run_count"], 1)
         self.assertEqual(history["last_run"]["estimate_error_seconds"], 20.0)
 
+    def test_processing_history_estimate_prefers_similar_workload(self):
+        bridge = self._bridge_with_personalization({"schema_version": 1, "events": [], "clips": {}})
+        bridge._processing_history = {
+            "schema_version": 1,
+            "runs": [
+                {
+                    "run_id": "balanced_light",
+                    "processing_depth": "balanced",
+                    "elapsed_seconds": 120.0,
+                    "video_duration_seconds": 600.0,
+                    "settings_fingerprint": {
+                        "generation_mode": "clips",
+                        "scene_mode": "sampled",
+                        "candidate_whisper_model": "small",
+                        "candidate_pool_cap": 12,
+                        "candidate_multiplier": 3,
+                        "visual_analysis": False,
+                        "multimodal_analysis": False,
+                        "ai_moment_labels": False,
+                        "moment_label_ranking": False,
+                        "subtitle_style": "tiktok",
+                    },
+                },
+                {
+                    "run_id": "balanced_heavy",
+                    "processing_depth": "balanced",
+                    "elapsed_seconds": 420.0,
+                    "video_duration_seconds": 600.0,
+                    "settings_fingerprint": {
+                        "generation_mode": "clips",
+                        "scene_mode": "sampled",
+                        "candidate_whisper_model": "small",
+                        "candidate_pool_cap": 40,
+                        "candidate_multiplier": 5,
+                        "visual_analysis": True,
+                        "multimodal_analysis": True,
+                        "ai_moment_labels": True,
+                        "moment_label_ranking": True,
+                        "subtitle_style": "tiktok",
+                    },
+                },
+            ],
+        }
+
+        estimate, source = bridge._estimate_processing_seconds_from_history(
+            "balanced",
+            300.0,
+            settings_fingerprint={
+                "generation_mode": "clips",
+                "scene_mode": "sampled",
+                "candidate_whisper_model": "small",
+                "candidate_pool_cap": 40,
+                "candidate_multiplier": 5,
+                "visual_analysis": True,
+                "multimodal_analysis": True,
+                "ai_moment_labels": True,
+                "moment_label_ranking": True,
+                "subtitle_style": "tiktok",
+            },
+        )
+
+        self.assertEqual(source, "local_history_nearest")
+        self.assertAlmostEqual(estimate, 210.0, delta=1.0)
+
+    def test_processing_history_estimate_does_not_mix_generation_modes(self):
+        bridge = self._bridge_with_personalization({"schema_version": 1, "events": [], "clips": {}})
+        bridge._processing_history = {
+            "schema_version": 1,
+            "runs": [
+                {
+                    "run_id": "clip_run",
+                    "generation_mode": "clips",
+                    "processing_depth": "deep",
+                    "elapsed_seconds": 120.0,
+                    "video_duration_seconds": 600.0,
+                    "settings_fingerprint": {
+                        "generation_mode": "clips",
+                        "scene_mode": "targeted",
+                        "candidate_whisper_model": "base",
+                        "candidate_pool_cap": 72,
+                        "candidate_multiplier": 7,
+                        "visual_analysis": True,
+                        "multimodal_analysis": True,
+                        "ai_moment_labels": True,
+                        "moment_label_ranking": True,
+                        "subtitle_style": "tiktok",
+                    },
+                },
+                {
+                    "run_id": "old_missing_mode",
+                    "processing_depth": "deep",
+                    "elapsed_seconds": 999.0,
+                    "video_duration_seconds": 600.0,
+                    "settings_fingerprint": {
+                        "scene_mode": "targeted",
+                        "candidate_whisper_model": "base",
+                        "candidate_pool_cap": 72,
+                        "candidate_multiplier": 7,
+                        "visual_analysis": True,
+                        "multimodal_analysis": True,
+                        "ai_moment_labels": True,
+                        "moment_label_ranking": True,
+                        "subtitle_style": "tiktok",
+                    },
+                },
+            ],
+        }
+
+        estimate, source = bridge._estimate_processing_seconds_from_history(
+            "deep",
+            300.0,
+            settings_fingerprint={
+                "generation_mode": "montage",
+                "scene_mode": "targeted",
+                "candidate_whisper_model": "base",
+                "candidate_pool_cap": 72,
+                "candidate_multiplier": 7,
+                "visual_analysis": True,
+                "multimodal_analysis": True,
+                "ai_moment_labels": True,
+                "moment_label_ranking": True,
+                "subtitle_style": "tiktok",
+            },
+        )
+        plan = bridge._estimate_processing_stage_plan_from_history(
+            "deep",
+            300.0,
+            settings_fingerprint={
+                "generation_mode": "montage",
+                "scene_mode": "targeted",
+                "candidate_whisper_model": "base",
+                "candidate_pool_cap": 72,
+                "candidate_multiplier": 7,
+                "visual_analysis": True,
+                "multimodal_analysis": True,
+                "ai_moment_labels": True,
+                "moment_label_ranking": True,
+                "subtitle_style": "tiktok",
+            },
+        )
+
+        self.assertIsNone(estimate)
+        self.assertEqual(source, "no_local_history")
+        self.assertIsNone(plan)
+
+    def test_save_settings_does_not_persist_transient_game_hint(self):
+        bridge = self._bridge_with_personalization({"schema_version": 1, "events": [], "clips": {}})
+        bridge._sync_video_server_root = lambda: None
+        bridge._save_state = lambda: None
+
+        result = bridge.save_settings({
+            "game_title_hint": "Alan Wake",
+            "processing_depth": "deep",
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("game_title_hint", bridge._user_settings)
+        self.assertEqual(bridge.get_settings()["game_title_hint"], "")
+
+    def test_processing_history_stage_seconds_do_not_double_count_scene_detection(self):
+        with_detect = ApiBridge._stage_seconds_from_timing(
+            {
+                "detect": 4.0,
+                "visual_analysis": 1.0,
+                "scene_detection": 99.0,
+            }
+        )
+        scene_fallback = ApiBridge._stage_seconds_from_timing(
+            {
+                "scene_detection": 9.0,
+                "candidate_analysis": 1.0,
+            }
+        )
+
+        self.assertEqual(with_detect["detect"], 5.0)
+        self.assertEqual(scene_fallback["detect"], 9.0)
+        self.assertEqual(scene_fallback["candidates"], 1.0)
+
+    def test_processing_history_stage_plan_prefers_matching_workload(self):
+        bridge = self._bridge_with_personalization({"schema_version": 1, "events": [], "clips": {}})
+        fingerprint = {
+            "generation_mode": "clips",
+            "scene_mode": "targeted",
+            "candidate_whisper_model": "small",
+            "candidate_pool_cap": 72,
+            "candidate_multiplier": 8,
+            "visual_analysis": True,
+            "multimodal_analysis": True,
+            "ai_moment_labels": True,
+            "moment_label_ranking": True,
+            "subtitle_style": "tiktok",
+        }
+        bridge._processing_history = {
+            "schema_version": 1,
+            "runs": [
+                {
+                    "run_id": "deep_stage_timing",
+                    "processing_depth": "deep",
+                    "elapsed_seconds": 300.0,
+                    "video_duration_seconds": 600.0,
+                    "settings_fingerprint": fingerprint,
+                    "stage_timings": {
+                        "download": 10.0,
+                        "game_context": 2.0,
+                        "detect": 30.0,
+                        "visual_analysis": 10.0,
+                        "candidate_analysis": 120.0,
+                        "multimodal_analysis": 40.0,
+                        "final_render": 70.0,
+                        "auto_metadata": 18.0,
+                    },
+                }
+            ],
+        }
+
+        plan = bridge._estimate_processing_stage_plan_from_history(
+            "deep",
+            300.0,
+            settings_fingerprint=fingerprint,
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["source"], "stage_history_nearest")
+        self.assertEqual(plan["sampleCount"], 1)
+        self.assertAlmostEqual(plan["stages"]["download"], 6.0, delta=0.1)
+        self.assertAlmostEqual(plan["stages"]["detect"], 20.0, delta=0.1)
+        self.assertAlmostEqual(plan["stages"]["candidates"], 80.0, delta=0.1)
+        self.assertAlmostEqual(plan["stages"]["clips"], 44.0, delta=0.1)
+        self.assertAlmostEqual(plan["estimatedTotalSeconds"], 150.0, delta=0.5)
+
     def test_balanced_depth_reports_moment_label_ranking_depth_override(self):
         bridge = self._bridge_with_personalization({"schema_version": 1, "events": [], "clips": {}})
         bridge._user_settings = {

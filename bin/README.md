@@ -1,8 +1,12 @@
-# Optional FFmpeg Binaries
+# Optional FFmpeg Binaries For Gameplay Clipping Releases
 
-ViriaRevive checks this folder before the system `PATH`.
+ViriaRevive uses FFmpeg/ffprobe to inspect gameplay recordings, extract clips,
+mix audio, burn subtitles, and render montage segments. The app checks this
+folder before the system `PATH`, so a release can ship reviewed local media
+tools without requiring every user to install FFmpeg manually.
 
-For a portable build, place both files here before running `build.bat`:
+For a portable game-clipping build, place both executables here before running
+`build.bat`:
 
 - `ffmpeg.exe`
 - `ffprobe.exe`
@@ -24,4 +28,6 @@ build. For GPL builds, publish or link to complete corresponding source in the
 manner required by the build's license terms.
 
 Do not commit downloaded binaries unless the release owner has reviewed the
-license and distribution terms for the exact FFmpeg build.
+license and distribution terms for the exact FFmpeg build. This fork is intended
+to stay open source, but packaged binaries still need correct license notices
+and source-offer handling.
