@@ -1,7 +1,7 @@
 """Side-effect-free app version metadata."""
 
 APP_NAME = "ViriaRevive"
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.4.0"
 APP_VERSION_DISPLAY = f"v{APP_VERSION}"
 APP_VERSION_QUAD = f"{APP_VERSION}.0"
 APP_COMPANY = "Expired Soda"
