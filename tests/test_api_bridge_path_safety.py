@@ -1375,7 +1375,7 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             "model_ready": True,
             "model": "qwen3-vl:latest",
             "supported_model_hints": ["qwen3-vl"],
-        }), patch("api_bridge.shutil.which", return_value=None):
+        }), patch.object(ApiBridge, "_find_ollama_executable", return_value=None):
             status = bridge.get_ollama_status()
 
         self.assertTrue(status["text_model"]["model_ready"])
@@ -1384,6 +1384,40 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
         self.assertEqual(status["vision"]["model"], "qwen3-vl:latest")
         self.assertTrue(status["using_ollama_vision"])
         self.assertFalse(status["installed"])
+
+    def test_ollama_status_can_auto_start_known_install(self):
+        bridge = ApiBridge.__new__(ApiBridge)
+        ollama_path = Path("A:/Ollama/ollama.exe")
+
+        with patch("api_bridge.ollama_status", side_effect=[
+            {
+                "running": False,
+                "model": "qwen3.5:4b",
+                "model_ready": False,
+                "using_ollama": False,
+                "models": [],
+                "version": "",
+            },
+            {
+                "running": True,
+                "model": "qwen3.5:4b",
+                "model_ready": True,
+                "using_ollama": True,
+                "models": ["qwen3.5:4b", "qwen3-vl:latest"],
+                "version": "0.30.10",
+            },
+        ]), patch("api_bridge.ollama_vision_status", return_value={
+            "model_ready": True,
+            "model": "qwen3-vl:latest",
+            "supported_model_hints": ["qwen3-vl"],
+        }), patch.object(ApiBridge, "_find_ollama_executable", return_value=ollama_path), patch("api_bridge.subprocess.Popen") as popen, patch("api_bridge.time.sleep"):
+            status = bridge.get_ollama_status()
+
+        popen.assert_called_once()
+        self.assertTrue(status["running"])
+        self.assertTrue(status["using_ollama"])
+        self.assertTrue(status["auto_start"]["attempted"])
+        self.assertEqual(status["install_path"], str(ollama_path))
 
     def test_ollama_powershell_install_api_is_removed(self):
         bridge = ApiBridge.__new__(ApiBridge)
@@ -1478,6 +1512,49 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertEqual(meta["clip_id"], "clip-identity")
             self.assertEqual(meta["source_id"], "source-identity")
             self.assertEqual(meta["clip_filename"], "clip.mp4")
+
+    def test_clip_payload_recovers_generated_metadata_from_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_path = Path(temp_dir) / "Recovered Clip.mp4"
+            clip_path.write_text("video", encoding="utf-8")
+            clip_path.with_suffix(".txt").write_text(
+                "\n".join([
+                    "Title: Recovered Clip Title #shorts #AlanWake",
+                    "",
+                    "Description:",
+                    "Recovered Clip Title",
+                    "",
+                    "#shorts #AlanWake #gaming",
+                    "",
+                    "Tags: Alan Wake, gameplay, shorts",
+                    "Hashtags: #shorts #AlanWake #gaming",
+                    "Game: Alan Wake",
+                    f"Clip: {clip_path}",
+                    "",
+                    "Analysis Context:",
+                    "Moment Type: chase/panic",
+                    "Creator Context: Barry could not open the gate",
+                    "Game Knowledge: Alan Wake | 2010 | action-adventure game",
+                ]),
+                encoding="utf-8",
+            )
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = [clip_path]
+            bridge._moments = [{}]
+            bridge._user_settings = {"output_dir": temp_dir}
+            bridge._source_context = {}
+            bridge._metadata_hydration_changed = False
+
+            clip = bridge._clip_payload(0, clip_path, include_url=False)
+
+            metadata = clip["generated_metadata"]
+            self.assertEqual(metadata["title"], "Recovered Clip Title #shorts #AlanWake")
+            self.assertEqual(metadata["tags"], "Alan Wake, gameplay, shorts")
+            self.assertEqual(metadata["game_title"], "Alan Wake")
+            self.assertEqual(bridge._moments[0]["generated_metadata"]["metadata_file"], str(clip_path.with_suffix(".txt")))
+            self.assertEqual(bridge._moments[0]["creator_title_context"], "Barry could not open the gate")
+            self.assertTrue(bridge._metadata_hydration_changed)
 
     def test_montage_metadata_uses_storyboard_context_for_title_and_description(self):
         with tempfile.TemporaryDirectory() as temp_dir:

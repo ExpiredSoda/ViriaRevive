@@ -271,17 +271,18 @@ label fallbacks.
 In the app, open **Settings > Local AI**:
 
 1. **Install Ollama** opens the official Ollama download page.
-2. After Ollama is installed and running, **Download Text Model** appears for
+2. After Ollama is installed, ViriaRevive will try to start the local Ollama
+   service when the app checks AI status. **Download Text Model** appears for
    the approved local model used for AI titles, descriptions, and moment labels.
-3. After Ollama is installed and running, **Download Vision Model** appears for
+3. **Download Vision Model** appears for
    the approved local model used by Deep Analysis to inspect sampled gameplay
    frames.
 4. The footer and Settings card show separate text-model and vision-model
    readiness, including the actual model names detected locally.
 
 ViriaRevive does not run remote PowerShell installer scripts from inside the
-app. It sends you to Ollama's official download page, then lets Ollama download
-the approved local models once the local service is running.
+app. It sends you to Ollama's official download page, can start the installed
+local service, then lets Ollama download the approved local models.
 
 Deep Analysis can also use a local Ollama vision model, if you install one. The
 recommended local setup is:

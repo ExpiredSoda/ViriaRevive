@@ -213,6 +213,12 @@ PROCESSING_DEPTHS = {"fast", "balanced", "deep"}
 GENERATION_MODES = {"clips", "montage"}
 MONTAGE_TEMPLATES = {"panic", "funny", "failure", "combat", "story", "tutorial", "atmosphere", "custom"}
 VIDEO_FILE_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+OLLAMA_STARTUP_PATHS = (
+    Path("A:/Ollama/ollama.exe"),
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+    Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
+    Path(os.environ.get("ProgramFiles(x86)", "")) / "Ollama" / "ollama.exe",
+)
 VOICE_ENROLLMENT_MIN_WORDS = 12
 VOICE_ENROLLMENT_MIN_CREATOR_RATIO = 0.70
 VOICE_ENROLLMENT_MIN_CREATOR_CONFIDENCE = 0.65
@@ -3226,9 +3232,58 @@ class ApiBridge:
         models = list_ollama_models()
         return {"models": models, "available": len(models) > 0}
 
+    def _find_ollama_executable(self) -> Path | None:
+        """Find an installed Ollama binary without downloading or installing it."""
+        for raw in (shutil.which("ollama.exe"), shutil.which("ollama")):
+            if raw:
+                try:
+                    path = Path(raw).resolve()
+                    if path.exists() and path.is_file():
+                        return path
+                except Exception:
+                    continue
+        for candidate in OLLAMA_STARTUP_PATHS:
+            try:
+                path = candidate.expanduser().resolve()
+                if path.exists() and path.is_file():
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _try_start_ollama_server(self) -> dict:
+        """Start a local Ollama server when installed but not already running."""
+        now = time.monotonic()
+        last_attempt = float(getattr(self, "_ollama_auto_start_attempt", 0.0) or 0.0)
+        if now - last_attempt < 20:
+            return {"attempted": False, "reason": "recent_attempt"}
+        self._ollama_auto_start_attempt = now
+
+        exe = self._find_ollama_executable()
+        if not exe:
+            return {"attempted": False, "reason": "not_installed"}
+        try:
+            subprocess.Popen(
+                [str(exe), "serve"],
+                cwd=str(exe.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            time.sleep(1.0)
+            return {"attempted": True, "path": str(exe)}
+        except Exception as exc:
+            return {"attempted": True, "path": str(exe), "error": str(exc)}
+
     def get_ollama_status(self):
         """Return whether Ollama is running and ready for text and vision AI."""
         status = ollama_status()
+        startup = {"attempted": False}
+        if not status.get("running"):
+            startup = self._try_start_ollama_server()
+            if startup.get("attempted"):
+                status = ollama_status()
         vision = ollama_vision_status(status.get("models") if status.get("running") else [])
         status["text_model"] = {
             "model": status.get("model", DEFAULT_MODEL),
@@ -3246,17 +3301,19 @@ class ApiBridge:
         status["vision_model"] = status["vision"]["model"]
         status["vision_model_ready"] = status["vision"]["model_ready"]
         status["using_ollama_vision"] = status["vision"]["using_vision"]
-        install_path = shutil.which("ollama.exe") or shutil.which("ollama")
+        path_on_env = shutil.which("ollama.exe") or shutil.which("ollama")
+        install_path = self._find_ollama_executable()
         if install_path:
-            status["install_path"] = str(Path(install_path))
+            status["install_path"] = str(install_path)
         status["service_running"] = bool(status.get("running"))
-        status["binary_on_path"] = bool(install_path)
+        status["binary_on_path"] = bool(path_on_env)
         status["installed"] = bool(install_path)
+        status["auto_start"] = startup
         return status
 
     def open_ollama_folder(self):
         """Open the local Ollama install folder when it can be found."""
-        install_path = shutil.which("ollama.exe") or shutil.which("ollama")
+        install_path = self._find_ollama_executable()
         if not install_path:
             return {"error": "Ollama was not found on PATH. Use Install Ollama first."}
         folder = Path(install_path).resolve().parent
@@ -3477,6 +3534,80 @@ class ApiBridge:
             and "\nDescription:" in text
             and "\nAnalysis Context:" in text
         )
+
+    @staticmethod
+    def _metadata_sidecar_field(text: str, label: str) -> str:
+        match = re.search(rf"(?m)^{re.escape(label)}:\s*(.+?)\s*$", text)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _metadata_sidecar_block(text: str, label: str, next_labels: tuple[str, ...]) -> str:
+        next_pattern = "|".join(re.escape(item) for item in next_labels)
+        match = re.search(
+            rf"(?ms)^{re.escape(label)}:\s*\n(.*?)(?=^\s*(?:{next_pattern}):|\Z)",
+            text,
+        )
+        return match.group(1).strip() if match else ""
+
+    def _read_generated_metadata_sidecar(self, clip_path: Path, clip_context: dict | None = None) -> dict:
+        """Recover generated metadata from the .txt sidecar next to a clip."""
+        sidecar = clip_path.with_suffix(".txt")
+        if not sidecar.exists() or not sidecar.is_file() or not self._looks_like_generated_metadata_sidecar(sidecar):
+            return {}
+        try:
+            text = sidecar.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {}
+        title = self._metadata_sidecar_field(text, "Title")
+        description = self._metadata_sidecar_block(
+            text,
+            "Description",
+            ("Tags", "Hashtags", "Game", "Clip", "Analysis Context"),
+        )
+        tags = self._metadata_sidecar_field(text, "Tags")
+        game_title = self._metadata_sidecar_field(text, "Game")
+        if game_title.lower() == "unknown":
+            game_title = ""
+        creator_context = sanitize_creator_title_context(self._metadata_sidecar_field(text, "Creator Context"))
+        if not title and not description and not tags:
+            return {}
+        return {
+            "title": title,
+            "description": description,
+            "final_description": description,
+            "generated_description": description.split("\n\n", 1)[0].strip() if description else title,
+            "description_custom_text": self._description_profile()["custom_text"],
+            "description_auto_hashtags": self._description_profile()["auto_hashtags"],
+            "recommended_hashtags": recommended_hashtags(game_title),
+            "tags": tags,
+            "game_title": game_title,
+            "metadata_file": str(sidecar),
+            "creator_title_context": creator_context,
+            "title_context": summarize_clip_context(
+                (clip_context or {}).get("transcript", ""),
+                game_title,
+                clip_context,
+            ),
+            "recovered_from_sidecar": True,
+        }
+
+    def _hydrate_generated_metadata_from_sidecar(self, idx: int, path: Path, moment: dict) -> bool:
+        if not isinstance(moment, dict):
+            return False
+        existing = moment.get("generated_metadata")
+        if isinstance(existing, dict) and existing.get("title") and existing.get("metadata_file"):
+            return False
+        metadata = self._read_generated_metadata_sidecar(path, moment)
+        if not metadata:
+            return False
+        moment["generated_metadata"] = metadata
+        if metadata.get("creator_title_context"):
+            moment["creator_title_context"] = metadata["creator_title_context"]
+        if metadata.get("game_title"):
+            moment["game_title"] = metadata["game_title"]
+        if 0 <= idx < len(self._moments):
+            self._moments[idx] = moment
+        return True
 
     def _prune_orphan_metadata_sidecars(self) -> int:
         """Remove app-generated .txt metadata files whose matching video is gone."""
@@ -4854,8 +4985,15 @@ class ApiBridge:
             self._moments[idx] if idx < len(self._moments) else {},
             path,
         )
+        if self._hydrate_generated_metadata_from_sidecar(idx, path, moment):
+            self._metadata_hydration_changed = True
         if idx < len(self._moments):
             self._moments[idx] = moment
+        generated_metadata = (
+            moment.get("generated_metadata")
+            if isinstance(moment.get("generated_metadata"), dict)
+            else {}
+        )
         clip = {
             "path": str(path),
             "filename": path.name,
@@ -4879,6 +5017,7 @@ class ApiBridge:
             "speech_policy": moment.get("speech_policy") if isinstance(moment.get("speech_policy"), dict) else _clip_speech_policy_summary(moment),
             "metadata_warning": moment.get("metadata_warning"),
             "metadata_needs_context": bool(moment.get("metadata_needs_context")),
+            "generated_metadata": generated_metadata,
             "truth_summary": self._clip_truth_summary(moment, path),
         }
         if include_url:
@@ -6572,8 +6711,12 @@ class ApiBridge:
         self._prune_missing_results()
         self._prune_orphan_metadata_sidecars()
         clips = []
+        self._metadata_hydration_changed = False
         for i, p in enumerate(self._results):
             clips.append(self._clip_payload(i, p, include_url=True))
+        if getattr(self, "_metadata_hydration_changed", False):
+            self._metadata_hydration_changed = False
+            self._save_state()
         return {"clips": clips, "moments": self._moments}
 
     def _resolve_clip_context_index(self, clip_id=None, clip_index=None, filename=None) -> int:

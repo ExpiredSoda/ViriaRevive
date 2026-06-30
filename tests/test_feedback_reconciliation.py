@@ -1131,6 +1131,61 @@ class FeedbackReconciliationTests(unittest.TestCase):
         )
         self.assertTrue(guarded["commentary_guard"]["application"]["trusted_unclear_creator_track"])
 
+    def test_commentary_guard_repairs_sparse_late_creator_subtitles(self):
+        segments = [
+            "oh thank god a flashlight you know how theres the oh candy joke".split(),
+            "objective updated manuscript page found checkpoint reached chapter mission goal inventory quest map".split(),
+            "and then you just get hit by like ten barrels".split(),
+            "oh I wonder if I dont fight them".split(),
+            "okay thats not going to work oh thats not going to work oh no".split(),
+            "theyre all over me".split(),
+            "now how am I supposed to turn that on if theyre just like in front of it".split(),
+            "seriously hes got some good aim oh hes got some amazing aim".split(),
+        ]
+        words = []
+        start = 0.1
+        for segment in segments:
+            part = _words_from_tokens(segment, start=start)
+            words.extend(part)
+            start = part[-1]["end"] + 1.05
+
+        guarded = evaluate_candidate(
+            _ranker_candidate(),
+            words,
+            extraction_start=0,
+            extraction_end=75,
+            video_duration=90,
+            target_duration=70,
+            selected_stream=1,
+            quality_floor=0.0,
+            commentary_guard=True,
+            commentary_guard_policy="creator",
+            stream_profile={
+                "title": "Track3_vertical",
+                "selected_reason": "creator_source_confidence",
+                "selected_confidence": 0.724,
+                "creator_likeness_score": 0.64,
+                "natural_dialogue_score": 3.8,
+                "scripted_game_score": 0.25,
+                "acoustic_game_bed_score": 0.02,
+                "lyric_likelihood": 0.05,
+                "voice_title_hints": [],
+                "game_title_hints": [],
+            },
+        )
+
+        transcript = guarded["moment"]["transcript"]
+        application = guarded["commentary_guard"]["application"]
+        self.assertIn("dont fight them", transcript)
+        self.assertIn("thats not going to work", transcript)
+        self.assertIn("how am I supposed", transcript)
+        self.assertNotIn("objective updated", transcript)
+        self.assertGreater(guarded["moment"]["subtitle_word_count"], 7)
+        self.assertEqual(application["reason"], "trusted_creator_track_sparse_subtitles_repaired")
+        self.assertEqual(application["original_filter_reason"], "creator_subtitle_filter_applied")
+        self.assertTrue(application["trusted_unclear_creator_track"])
+        self.assertTrue(application["sparse_filtered_subtitles"])
+
     def test_commentary_guard_does_not_restore_game_speech_from_creator_like_stream(self):
         game_only = _words_from_tokens("objective updated find the key to the door.".split(), start=0.1)
         guarded = evaluate_candidate(

@@ -824,6 +824,76 @@ def _filter_words_by_commentary_segment_indexes(
     return filtered
 
 
+def _merge_words_by_timing(*word_lists: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[tuple[float, float, str]] = set()
+    for words in word_lists:
+        for word in words or []:
+            try:
+                start = round(float(word.get("start", 0.0)), 3)
+                end = round(float(word.get("end", start)), 3)
+            except (TypeError, ValueError):
+                continue
+            text = str(word.get("text") or "").strip()
+            key = (start, end, text.lower())
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            merged.append(word)
+    return sorted(merged, key=lambda row: (float(row.get("start", 0.0)), float(row.get("end", 0.0))))
+
+
+def _subtitle_filter_needs_creator_repair(
+    subtitle_words: list[dict],
+    render_words: list[dict],
+    commentary_guard_application: dict,
+) -> tuple[bool, dict]:
+    """Return true when creator-only subtitles became too sparse or too late."""
+    details = {
+        "sparse_filtered_subtitles": False,
+        "late_filtered_subtitles": False,
+        "filtered_word_ratio": 1.0,
+        "first_filtered_word_start": None,
+    }
+    if not render_words or not subtitle_words or not commentary_guard_application.get("output_changed"):
+        return False, details
+    if commentary_guard_application.get("reason") not in {
+        "creator_subtitle_filter_applied",
+        "no_creator_commentary_after_filter",
+    }:
+        return False, details
+
+    original_count = int(commentary_guard_application.get("original_word_count") or len(render_words) or 0)
+    filtered_count = len(subtitle_words)
+    if original_count <= 0:
+        return False, details
+    ratio = filtered_count / max(1, original_count)
+    details["filtered_word_ratio"] = round(float(ratio), 4)
+
+    if filtered_count < max(MIN_WORDS, 8) and original_count >= 18:
+        details["sparse_filtered_subtitles"] = True
+    if ratio < 0.22 and original_count >= 24:
+        details["sparse_filtered_subtitles"] = True
+
+    if subtitle_words:
+        try:
+            first_start = float(subtitle_words[0].get("start", 0.0))
+        except (TypeError, ValueError):
+            first_start = 0.0
+        details["first_filtered_word_start"] = round(float(first_start), 3)
+        try:
+            render_start = float(render_words[0].get("start", 0.0))
+            render_end = float(render_words[-1].get("end", render_start))
+        except (TypeError, ValueError):
+            render_start = 0.0
+            render_end = 0.0
+        render_span = max(0.0, render_end - render_start)
+        if first_start > max(12.0, min(24.0, render_span * 0.38)) and original_count >= 18:
+            details["late_filtered_subtitles"] = True
+
+    return bool(details["sparse_filtered_subtitles"] or details["late_filtered_subtitles"]), details
+
+
 def _restore_trusted_unclear_creator_subtitles(
     *,
     subtitle_words: list[dict],
@@ -837,9 +907,17 @@ def _restore_trusted_unclear_creator_subtitles(
     """Keep mic-track speech when the light guard only failed to classify it."""
     if normalize_commentary_subtitle_policy(policy) != "creator":
         return subtitle_words, commentary_guard_result, commentary_guard_application
-    if subtitle_words or not render_words:
+    needs_repair, repair_details = _subtitle_filter_needs_creator_repair(
+        subtitle_words,
+        render_words,
+        commentary_guard_application,
+    )
+    if (subtitle_words and not needs_repair) or not render_words:
         return subtitle_words, commentary_guard_result, commentary_guard_application
-    if commentary_guard_application.get("reason") != "no_creator_commentary_after_filter":
+    if commentary_guard_application.get("reason") not in {
+        "no_creator_commentary_after_filter",
+        "creator_subtitle_filter_applied",
+    }:
         return subtitle_words, commentary_guard_result, commentary_guard_application
     if not _trust_unclear_creator_stream(stream_profile):
         return subtitle_words, commentary_guard_result, commentary_guard_application
@@ -882,6 +960,8 @@ def _restore_trusted_unclear_creator_subtitles(
         keep_indexes, restore_details = _restorable_unclear_creator_segment_indexes(segments)
         if keep_indexes:
             restored_words = _filter_words_by_commentary_segment_indexes(render_words, segments, keep_indexes)
+            if needs_repair and subtitle_words:
+                restored_words = _merge_words_by_timing(subtitle_words, restored_words)
             restore_mode = "trusted_track_partial" if len(restored_words) < len(render_words) else "trusted_track"
         elif trusted_creator_override:
             restore_details = {
@@ -894,14 +974,21 @@ def _restore_trusted_unclear_creator_subtitles(
 
     restored_application = dict(commentary_guard_application)
     partial_restore = len(restored_words) < len(render_words)
+    original_reason = str(commentary_guard_application.get("reason") or "")
+    reason = (
+        "trusted_creator_track_sparse_subtitles_repaired"
+        if needs_repair
+        else "trusted_creator_track_unclear_segments_restored"
+        if partial_restore
+        else "trusted_creator_track_unclear_restored"
+    )
     restored_application.update(
         {
             "applied": bool(partial_restore),
             "output_changed": bool(partial_restore),
             "fallback_used": True,
-            "reason": "trusted_creator_track_unclear_segments_restored"
-            if partial_restore
-            else "trusted_creator_track_unclear_restored",
+            "reason": reason,
+            "original_filter_reason": original_reason,
             "filtered_word_count": len(restored_words),
             "removed_word_count": max(0, len(render_words) - len(restored_words)),
             "kept_labels": ["unclear_creator_like"],
@@ -909,6 +996,7 @@ def _restore_trusted_unclear_creator_subtitles(
             "selection_impact": "none",
             "subtitle_impact": "filtered_words" if partial_restore else "none",
             "trusted_unclear_creator_track": True,
+            **repair_details,
             **restore_details,
         }
     )
