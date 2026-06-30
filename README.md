@@ -34,10 +34,10 @@
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/screenshots/actual-upload.png" alt="ViriaRevive YouTube upload scheduler and AI metadata screen">
+      <img src="docs/screenshots/app-upload.png" alt="ViriaRevive YouTube upload scheduler and AI metadata screen">
     </td>
     <td width="50%">
-      <img src="docs/screenshots/actual-settings.png" alt="ViriaRevive settings with Local AI, subtitle style, data privacy, and output folder controls">
+      <img src="docs/screenshots/app-settings.png" alt="ViriaRevive settings with Local AI, subtitle style, data privacy, and output folder controls">
     </td>
   </tr>
   <tr>
@@ -46,15 +46,15 @@
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/screenshots/actual-results.png" alt="ViriaRevive Results view showing generated clip folders and clip actions">
+      <img src="docs/screenshots/app-library.png" alt="ViriaRevive All Videos library showing generated clip cards, labels, AI notes, and feedback controls">
     </td>
     <td width="50%">
-      <img src="docs/screenshots/actual-all-videos.png" alt="ViriaRevive All Videos library with custom output folder sync">
+      <img src="docs/screenshots/app-processing.png" alt="ViriaRevive generation progress view showing candidate render status and scoring">
     </td>
   </tr>
   <tr>
-    <td align="center"><strong>Results view</strong></td>
-    <td align="center"><strong>All Videos library</strong></td>
+    <td align="center"><strong>All Videos library with clip learning controls</strong></td>
+    <td align="center"><strong>Generation progress and candidate scoring</strong></td>
   </tr>
 </table>
 
