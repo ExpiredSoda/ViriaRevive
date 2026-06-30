@@ -6707,9 +6707,41 @@ class ApiBridge:
         self._save_state()
         return removed
 
-    def get_results(self):
-        self._prune_missing_results()
+    def _sync_results_with_clips_dir(self) -> dict:
+        """Reconcile persisted results with videos in the active output folder."""
+        removed = self._prune_missing_results()
         self._prune_orphan_metadata_sidecars()
+        _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+        existing = {p.resolve() for p in self._results if p.exists()}
+        added = 0
+
+        clips_dir = self._clips_dir()
+        if clips_dir.exists():
+            safe_entries = []
+            for p in clips_dir.iterdir():
+                safe_path = self._safe_path_under(clips_dir, p)
+                if safe_path and safe_path.is_file() and safe_path.suffix.lower() in _exts:
+                    safe_entries.append(safe_path)
+            for p in sorted(safe_entries, key=lambda x: x.stat().st_mtime):
+                resolved = p.resolve()
+                if resolved not in existing:
+                    self._results.append(p)
+                    self._moments.append(self._ensure_moment_identity({}, p))
+                    existing.add(resolved)
+                    added += 1
+
+        if added:
+            print(f"[+] Imported {added} clip(s) from clips folder")
+        if added:
+            self._save_state()
+        return {"added": added, "removed": removed}
+
+    def get_results(self, sync_folder=True):
+        if sync_folder:
+            self._sync_results_with_clips_dir()
+        else:
+            self._prune_missing_results()
+            self._prune_orphan_metadata_sidecars()
         clips = []
         self._metadata_hydration_changed = False
         for i, p in enumerate(self._results):
@@ -7128,8 +7160,7 @@ class ApiBridge:
 
     def list_all_clips(self):
         """List all video files in the clips directory."""
-        self._prune_missing_results()
-        self._prune_orphan_metadata_sidecars()
+        self._sync_results_with_clips_dir()
         clips = []
         total_size = 0
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
@@ -7216,33 +7247,8 @@ class ApiBridge:
         appear in the upload section alongside pipeline-generated clips.
         Returns the updated results list.
         """
-        removed = self._prune_missing_results()
-        self._prune_orphan_metadata_sidecars()
-        _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-        existing = {p.resolve() for p in self._results if p.exists()}
-        added = 0
-
-        clips_dir = self._clips_dir()
-        if clips_dir.exists():
-            safe_entries = []
-            for p in clips_dir.iterdir():
-                safe_path = self._safe_path_under(clips_dir, p)
-                if safe_path and safe_path.is_file() and safe_path.suffix.lower() in _exts:
-                    safe_entries.append(safe_path)
-            for p in sorted(safe_entries, key=lambda x: x.stat().st_mtime):
-                resolved = p.resolve()
-                if resolved not in existing:
-                    self._results.append(p)
-                    self._moments.append(self._ensure_moment_identity({}, p))
-                    existing.add(resolved)
-                    added += 1
-
-        if added or removed:
-            self._save_state()
-            if added:
-                print(f"[+] Imported {added} clip(s) from clips folder")
-
-        return self.get_results()
+        self._sync_results_with_clips_dir()
+        return self.get_results(sync_folder=False)
 
     # ── Exposed: schedule management ─────────────────────────────────────
 

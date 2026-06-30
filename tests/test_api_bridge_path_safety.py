@@ -45,6 +45,34 @@ class ApiBridgePathSafetyTests(unittest.TestCase):
             self.assertEqual(output.parent, Path(temp_dir).resolve())
             self.assertTrue(output.name.endswith("_viral1.mp4"))
 
+    def test_get_results_imports_loose_clips_from_custom_output_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clips_dir = Path(temp_dir)
+            loose_clip = clips_dir / "loose custom output.mp4"
+            loose_clip.write_text("video", encoding="utf-8")
+
+            bridge = ApiBridge.__new__(ApiBridge)
+            bridge._results = []
+            bridge._moments = []
+            bridge._scheduled = []
+            bridge._user_settings = {"output_dir": temp_dir}
+            bridge._source_context = {}
+            bridge._metadata_hydration_changed = False
+            bridge._state_lock = threading.RLock()
+            bridge._personalization_lock = threading.RLock()
+            bridge._personalization = {"schema_version": 1, "events": [], "clips": {}}
+            save_calls = []
+            bridge._save_state = lambda: save_calls.append(True)
+            bridge._video_port = 0
+            bridge._clip_url_for_path = lambda path: f"http://127.0.0.1:0/{Path(path).name}"
+
+            result = bridge.get_results()
+
+            self.assertEqual([clip["filename"] for clip in result["clips"]], [loose_clip.name])
+            self.assertEqual(bridge._results, [loose_clip.resolve()])
+            self.assertEqual(len(bridge._moments), 1)
+            self.assertTrue(save_calls)
+
     def test_youtube_download_metadata_feeds_game_identity_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             clip_path = Path(temp_dir) / "Alan_Wake_Part_4.mp4"
