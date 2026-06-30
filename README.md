@@ -27,6 +27,37 @@
   <img src="docs/preview.png" alt="ViriaRevive desktop app preview" width="850">
 </p>
 
+<p align="center">
+  <em>Actual ViriaRevive v2.4.0 desktop screenshots.</em>
+</p>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/actual-upload.png" alt="ViriaRevive YouTube upload scheduler and AI metadata screen">
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/actual-settings.png" alt="ViriaRevive settings with Local AI, subtitle style, data privacy, and output folder controls">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Upload scheduling and AI metadata prep</strong></td>
+    <td align="center"><strong>Local AI, privacy, subtitles, and output settings</strong></td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/actual-results.png" alt="ViriaRevive Results view showing generated clip folders and clip actions">
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/actual-all-videos.png" alt="ViriaRevive All Videos library with custom output folder sync">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Results view</strong></td>
+    <td align="center"><strong>All Videos library</strong></td>
+  </tr>
+</table>
+
 ---
 
 ## What This Fork Is
